@@ -3,8 +3,8 @@
 A launchd job that starts the Dashboard directly with uv's versioned Python makes that
 interpreter the TCC responsible host for descendant MCP processes.  The existing Hermes
 launchd implementation already has a supported identity boundary: ``/usr/bin/osascript``
-with ``do shell script`` and an ``exec`` child.  This module applies that boundary to a
-Dashboard plist without changing Chrome, TCC.db, the MCP command, or the service lifecycle.
+with an ``exec`` child.  This module applies that boundary to a Dashboard plist without
+changing Chrome, TCC.db, the MCP command, or the service lifecycle.
 
 The repair is deliberately one-shot and explicit.  It edits only ``ProgramArguments`` and
 never bootstraps, kickstarts, or otherwise restarts launchd; the caller must do that after
@@ -13,6 +13,7 @@ reviewing the result.
 
 from __future__ import annotations
 
+import json
 import os
 import plistlib
 import platform
@@ -63,8 +64,7 @@ def _user_home() -> Path:
 
 
 def _valid_profile_selector(value: str) -> bool:
-    raw = value.strip()
-    return raw.isascii() and PROFILE_ID_RE.fullmatch(raw.lower()) is not None
+    return value.isascii() and PROFILE_ID_RE.fullmatch(value.lower()) is not None
 
 
 def _is_python_executable(token: str) -> bool:
@@ -179,19 +179,11 @@ def _dashboard_mode_index(arguments: list[str]) -> int | None:
         and Path(arguments[0]).parent == Path(arguments[1]).parent
     ):
         index = 2
-    elif (
-        len(arguments) >= 2
-        and _is_python_executable(arguments[0])
-        and _is_hermes_main_module_script(arguments[1])
+    elif len(arguments) >= 2 and _is_python_executable(arguments[0]) and (
+        _is_hermes_main_module_script(arguments[1])
+        or (arguments[1:3] == ["-m", "hermes_cli.main"])
     ):
-        index = 2
-    elif (
-        len(arguments) >= 3
-        and _is_python_executable(arguments[0])
-        and arguments[1] == "-m"
-        and arguments[2] == "hermes_cli.main"
-    ):
-        index = 3
+        index = 2 if _is_hermes_main_module_script(arguments[1]) else 3
     else:
         return None
 
@@ -203,7 +195,7 @@ def _dashboard_mode_index(arguments: list[str]) -> int | None:
         if token in {"-p", "--profile"}:
             if profile_seen or index + 1 >= len(arguments):
                 return None
-            profile_value = arguments[index + 1].strip()
+            profile_value = arguments[index + 1]
             if not _valid_profile_selector(profile_value):
                 return None
             profile_seen = True
@@ -230,15 +222,31 @@ def _is_dashboard_command(arguments: list[str]) -> bool:
     return bool(arguments) and _dashboard_mode_index(arguments) is not None and _entrypoint_matches_runtime(arguments)
 
 
+def _wrap_command_applescript(command: list[str], stdout_log: Path, stderr_log: Path) -> list[str]:
+    """Reproduce the pre-JXA Hermes ``osascript -e 'do shell script …'`` wrapper.
+
+    Hermes shipped this form until the JXA wrapper replaced it.  A plist produced by the
+    older release must round-trip byte-for-byte, otherwise an already-repaired job would be
+    rejected as malformed instead of being recognised as using the osascript identity.
+    """
+
+    shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_log))} 2>> {shlex.quote(str(stderr_log))}"
+    applescript = shell.replace("\\", "\\\\").replace('"', '\\"')
+    return [TCC_HOST_IDENTITY, "-e", f'do shell script "{applescript}"']
+
+
 def _is_osascript_wrapper(arguments: list[str]) -> bool:
     """Return whether arguments already use Hermes' stable Apple host boundary."""
 
+    if arguments[:1] != [TCC_HOST_IDENTITY]:
+        return False
+    if len(arguments) == 3 and arguments[1] == "-e":
+        return arguments[2].startswith('do shell script "') and arguments[2].endswith('"')
     return (
-        len(arguments) == 3
-        and arguments[0] == TCC_HOST_IDENTITY
-        and arguments[1] == "-e"
-        and arguments[2].startswith('do shell script "')
-        and arguments[2].endswith('"')
+        len(arguments) == 5
+        and arguments[1:4] == ["-l", "JavaScript", "-e"]
+        and arguments[4].startswith('ObjC.import("stdlib"); const status=$.system("')
+        and arguments[4].endswith("$.exit(status === -1 ? 1 : signal === 0 ? (status >> 8) & 255 : 128 + signal);")
     )
 
 
@@ -247,14 +255,31 @@ def _wrapped_child_arguments(
 ) -> list[str] | None:
     """Decode the command embedded in Hermes' generated osascript wrapper."""
 
-    if arguments and arguments[0] != TCC_HOST_IDENTITY:
+    if arguments and (not all(isinstance(item, str) for item in arguments) or arguments[0] != TCC_HOST_IDENTITY):
         return None
     if not _is_osascript_wrapper(arguments):
         raise DashboardTccRepairError("refusing malformed osascript ProgramArguments")
-    script = arguments[2]
-    prefix, suffix = 'do shell script "', '"'
+    if len(arguments) == 3:
+        script = arguments[2]
+        prefix, suffix = 'do shell script "', '"'
+        body = script[len(prefix) : -len(suffix)]
+        shell = re.sub(r"\\(.)", r"\1", body)
+        legacy_form = True
+    else:
+        # Coupled to `gateway_launchd.launchd_program_arguments` (the JXA template): if that
+        # template changes, the round-trip equality below fails closed rather than admitting
+        # an unrecognised wrapper.
+        script = arguments[4]
+        prefix = 'ObjC.import("stdlib"); const status=$.system("'
+        suffix = '); const signal=status & 127; $.exit(status === -1 ? 1 : signal === 0 ? (status >> 8) & 255 : 128 + signal);'
+        body = script[len(prefix) : -len(suffix)]
+        body = body.removesuffix('"')
+        try:
+            shell = json.loads('"' + body + '"')
+        except ValueError as exc:
+            raise DashboardTccRepairError("refusing malformed osascript shell payload") from exc
+        legacy_form = False
     try:
-        shell = re.sub(r"\\(.)", r"\1", script[len(prefix) : -len(suffix)])
         tokens = shlex.split(shell)
     except ValueError as exc:
         raise DashboardTccRepairError("refusing malformed osascript shell payload") from exc
@@ -263,7 +288,14 @@ def _wrapped_child_arguments(
     if tokens[-4] != ">>" or tokens[-2] != "2>>":
         raise DashboardTccRepairError("refusing osascript wrapper with unexpected shell redirections")
     child = tokens[1:-4]
-    if not child or launchd_program_arguments(child, stdout_path, stderr_path) != arguments:
+    if not child:
+        raise DashboardTccRepairError("refusing osascript wrapper with an empty shell command")
+    expected = (
+        _wrap_command_applescript(child, stdout_path, stderr_path)
+        if legacy_form
+        else launchd_program_arguments(child, stdout_path, stderr_path)
+    )
+    if expected != arguments:
         raise DashboardTccRepairError("refusing osascript wrapper with an unexpected shell command")
     return child
 
@@ -334,7 +366,6 @@ def repair_dashboard_launchd_tcc_host(
     if platform.system() != "Darwin":
         path = Path(plist_path).expanduser() if plist_path is not None else Path()
         return DashboardTccRepairResult(status="unsupported", plist_path=path)
-    path = Path(plist_path).expanduser() if plist_path is not None else default_dashboard_plist_path()
     path = _validated_plist_path(plist_path)
     if not path.is_file():
         raise DashboardTccRepairError(f"Dashboard launchd plist not found: {path}")

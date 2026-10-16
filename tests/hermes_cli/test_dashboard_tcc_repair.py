@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import plistlib
+import json
 import re
 import shlex
 from pathlib import Path
@@ -35,15 +36,24 @@ def _load(path):
 
 
 def _unwrap_osascript(program_arguments):
-    assert program_arguments[:2] == ["/usr/bin/osascript", "-e"]
-    assert len(program_arguments) == 3
-    script = program_arguments[2]
-    prefix, suffix = 'do shell script "', '"'
-    assert script.startswith(prefix) and script.endswith(suffix)
-    shell = re.sub(r"\\(.)", r"\1", script[len(prefix) : -len(suffix)])
-    exec_name, *argv = shlex.split(shell)
+    assert program_arguments[0] == "/usr/bin/osascript"
+    if len(program_arguments) == 3:
+        assert program_arguments[1] == "-e"
+        script = program_arguments[2]
+        prefix, suffix = 'do shell script "', '"'
+        shell = re.sub(r"\\(.)", r"\1", script[len(prefix) : -len(suffix)])
+    else:
+        assert program_arguments[1:4] == ["-l", "JavaScript", "-e"]
+        script = program_arguments[4]
+        prefix = 'ObjC.import("stdlib"); const status=$.system("'
+        suffix = '); const signal=status & 127; $.exit(status === -1 ? 1 : signal === 0 ? (status >> 8) & 255 : 128 + signal);'
+        body = script[len(prefix) : -len(suffix)]
+        body = body.removesuffix('"')
+        shell = json.loads('"' + body + '"')
+    exec_name, *rest = shlex.split(shell)
     assert exec_name == "exec"
-    return argv
+    assert rest[-4:-3] == [">>"] and rest[-2:-1] == ["2>>"]
+    return rest[:-4]
 
 
 def _darwin(monkeypatch, home):
@@ -112,13 +122,7 @@ def test_apply_wraps_dashboard_under_existing_osascript_identity(tmp_path, monke
     installed = _load(path)
     program_arguments = installed["ProgramArguments"]
     assert program_arguments[0] == "/usr/bin/osascript"
-    assert _unwrap_osascript(program_arguments) == [
-        *command,
-        ">>",
-        data["StandardOutPath"],
-        "2>>",
-        data["StandardErrorPath"],
-    ]
+    assert _unwrap_osascript(program_arguments) == command
     assert installed["EnvironmentVariables"] == data["EnvironmentVariables"]
     assert installed["KeepAlive"] == data["KeepAlive"]
     assert path.stat().st_mode & 0o777 == original_mode
@@ -162,13 +166,10 @@ def test_shell_hostile_paths_round_trip_through_wrapper(tmp_path, monkeypatch):
 
     repair.repair_dashboard_launchd_tcc_host(path, apply=True)
 
-    assert _unwrap_osascript(_load(path)["ProgramArguments"]) == [
-        *command,
-        ">>",
-        str(stdout),
-        "2>>",
-        str(stderr),
-    ]
+    installed = _load(path)["ProgramArguments"]
+    assert _unwrap_osascript(installed) == command
+    assert f">> {shlex.quote(str(stdout))}" in json.loads(re.match(r'.*\$\.system\((.*)\); const signal', installed[4]).group(1))
+    assert f"2>> {shlex.quote(str(stderr))}" in json.loads(re.match(r'.*\$\.system\((.*)\); const signal', installed[4]).group(1))
 
 
 def test_non_dashboard_plist_fails_closed(tmp_path, monkeypatch):
@@ -322,8 +323,19 @@ def test_module_mode_is_bound_to_current_python_runtime(tmp_path, monkeypatch):
 
 
 def test_installed_dashboard_launchd_argv_shape_is_admitted(tmp_path, monkeypatch):
+    """The real live-shaped argv (venv python + venv hermes) is admitted and runtime-bound.
+
+    The `home_io_guard` fixture forbids real `~/.hermes` I/O, so the runtime binding is
+    exercised through the module's own resolution seams rather than the live install.
+    """
+
     _darwin(monkeypatch, tmp_path)
-    root = Path("/Users/timmywen/.hermes/hermes-agent")
+    root = tmp_path / "install"
+    (root / "venv/bin").mkdir(parents=True)
+    (root / "hermes_cli").mkdir(parents=True)
+    (root / "hermes_cli/main.py").write_text("")
+    (root / "venv/bin/python").touch()
+    (root / "venv/bin/hermes").touch()
     command = [
         str(root / "venv/bin/python"),
         str(root / "venv/bin/hermes"),
@@ -339,9 +351,16 @@ def test_installed_dashboard_launchd_argv_shape_is_admitted(tmp_path, monkeypatc
     monkeypatch.setattr(repair, "_current_hermes_root", lambda: root)
     path, _ = _write_plist(tmp_path, command)
 
+    assert repair._entrypoint_matches_runtime(command) is True
     result = repair.repair_dashboard_launchd_tcc_host(path, apply=False)
 
     assert result.status == "needs_repair"
+
+    mismatched = [str(tmp_path / "other/venv/bin/python"), *command[1:]]
+    (tmp_path / "other/venv/bin").mkdir(parents=True)
+    (tmp_path / "other/venv/bin/python").touch()
+    (tmp_path / "other/venv/bin/hermes").touch()
+    assert repair._entrypoint_matches_runtime(mismatched) is False
 
 
 def test_valid_profile_selector_is_admitted_and_conflicting_launchd_keys_are_rejected(tmp_path, monkeypatch):
@@ -406,6 +425,13 @@ def test_valid_profile_selector_is_admitted_and_conflicting_launchd_keys_are_rej
         [
             "/Users/example/.hermes/hermes-agent/venv/bin/python",
             "/Users/example/.hermes/hermes-agent/venv/bin/hermes",
+            "--profile",
+            "default\n",
+            "dashboard",
+        ],
+        [
+            "/Users/example/.hermes/hermes-agent/venv/bin/python",
+            "/Users/example/.hermes/hermes-agent/venv/bin/hermes",
             "dashboard",
             "--open-profile",
             "K",
@@ -432,11 +458,92 @@ def test_non_macos_is_unsupported_without_writing(tmp_path, monkeypatch):
     path, _ = _write_plist(tmp_path, ["/usr/bin/python3", "-m", "hermes_cli.main", "dashboard"])
     before = path.read_bytes()
 
-    result = repair.repair_dashboard_launchd_tcc_host(path, apply=True)
+    result = repair.repair_dashboard_launchd_tcc_host(None, apply=True)
 
     assert result.status == "unsupported"
     assert result.changed is False
     assert path.read_bytes() == before
+
+
+def _legacy_wrapper(command, stdout_path, stderr_path):
+    """Reproduce the v0.21.x `osascript -e 'do shell script ...'` wrapper."""
+
+    shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_path))} 2>> {shlex.quote(str(stderr_path))}"
+    escaped = shell.replace("\\", "\\\\").replace('"', '\\"')
+    return ["/usr/bin/osascript", "-e", f'do shell script "{escaped}"']
+
+
+def test_legacy_applescript_wrapper_reports_already_repaired(tmp_path, monkeypatch):
+    _darwin(monkeypatch, tmp_path)
+    command = [
+        "/Users/example/.hermes/hermes-agent/venv/bin/python",
+        "/Users/example/.hermes/hermes-agent/venv/bin/hermes",
+        "dashboard",
+        "--port",
+        "9119",
+        "--no-open",
+    ]
+    _bind_runtime(monkeypatch, command)
+    path, data = _write_plist(tmp_path, command)
+    legacy = _legacy_wrapper(command, data["StandardOutPath"], data["StandardErrorPath"])
+    plist = _load(path)
+    plist["ProgramArguments"] = legacy
+    path.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_XML, sort_keys=False))
+    before = path.read_bytes()
+
+    assert _unwrap_osascript(legacy) == command
+
+    result = repair.repair_dashboard_launchd_tcc_host(path, apply=True)
+
+    assert result.status == "already_repaired"
+    assert result.changed is False
+    assert result.tcc_host_identity == "/usr/bin/osascript"
+    assert path.read_bytes() == before
+
+
+def test_legacy_wrapper_with_extra_shell_command_is_refused(tmp_path, monkeypatch):
+    _darwin(monkeypatch, tmp_path)
+    command = [
+        "/Users/example/.hermes/hermes-agent/venv/bin/python",
+        "/Users/example/.hermes/hermes-agent/venv/bin/hermes",
+        "serve",
+        "--port",
+        "9119",
+    ]
+    _bind_runtime(monkeypatch, command)
+    path, data = _write_plist(tmp_path, command)
+    tail = shlex.join(command)
+    poisoned = [
+        "/usr/bin/osascript",
+        "-e",
+        f'do shell script "exec {tail} >> {data["StandardOutPath"]} 2>> {data["StandardErrorPath"]}; rm -rf /tmp/x"',
+    ]
+    plist = _load(path)
+    plist["ProgramArguments"] = poisoned
+    path.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_XML, sort_keys=False))
+    before = path.read_bytes()
+
+    with pytest.raises(repair.DashboardTccRepairError):
+        repair.repair_dashboard_launchd_tcc_host(path, apply=True)
+    assert path.read_bytes() == before
+
+
+def test_unknown_osascript_shape_is_refused(tmp_path, monkeypatch):
+    _darwin(monkeypatch, tmp_path)
+    path, _ = _write_plist(
+        tmp_path,
+        [
+            "/Users/example/.hermes/hermes-agent/venv/bin/python",
+            "/Users/example/.hermes/hermes-agent/venv/bin/hermes",
+            "dashboard",
+        ],
+    )
+    plist = _load(path)
+    plist["ProgramArguments"] = ["/usr/bin/osascript", "--totally-unknown", "1", "2", "3", "4", "5"]
+    path.write_bytes(plistlib.dumps(plist, fmt=plistlib.FMT_XML, sort_keys=False))
+
+    with pytest.raises(repair.DashboardTccRepairError, match="malformed osascript"):
+        repair.repair_dashboard_launchd_tcc_host(path, apply=False)
 
 
 def test_dashboard_parser_exposes_explicit_no_restart_repair_command():
@@ -458,14 +565,21 @@ def test_dashboard_parser_exposes_explicit_no_restart_repair_command():
     assert args.plist == "/tmp/dashboard.plist"
 
 
-def test_full_cli_parser_round_trips_dashboard_launch_shape():
-    from hermes_cli.main import _build_cli_parser, _parse_cli_args
+def test_full_cli_parser_round_trips_dashboard_launch_shape(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from hermes_cli.subcommands.dashboard import build_dashboard_parser
 
-    parser, subparsers = _build_cli_parser()
-    args = _parse_cli_args(
-        parser,
+    root = argparse.ArgumentParser(prog="hermes")
+    subparsers = root.add_subparsers(dest="command")
+    build_dashboard_parser(
         subparsers,
-        ["dashboard", "--port", "9119", "--host", "127.0.0.1", "--no-open"],
+        cmd_dashboard=lambda args: 0,
+        cmd_dashboard_register=lambda args: 0,
+        cmd_dashboard_tcc_repair=lambda args: 0,
+    )
+    args = root.parse_args(
+        ["dashboard", "--port", "9119", "--host", "127.0.0.1", "--no-open"]
     )
 
     assert args.command == "dashboard"

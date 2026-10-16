@@ -74,7 +74,9 @@ def build_serve_parser(
 
 
 def build_dashboard_parser(
-    subparsers, *, cmd_dashboard: Callable, cmd_dashboard_register: Callable) -> None:
+    subparsers, *, cmd_dashboard: Callable, cmd_dashboard_register: Callable,
+    cmd_dashboard_tcc_repair: Callable | None = None,
+) -> None:
     """Attach ``dashboard`` (browser UI) and ``serve`` (headless backend the desktop spawns)."""
     dashboard_parser = subparsers.add_parser(
         "dashboard", help="Start the web UI dashboard",
@@ -123,3 +125,20 @@ def build_dashboard_parser(
             "portal. Also settable via HERMES_DASHBOARD_PORTAL_URL. Mainly for "
             "testing against a staging/preview portal.")
     dashboard_register_parser.set_defaults(func=cmd_dashboard_register)
+
+    if cmd_dashboard_tcc_repair is not None:
+        tcc_repair_parser = dashboard_subparsers.add_parser(
+            "repair-tcc-host",
+            help="Repair the macOS launchd TCC host boundary without restarting the service",
+            description="Preview or apply the narrow macOS Dashboard launchd identity repair. "
+                "This edits only ProgramArguments and never restarts launchd.",
+        )
+        tcc_repair_parser.add_argument(
+            "--plist", default=None, metavar="PATH",
+            help="Dashboard LaunchAgent plist (default: ~/Library/LaunchAgents/ai.hermes.dashboard.plist)",
+        )
+        tcc_repair_parser.add_argument(
+            "--apply", action="store_true",
+            help="Atomically write the osascript wrapper; do not kickstart or restart the service",
+        )
+        tcc_repair_parser.set_defaults(func=cmd_dashboard_tcc_repair)

@@ -6,6 +6,7 @@ requirement. Approved output is a bounded Control projection, not model prose.
 from __future__ import annotations
 
 import contextvars
+import copy
 import threading
 import time
 from dataclasses import dataclass, field
@@ -19,11 +20,11 @@ _gates_lock = threading.RLock()
 _commits = {}
 
 
-def register_gate(host, validate):
-    if not callable(validate):
+def register_gate(host, validate, *, on_commit=None):
+    if not callable(validate) or (on_commit is not None and not callable(on_commit)):
         raise TypeError("gate validator must be callable")
     key = (host.profile, host.plugin_id)
-    entry = (host, validate)
+    entry = (host, validate, on_commit)
     with _gates_lock:
         _gates[key] = entry
 
@@ -79,7 +80,7 @@ class TurnGate:
             if (entry is None or evidence is None or self.ingress is None
                     or self.ingress.source is not TurnSource.TOP_LEVEL_HUMAN):
                 return self.deny()
-            host, validate = entry
+            host, validate, _ = entry
             invocation = evidence.invocation
             if (not host.live() or invocation.ingress is not self.ingress
                     or invocation.host_instance != host.instance
@@ -89,15 +90,16 @@ class TurnGate:
             # Daemon worker + finite wait: a stalled plugin never blocks output
             # indefinitely. It receives an immutable evidence object only.
             result, done = [], threading.Event()
-            def check(validator=validate, value=evidence):
+            def check(validator=validate, value=evidence, answer=result, signal=done):
                 try:
-                    result.append(validator(value) is True)
-                except Exception:
-                    result.append(False)
+                    answer.append(validator(value) is True)
+                except Exception:  # health: allow BLE001 -- fail-closed plugin boundary; exception text can contain private input
+                    answer.append(False)
                 finally:
-                    done.set()
+                    signal.set()
             threading.Thread(target=contextvars.copy_context().run, args=(check,), daemon=True).start()
-            if not done.wait(2) or result != [True] or not host.live():
+            if (not done.wait(2) or result != [True] or not host.live()
+                    or evidence.expires_at <= time.monotonic()):
                 return self.deny()
             with _gates_lock:
                 if _gates.get((hermes_home_key(), plugin_id)) is not entry:
@@ -134,7 +136,7 @@ def run_guarded(agent, message, ingress, run):
     native = consume_ingress(ingress, session)
     try:
         required = requirements(message)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- unreadable operator policy must never disable a required gate
         # Unreadable policy cannot be treated as no requirement.
         required = ("<policy-unavailable>",)
     state = TurnGate(native, required)
@@ -147,7 +149,7 @@ def run_guarded(agent, message, ingress, run):
                 setattr(agent, name, True if name in ("quiet_mode", "_native_output_held") else (lambda *a, **kw: None))
         try:
             result = run(state)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- fail-closed runtime boundary; never expose private model or tool error text
             if not required:
                 raise
             result = {"final_response": UNAVAILABLE, "messages": [], "completed": False, "failed": True}
@@ -169,6 +171,7 @@ def run_guarded(agent, message, ingress, run):
                 while len(_commits) >= 1024:
                     _commits.pop(next(iter(_commits)))
                 _commits[id(result)] = (result, result["native_response_receipt"], digest(result["final_response"]))
+            notify_committed(state, result["native_response_receipt"])
         return result
     finally:
         state.closed = True
@@ -179,6 +182,33 @@ def run_guarded(agent, message, ingress, run):
                 setattr(agent, name, value)
             else:
                 delattr(agent, name)
+
+
+def notify_committed(state, receipt):
+    """Bounded observation of a committed projection; never a delivery claim.
+
+    Observers receive a copy, cannot rewrite the committed output, and must
+    reconcile an uncertain ACK instead of replaying the request.
+    """
+    if receipt.get("gate_decision") != "OUTPUT_GATE_PASSED":
+        return
+    outcomes = {}
+    for plugin_id in state.required:
+        with _gates_lock:
+            entry = _gates.get((hermes_home_key(), plugin_id))
+        if entry is None or entry[2] is None:
+            continue
+        done, accepted = threading.Event(), []
+        def observe(callback=entry[2], snapshot=copy.deepcopy(receipt), answer=accepted, signal=done):
+            try:
+                answer.append(callback(snapshot) is True)
+            except Exception:  # health: allow BLE001 -- an observer failure keeps its ACK unknown without leaking plugin exception text
+                answer.append(False)
+            finally:
+                signal.set()
+        threading.Thread(target=contextvars.copy_context().run, args=(observe,), daemon=True).start()
+        outcomes[plugin_id] = "ACKNOWLEDGED" if done.wait(2) and accepted == [True] else "UNKNOWN"
+    receipt["commit_observers"] = outcomes
 
 
 def acknowledge_delivery(result, *, output: str, transport: str, delivery_id: str):
@@ -195,3 +225,10 @@ def acknowledge_delivery(result, *, output: str, transport: str, delivery_id: st
         commit[1].update(transport_delivery_status="TRANSPORT_DELIVERED", transport=transport,
                          delivery_id=delivery_id)
         return dict(commit[1])
+
+
+def acknowledge_terminal(result, output):
+    """Classic terminal calls only after its final response print succeeds."""
+    if result and "native_response_receipt" in result:
+        acknowledge_delivery(result, output=output, transport="terminal-stdout",
+                             delivery_id=result["native_response_receipt"]["final_output_digest"])

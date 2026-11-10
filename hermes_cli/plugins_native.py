@@ -7,6 +7,10 @@ from hermes_cli.plugins_loader import _serialized_replacement
 
 
 class NativePluginContextMixin:
+    def _abandon_load(self) -> None:
+        """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
+        self._load_abandoned = True
+
     @cached_property
     def native_host(self):
         host = PluginHost(self.plugin_id, self._manager.scope_key)
@@ -14,7 +18,7 @@ class NativePluginContextMixin:
         return host
 
     @_serialized_replacement
-    def register_response_gate(self, validate):
+    def register_response_gate(self, validate, *, on_commit=None):
         """Require current Control evidence when the operator's profile scope matches.
 
         ``validate(evidence) -> True`` rechecks freshness/revision with Control.
@@ -23,7 +27,7 @@ class NativePluginContextMixin:
         plugins cannot silently remove the requirement.
         """
         from agent.response_gate import register_gate
-        release = register_gate(self.native_host, validate)
+        release = register_gate(self.native_host, validate, on_commit=on_commit)
         return self._track("response_gate", self.plugin_id, release)
 
     def native_turn_attestation(self):

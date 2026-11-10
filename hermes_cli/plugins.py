@@ -237,10 +237,6 @@ class PluginContext(NativePluginContextMixin):
         # still be running register(), and nothing it registers from then on may reach a registry.
         self._load_abandoned = False
 
-    def _abandon_load(self) -> None:
-        """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
-        self._load_abandoned = True
-
     @property
     def plugin_id(self) -> str:
         """Return the effective registry id used for this plugin's namespaces."""

@@ -713,6 +713,9 @@ class CLIChatTurnMixin:
                     width=self._scrollback_box_width(),
                 ))
 
+            from agent.response_gate import acknowledge_terminal
+            acknowledge_terminal(turn.result, response)
+
             # Billing CTA pins the single action (Nous → /topup, others → billing page) so it
             # stays visible instead of scrolling away inside the response prose.
             if turn.result and turn.result.get("failure_reason") == "billing":

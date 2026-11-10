@@ -28,6 +28,13 @@ logger = logging.getLogger("cli")
 class CLITuiRuntimeMixin:
     """Classic-TUI run loop phases: input processing, after-turn bookkeeping, startup banner/prewarm/maintenance, prompt_toolkit application build, signal handlers and shutdown."""
 
+    def _tui_wake_startup(self):
+        from cli import logger
+        try:
+            self._maybe_start_wake_word()
+        except Exception as e:
+            logger.debug("wake-word startup skipped: %s", e)
+
     def _tui_process_loop(self):
         """REPL worker thread: drain ``_pending_input``, run idle housekeeping, dispatch each input."""
         held = None

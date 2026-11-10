@@ -1361,13 +1361,6 @@ class CLITuiMixin:
             st["selected"] = max(0, st["selected"] - 1)
             event.app.invalidate()
 
-    def _tui_wake_startup(self):
-        from cli import logger
-        try:
-            self._maybe_start_wake_word()
-        except Exception as e:
-            logger.debug("wake-word startup skipped: %s", e)
-
     def _tui_suppress_closed_loop_errors(self, loop, context):
         exc = context.get("exception")
         if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):

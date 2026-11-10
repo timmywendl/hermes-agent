@@ -1,4 +1,4 @@
-"""Native turn and plugin invocation capabilities (wire contract v1).
+"""Native turn and plugin invocation capabilities (wire contract v2).
 
 These objects stay outside model arguments. Python plugins are trusted code in the
 Hermes process, not a sandbox; a hostile Python plugin can compromise its host.
@@ -6,9 +6,7 @@ Hermes process, not a sandbox; a hostile Python plugin can compromise its host.
 from __future__ import annotations
 
 import hashlib
-import hmac
 import json
-import os
 import threading
 import time
 import uuid
@@ -17,6 +15,7 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 
 import psutil
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from hermes_constants import hermes_home_key
 
@@ -121,14 +120,15 @@ class ControlEvidence:
 class PluginHost:
     """One in-process plugin activation; unload/reload invalidates all its leases.
 
-    A remote verifier must pin this host's key out of band AND authenticate its
-    kernel peer. Merely presenting the public identity is never authentication.
+    Remote Control uses connect_control: kernel-authenticated registration plus
+    challenge proof pins a generation key to one live connection.
     """
     def __init__(self, plugin_id: str, profile: str):
         self.plugin_id, self.profile = plugin_id, profile
         self.instance, self.generation = uuid.uuid4().hex, uuid.uuid4().hex
         self.process = process_identity()
-        self._key = os.urandom(32)
+        self._key = Ed25519PrivateKey.generate()
+        self._channels = []
         self._active = True
         self._leases = {}
         self._lock = threading.RLock()
@@ -141,6 +141,19 @@ class PluginHost:
         self._active = False
         with self._lock:
             self._leases.clear()
+            for channel in self._channels:
+                channel.close()
+            self._channels.clear()
+
+    def connect_control(self, path, approved_control):
+        """Trusted plugin startup calls this with the supervisor-approved Control identity."""
+        from agent.native_control_channel import NativeControlChannel
+        with self._lock:
+            if not self.live():
+                raise PermissionError("native host inactive")
+            channel = NativeControlChannel(self, path, approved_control)
+            self._channels.append(channel)
+            return channel
 
     def invocation(self, tool_name: str) -> Invocation | None:
         state = current_turn.get()
@@ -161,7 +174,7 @@ class PluginHost:
     def attest(self, invocation: Invocation) -> dict:
         if not self.matches(invocation):
             raise PermissionError("native invocation expired")
-        body = {"contract": "hermes.native-turn/1", **asdict(invocation)}
+        body = {"contract": "hermes.native-turn/2", **asdict(invocation)}
         raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
         with self._lock:
             self._leases = {k: v for k, v in self._leases.items()
@@ -169,7 +182,7 @@ class PluginHost:
             if len(self._leases) >= 256:
                 raise PermissionError("native attestation capacity")
             self._leases[invocation.invocation_id] = (current_turn.get(), time.monotonic() + 60, digest(raw))
-        return {"body": body, "signature": hmac.new(self._key, raw.encode(), "sha256").hexdigest()}
+        return {"body": body, "signature": self._key.sign(raw.encode()).hex()}
 
     def verify_attestation(self, envelope: dict, *, peer_pid: int, peer_uid: int) -> dict:
         # Called by a trusted verifier under the owning profile. A socket's PID/
@@ -178,11 +191,11 @@ class PluginHost:
             raise PermissionError("native peer mismatch")
         body = envelope["body"]
         raw = json.dumps(body, sort_keys=True, separators=(",", ":"))
-        expected = hmac.new(self._key, raw.encode(), "sha256").hexdigest()
+        from agent.native_wire import verified
+        verified(self._key.public_key().public_bytes_raw().hex(), envelope)
         with self._lock:
             lease = self._leases.get(body.get("invocation_id"))
-        if (not hmac.compare_digest(expected, envelope["signature"])
-                or body["host_generation"] != self.generation
+        if (body.get("contract") != "hermes.native-turn/2" or body["host_generation"] != self.generation
                 or body["host_instance"] != self.instance or lease is None
                 or lease[0].finished or lease[1] <= time.monotonic() or lease[2] != digest(raw)):
             raise PermissionError("native host mismatch")

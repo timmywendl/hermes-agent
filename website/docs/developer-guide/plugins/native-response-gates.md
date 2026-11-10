@@ -101,14 +101,14 @@ to in-process execution is introduced. That separate plugin-host transport still
 requires its own qualification.
 
 `ctx.native_turn_attestation()` is for a trusted intake hook, never a model tool.
-The local wire contract is `hermes.native-turn/1`: canonical JSON body plus HMAC,
+The local wire contract is `hermes.native-turn/2`: canonical JSON body plus Ed25519 signature,
 registered host key, a bounded active-turn lease and at most 60-second lifetime.
 The verifier must authenticate kernel peer credentials and independently pin the
 exact process instance (including boot, executable digest and birth in a consumer
 such as the macOS Control). PID/UID strings in the envelope are not authentication.
-`host.verify_attestation` is the in-process live verifier API; there is no automatic
-cross-process key bootstrap. A separate-process verifier must not copy this live
-Python object or turn it into a model-visible registration RPC. Replaying after
+`host.verify_attestation` is the in-process live verifier API. Independent Control
+uses the explicit authenticated bootstrap below; it must not copy this live Python
+object or turn registration into a model-visible RPC. Replaying after
 turn finish, wrong profile/generation/peer, or modifying the envelope is rejected.
 
 ## Required validation and result use
@@ -221,3 +221,54 @@ returns to the prior accepted artifact; this patch has no product data migration
 Keep a required profile gate enabled while the capability is unavailable so facts
 fail closed. Retire the patch only with equivalent source, process, scope,
 pre-stream, stale-result, receipt and continuity evidence.
+
+## Separate Control bootstrap (macOS candidate, wire v2)
+
+`ctx.native_host.connect_control(socket_path, approved_control_process)` is a
+trusted startup API, never a model tool. It returns a generation-owned channel;
+`channel.call(native_context, payload)` signs only the currently bound invocation.
+The native Host now holds an ephemeral Ed25519 private key, generated once per
+activation and never serialized to a shared file. The local attestation is versioned as `hermes.native-turn/2`; v1 HMAC is not accepted
+by this candidate. Its in-process lease checks remain.
+
+The independent receiver uses `agent.native_control_verifier.NativeControlVerifier`
+with the supervisor-approved exact process snapshot, plugin and profile. Obtain
+snapshots with `hermes_platform.native_peer.process_snapshot(pid)` from the trusted
+supervisor's process handle; **never populate admission policy from incoming JSON,
+model arguments or UID alone**. A Python executable hash is an additional binding,
+not proof that arbitrary Python code is Hermes. The supervisor's exact PID/birth,
+boot UUID and accepted launch/profile ownership are required. The native process
+is trusted code under the existing plugin security model; this is not an in-process
+sandbox or code-signing guarantee.
+
+The receiver authenticates macOS `LOCAL_PEERPID` + `getpeereid`, independently
+re-reads birth/boot/executable and its digest, checks the pinned profile/plugin,
+issues a random five-second challenge bound to the complete registration and
+channel, verifies the key proof, then pins that public key for that connection.
+The client also authenticates the approved Control process. Every call carries
+contract, channel, turn/invocation/plugin/activation, payload digest, unique nonce
+and bounded wall-clock expiry; duplicate nonce, altered payload, wrong generation
+or foreign profile deny and close the registration. A connection accepts at most
+4096 calls before requiring a new handshake. Control replies bind the request nonce,
+payload digest and complete result digest. `channel.call_evidence(evidence, payload)` permits gate revalidation and commit
+observation only for this turn's native-owned, unexpired evidence, including the
+closing phase; finished turns and copied evidence are rejected. The plugin must still validate result
+revision/freshness/output through its required gate; a channel alone grants no
+Mission authority or output completion.
+
+Registrations have connection lifetime. Host unload/reload closes its channels;
+the receiver revokes on EOF or any invalid frame. A new Host gets a new key and
+generation. Control restart drops all sockets and registrations; the same live Host
+must authenticate and prove its key again on a fresh random channel. An old signed
+frame cannot be replayed onto it. The verifier processes and replies on that same
+connection; it is not an offline token-verification service. Already accepted
+in-flight operations remain subject to product idempotency/reconciliation, not
+retroactive cancellation. The client rejects expired/closed turns before signing.
+
+`tests/agent/test_native_control_process.py` runs an actual separate Control OS
+process on macOS UDS, covering registration, policy mismatches, strangers, proof
+and call replay, expiry, reload/restart and result mismatch. Its profile is a
+marked disposable HOME. Existing streaming, gate, transcript and commit/transport
+contracts remain mandatory. Other operating systems and Gateway/voice/cron/Telegram
+entry provenance are not qualified by these tests. Isolated plugin-host transport
+remains unsupported; this channel connects the native in-process host to Control.

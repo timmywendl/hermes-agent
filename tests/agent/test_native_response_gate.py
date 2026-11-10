@@ -67,7 +67,14 @@ def register(ctx):
 
 @pytest.fixture
 def runtime(tmp_path, monkeypatch):
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "isolated-home"))
+    from pathlib import Path
+    isolated_user = tmp_path / "disposable-user"
+    isolated_user.mkdir()
+    marker = isolated_user / ".native-test-fixture"
+    marker.write_text("disposable")
+    monkeypatch.setenv("HOME", str(isolated_user))
+    monkeypatch.setenv("HERMES_HOME", str(isolated_user / "isolated-home"))
+    assert marker.is_file() and Path(__import__('os').environ['HERMES_HOME']).is_relative_to(isolated_user)
     def no_external_network(*args, **kwargs):
         raise AssertionError("external network forbidden in synthetic runtime qualification")
     monkeypatch.setattr("requests.sessions.Session.request", no_external_network)

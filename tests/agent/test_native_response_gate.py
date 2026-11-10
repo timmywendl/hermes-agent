@@ -276,16 +276,25 @@ def test_required_projection_is_the_final_durable_assistant_row(runtime, tmp_pat
 
 
 @pytest.mark.parametrize("mode", ["expired_after_gate", "unload_after_gate"])
-def test_commit_revalidates_after_finalizer_hooks(runtime, monkeypatch, mode):
+def test_commit_revalidates_after_finalizer_hooks(runtime, monkeypatch, tmp_path, mode):
     from time import monotonic
+    from hermes_state import SessionDB
     make, plugin = runtime
     plugin.MODE = mode
     monkeypatch.setattr("agent.response_gate.monotonic", lambda: monotonic() + (100 if plugin.EXPIRED else 0))
-    agent, seen, _ = make()
-    result = agent.run_conversation("Cloud Test 当前状态", native_ingress=ingress())
-    assert result["final_response"] == UNAVAILABLE
-    assert result["native_response_receipt"]["gate_decision"] == "DENIED"
-    assert plugin.COMMITS == [] and seen == []
+    db = SessionDB(db_path=tmp_path / "isolated-expiry.db")
+    try:
+        agent, seen, _ = make(session_db=db)
+        result = agent.run_conversation("Cloud Test 当前状态", native_ingress=ingress())
+        assert result["final_response"] == UNAVAILABLE
+        assert result["native_response_receipt"]["gate_decision"] == "DENIED"
+        stored = [row["content"] for row in db.get_messages("native-session") if row["role"] == "assistant"]
+        assert stored[-1] == UNAVAILABLE
+        assert result['messages'][-1]['content'] == UNAVAILABLE
+        assert result["native_response_receipt"]["session_persistence_status"] == "DURABLE"
+        assert plugin.COMMITS == [] and seen == []
+    finally:
+        db.close()
 
 
 def test_gated_model_reasoning_cannot_reappear_in_terminal(runtime, monkeypatch):
@@ -306,3 +315,24 @@ def test_opaque_legacy_plugin_still_registers_and_dispatches(runtime):
     from tools.registry import registry
     result = json.loads(registry.dispatch("native_test_opaque", {}))
     assert result == {"legacy": True, "native_received": False}
+
+
+def test_gated_disk_failure_reports_unknown_durability(runtime, tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    make, _ = runtime
+    db = SessionDB(db_path=tmp_path / "isolated-full.db")
+    append = db.append_messages_batch
+    def disk_full(**kwargs):
+        if any(row.get("role") == "assistant" and row.get("content") == "VERIFIED current project facts"
+               for row in kwargs["messages"]):
+            raise OSError("synthetic disk full at final answer commit")
+        return append(**kwargs)
+    monkeypatch.setattr(db, "append_messages_batch", disk_full)
+    try:
+        agent, _, _ = make(session_db=db)
+        result = agent.run_conversation("Cloud Test 当前状态", native_ingress=ingress())
+        assert result["final_response"] == "VERIFIED current project facts"
+        assert result["native_response_receipt"]["session_persistence_status"] == "UNKNOWN"
+        assert result["native_response_receipt"]["transport_delivery_status"] == "UNKNOWN"
+    finally:
+        db.close()

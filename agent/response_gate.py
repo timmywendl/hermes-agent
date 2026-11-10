@@ -142,8 +142,11 @@ def run_guarded(agent, message, ingress, run):
     state = TurnGate(native, required)
     token = current_turn.set(state)
     saved = {}
+    pending = None
     try:
         if required:
+            from agent.response_gate_persistence import PendingGateTail
+            pending = PendingGateTail(agent, state)
             for name in (*_OUTPUT_CALLBACKS, "quiet_mode", "_safe_print", "_native_output_held"):
                 saved[name] = (name in getattr(agent, "__dict__", {}), getattr(agent, name, None))
                 setattr(agent, name, True if name in ("quiet_mode", "_native_output_held") else (lambda *a, **kw: None))
@@ -165,11 +168,13 @@ def run_guarded(agent, message, ingress, run):
                 result.update(completed=False, failed=True)
                 if "error" in result:
                     result["error"] = UNAVAILABLE
+            persistence = pending.commit(result)
             state.receipt.update(contract="hermes.response-receipt/1",
                                  model_status="MODEL_COMPLETED" if model_completed else "UNKNOWN",
                                  human_turn_id=native.turn if native else None,
                                  final_output_digest=digest(result["final_response"]),
                                  output_commit_status="OUTPUT_COMMITTED",
+                                 session_persistence_status=persistence,
                                  transport_delivery_status="UNKNOWN")
             result["native_response_receipt"] = {k: v for k, v in state.receipt.items() if k != "output"}
             with _gates_lock:
@@ -182,6 +187,8 @@ def run_guarded(agent, message, ingress, run):
         state.closed = True
         state.finished = True
         current_turn.reset(token)
+        if pending is not None:
+            pending.restore()
         for name, (owned, value) in saved.items():
             if owned:
                 setattr(agent, name, value)

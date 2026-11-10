@@ -123,9 +123,13 @@ model text are removed from selected-turn presentation fields, so enabling the
 terminal reasoning box cannot reopen the output channel.
 Optional `transform_llm_output` runs first; the required gate runs afterwards.
 The final answer is the exact Control projection, never model prose dressed with
-an evidence ID. Normal final text is gated before its first transcript persistence;
-recovery/early-result paths also pass the facade gate. Old transcript rows and
-system prompts are not rewritten.
+an evidence ID. The selected turn's closing assistant row and optional trajectory export are
+deferred until the final facade gate decision, while user/tool rows continue to
+flush. The exact accepted projection or explicit denial is then written once;
+expiry/unload after the first validation cannot leave a rejected factual answer
+in the durable transcript. `session_persistence_status` distinguishes durable,
+unconfigured and unknown writes. Recovery/early-result paths also pass the facade
+gate. Old transcript rows and system prompts are not rewritten.
 
 `on_commit(receipt) -> True` is an optional bounded two-second observer. It gets a
 copy after the projected result has been committed for handoff to the renderer.

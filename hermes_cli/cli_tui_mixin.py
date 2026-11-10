@@ -1422,6 +1422,8 @@ class CLITuiMixin:
         images = list(self._attached_images)
         self._attached_images.clear()
         event.app.invalidate()
+        from agent.native_turn import HumanText
+        text = HumanText(text, session=self.session_id)
         payload = (text, images) if images else text
         # A bang command is treated like a slash command while the agent is busy: it must never
         # be routed into steer/redirect (injecting `!git status` into the model's context as a

@@ -1729,6 +1729,9 @@ DEFAULT_CONFIG = {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.
         "clone_timeout_seconds": 300,
+        # Host-owned scopes survive a missing/unloaded evidence plugin.
+        # [{"plugin_id": "project-facts", "request_terms": ["my project"]}]
+        "required_response_gates": [],
         # Wall-clock cap (seconds) for one in-process Python plugin hook callback; shell hooks keep
         # their own per-entry `timeout`. 0 = no cap (sync call on agent thread). Max 600.
         "hook_callback_timeout": 30,

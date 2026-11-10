@@ -518,6 +518,11 @@ def apply_llm_output_transform(
         if isinstance(_hook_result, str) and _hook_result:
             pre_transform, final_response, transformed = final_response, _hook_result, True
             break
+    # Mandatory native gate is separate from optional, fail-open transforms.
+    from agent.response_gate import gated_output
+    guarded = gated_output(final_response)
+    if guarded != final_response:
+        pre_transform, final_response, transformed = final_response, guarded, True
     agent._llm_output_transform = (turn_id, transformed, pre_transform)
     return final_response, transformed, pre_transform
 

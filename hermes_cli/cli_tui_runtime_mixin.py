@@ -100,6 +100,9 @@ class CLITuiRuntimeMixin:
         from cli import _DIM, _PASTE_REF_RE, _RST, _cprint, _detect_file_drop, _looks_like_slash_command, _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
         from tools.process_registry_notifications import TimelineNotification
         self._tui_dock_drop_dequeued()
+        envelope = user_input[0] if isinstance(user_input, tuple) else user_input
+        from agent.native_turn import HumanText
+        native_ingress = envelope.native_ingress if isinstance(envelope, HumanText) else None
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
@@ -159,7 +162,8 @@ class CLITuiRuntimeMixin:
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
+            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input,
+                      native_ingress=native_ingress)
         finally:
             self._tui_after_turn()
 

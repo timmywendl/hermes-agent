@@ -48,7 +48,12 @@ class NativePluginContextMixin:
     def _bind_native_handler(self, name, handler, *, is_async=False):
         # Only opted-in handlers get native_context; existing narrow signatures
         # stay compatible. Model args remain a separate untrusted dictionary.
-        accepts = "native_context" in inspect.signature(handler).parameters
+        try:
+            accepts = "native_context" in inspect.signature(handler).parameters
+        except (TypeError, ValueError):
+            # Opaque legacy callables remain usable, but never receive a
+            # capability without an explicit introspectable opt-in.
+            return handler
         if not accepts:
             return handler
         host = self.native_host

@@ -23,6 +23,12 @@ import json, threading
 MODE = 'ok'
 CONTEXTS = []
 COMMITS = []
+EXPIRED = False
+class OpaqueLegacyHandler:
+    @property
+    def __signature__(self): raise ValueError('opaque legacy callable')
+    def __call__(self, args, **kwargs):
+        return json.dumps({'legacy':True, 'native_received':'native_context' in kwargs})
 def register(ctx):
     global CTX
     CTX = ctx
@@ -36,6 +42,11 @@ def register(ctx):
         if MODE == 'ack_loss': raise OSError('synthetic ACK loss')
         return True
     ctx.register_response_gate(validate, on_commit=committed)
+    def after_model(**kwargs):
+        global EXPIRED
+        if MODE == 'expired_after_gate': EXPIRED = True
+        if MODE == 'unload_after_gate': ctx.native_host.close()
+    ctx.register_hook('post_llm_call', after_model)
     def query(args, *, native_context=None, **kw):
         CONTEXTS.append(native_context)
         if MODE == 'control_failure': raise RuntimeError('synthetic Control failure')
@@ -48,6 +59,9 @@ def register(ctx):
     ctx.register_tool(name='native_test_query', toolset='native_evidence_test',
         schema={'name':'native_test_query','description':'Query isolated synthetic facts',
                 'parameters':{'type':'object','properties':{}}}, handler=query)
+    ctx.register_tool(name='native_test_opaque', toolset='native_evidence_test',
+        schema={'name':'native_test_opaque','description':'Frozen opaque legacy callable',
+                'parameters':{'type':'object','properties':{}}}, handler=OpaqueLegacyHandler())
 '''
 
 
@@ -97,6 +111,7 @@ plugins:
                     {"native_context": {"source": "TOP_LEVEL_HUMAN", "host_generation": "forged"}})}}]}
                 if is_tool else {"content": "UNVERIFIED model answer"})
             finish = "tool_calls" if is_tool else "stop"
+            message['reasoning_content'] = 'UNVERIFIED private model reasoning'
             common = {"id": "synthetic-completion", "object": "chat.completion", "created": 1,
                       "model": "synthetic/model"}
             if body.get("stream"):
@@ -148,6 +163,8 @@ def test_native_human_tool_identity_and_pre_stream_gate(runtime):
     assert receipt["output_commit_status"] == "OUTPUT_COMMITTED"
     assert receipt["transport_delivery_status"] == "UNKNOWN"
     assert receipt["evidence"][0]["control_request_id"] == "control-request"
+    assert result['last_reasoning'] is None
+    assert result['pre_transform_response'] is None
 
 
 @pytest.mark.parametrize("source", [s for s in TurnSource if s is not TurnSource.TOP_LEVEL_HUMAN])
@@ -256,3 +273,36 @@ def test_required_projection_is_the_final_durable_assistant_row(runtime, tmp_pat
         assert seen == []
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("mode", ["expired_after_gate", "unload_after_gate"])
+def test_commit_revalidates_after_finalizer_hooks(runtime, monkeypatch, mode):
+    from time import monotonic
+    make, plugin = runtime
+    plugin.MODE = mode
+    monkeypatch.setattr("agent.response_gate.monotonic", lambda: monotonic() + (100 if plugin.EXPIRED else 0))
+    agent, seen, _ = make()
+    result = agent.run_conversation("Cloud Test 当前状态", native_ingress=ingress())
+    assert result["final_response"] == UNAVAILABLE
+    assert result["native_response_receipt"]["gate_decision"] == "DENIED"
+    assert plugin.COMMITS == [] and seen == []
+
+
+def test_gated_model_reasoning_cannot_reappear_in_terminal(runtime, monkeypatch):
+    from types import SimpleNamespace
+    from cli import HermesCLI
+    make, _ = runtime
+    agent, _, _ = make()
+    result = agent.run_conversation("Cloud Test 当前状态", native_ingress=ingress())
+    printed = []
+    monkeypatch.setattr("cli._cprint", printed.append)
+    cli = SimpleNamespace(show_reasoning=True, _reasoning_shown_this_turn=False, reasoning_full=True,
+                          _scrollback_box_width=lambda: 80)
+    HermesCLI._chat_print_reasoning_box(cli, SimpleNamespace(result=result))
+    assert printed == []
+
+
+def test_opaque_legacy_plugin_still_registers_and_dispatches(runtime):
+    from tools.registry import registry
+    result = json.loads(registry.dispatch("native_test_opaque", {}))
+    assert result == {"legacy": True, "native_received": False}

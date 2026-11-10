@@ -117,6 +117,10 @@ turn finish, wrong profile/generation/peer, or modifying the envelope is rejecte
 context, Mission revision, digest and freshness. Exceptions, timeouts, no tool call,
 no evidence, stale evidence and host removal deny output. Native code rechecks
 expiry after the validator, so evidence that expires during validation is rejected.
+It validates again at the facade commit boundary after finalizer hooks; the
+closed-turn fence stays in place throughout. Final reasoning and pre-transform
+model text are removed from selected-turn presentation fields, so enabling the
+terminal reasoning box cannot reopen the output channel.
 Optional `transform_llm_output` runs first; the required gate runs afterwards.
 The final answer is the exact Control projection, never model prose dressed with
 an evidence ID. Normal final text is gated before its first transcript persistence;
@@ -191,6 +195,16 @@ HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh \
 The suite uses real Agent/plugin/tool/SSE code with an explicitly synthetic model
 and synthetic Control, and checks ordinary streaming, failures, profile changes,
 keyboard issuance and terminal ACK. Consumer bridge qualification is separate.
+A separate local consumer drill exercised the unchanged Control implementation
+through real macOS UDS/kernel peer registration and real GitHub GETs: four keyboard
+sessions over two projects, the same Mission per project, complete fresh coverage,
+four native commit/use reconciliations and four captured real-terminal render ACKs.
+An unregistered process with the same UID was rejected. The model was synthetic;
+Control ran on one writer thread in the same process, with an injected live native
+verifier. This is **not** a separate-process bootstrap or production qualification.
+A deliberate bypass of the final gate caused the missing-query assertion to fail;
+the unmutated tests pass. Local evidence includes the harness and digest manifest.
+
 External test paths must explicitly load `tests.conftest` before collection; the
 runner alone does not install the production Home I/O guard for such paths.
 Always assert the isolated Home before creating a fixture plugin or config.

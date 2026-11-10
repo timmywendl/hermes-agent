@@ -8,7 +8,7 @@ from __future__ import annotations
 import contextvars
 import copy
 import threading
-import time
+from time import monotonic
 from dataclasses import dataclass, field
 
 from agent.native_turn import (TurnSource, consume_ingress, current_turn, digest)
@@ -65,10 +65,10 @@ class TurnGate:
     finished: bool = False
     receipt: dict = field(default_factory=dict)
 
-    def final_output(self, candidate):
+    def final_output(self, candidate, *, revalidate=False):
         if not self.required:
             return candidate
-        if self.closed:
+        if self.closed and (not revalidate or self.receipt.get("gate_decision") != "OUTPUT_GATE_PASSED"):
             return self.receipt.get("output", UNAVAILABLE)
         self.closed = True  # No late tool/callback can replace the accepted result.
         approved = []
@@ -85,7 +85,7 @@ class TurnGate:
             if (not host.live() or invocation.ingress is not self.ingress
                     or invocation.host_instance != host.instance
                     or invocation.host_generation != host.generation
-                    or evidence.expires_at <= time.monotonic()):
+                    or evidence.expires_at <= monotonic()):
                 return self.deny()
             # Daemon worker + finite wait: a stalled plugin never blocks output
             # indefinitely. It receives an immutable evidence object only.
@@ -99,7 +99,7 @@ class TurnGate:
                     signal.set()
             threading.Thread(target=contextvars.copy_context().run, args=(check,), daemon=True).start()
             if (not done.wait(2) or result != [True] or not host.live()
-                    or evidence.expires_at <= time.monotonic()):
+                    or evidence.expires_at <= monotonic()):
                 return self.deny()
             with _gates_lock:
                 if _gates.get((hermes_home_key(), plugin_id)) is not entry:
@@ -156,10 +156,15 @@ def run_guarded(agent, message, ingress, run):
             state.deny()
         if required:
             model_completed = result.get("api_calls", 0) > 0 and not result.get("failed")
-            result["final_response"] = state.final_output(result.get("final_response", ""))
+            result["final_response"] = state.final_output(result.get("final_response", ""), revalidate=True)
+            # These fields are rendered after live callbacks have been restored.
+            # The authoritative projection contains no unvalidated model prose.
+            result.update(last_reasoning=None, pre_transform_response=None, response_reused=False)
             result["response_previewed"] = False
             if state.receipt.get("gate_decision") != "OUTPUT_GATE_PASSED":
                 result.update(completed=False, failed=True)
+                if "error" in result:
+                    result["error"] = UNAVAILABLE
             state.receipt.update(contract="hermes.response-receipt/1",
                                  model_status="MODEL_COMPLETED" if model_completed else "UNKNOWN",
                                  human_turn_id=native.turn if native else None,

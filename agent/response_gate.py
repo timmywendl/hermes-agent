@@ -222,6 +222,15 @@ def run_guarded(agent, message, ingress, run):
                 setattr(agent, name, value)
             else:
                 delattr(agent, name)
+        # post_llm_call runs inside run(), before this gate's commit. Cleanup
+        # belongs after final validation/commit and capability invalidation.
+        try:
+            from hermes_cli.lifecycle import invoke_hook
+            invoke_hook("on_native_turn_end", session_id=session,
+                        turn_id=native.turn if native is not None else None)
+        except Exception:  # health: allow BLE001 -- cleanup observers cannot replace an already committed answer or leak exception text
+            import logging
+            logging.getLogger(__name__).warning("Native turn cleanup observer unavailable")
 
 
 def notify_committed(state, receipt):

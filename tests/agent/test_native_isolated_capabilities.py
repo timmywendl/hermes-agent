@@ -582,3 +582,75 @@ def test_core_gate_missing_cannot_mint_intake_even_with_valid_policy(native):
         assert c.calls == []
     finally:
         hook_scope.reset(token)
+
+
+@pytest.mark.parametrize("mode", ["success", "denied", "error"])
+def test_native_turn_end_occurs_after_commit_and_capability_invalidation(
+    native, monkeypatch, mode
+):
+    from agent.native_turn import current_invocation
+    from agent.response_gate import register_gate, run_guarded
+    from hermes_cli.plugins import PluginContext, PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    profile, host, _ = native
+    c = _Channel(host)
+    host._channels.append(c)
+    manager = PluginManager(profile)
+    ctx = PluginContext(PluginManifest(name="cleanup-fixture"), manager)
+    order = []
+    states = []
+
+    def finished(session_id, turn_id):
+        assert session_id == "s" and turn_id == ingress.turn
+        assert states[0].finished and current_turn.get() is not states[0]
+        order.append("end")
+
+    ctx.register_hook("on_native_turn_end", finished)
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", manager.invoke_hook)
+
+    def committed(receipt, *, commit_use):
+        assert not states[0].finished
+        assert commit_use.response_used()["request_state"] == "COMPLETED_READ_ONLY"
+        order.append("commit")
+        return True
+
+    release = register_gate(host, lambda e: True, on_commit=committed)
+    ingress = issue_ingress(
+        TurnSource.TOP_LEVEL_HUMAN, actor="fixture", conversation="c", session="s"
+    )
+
+    def run(state):
+        states.append(state)
+        if mode == "error":
+            raise RuntimeError("synthetic selected-turn failure")
+        if mode == "success":
+            invocation = host.invocation("colleague_query")
+            token = current_invocation.set(invocation)
+            try:
+                host.record_result(
+                    invocation,
+                    control_request_id="r",
+                    context_revision="c",
+                    mission_revision="m",
+                    query_result_digest="q",
+                    output="verified",
+                    result_ref="result",
+                    control_epoch="control1",
+                    channel_ref="channel1",
+                )
+            finally:
+                current_invocation.reset(token)
+        return {"final_response": "unverified draft", "api_calls": 1}
+
+    try:
+        result = run_guarded(
+            SimpleNamespace(session_id="s"), "Check Cloud Test status", ingress, run
+        )
+        assert order == (["commit", "end"] if mode == "success" else ["end"])
+        assert result["native_response_receipt"]["gate_decision"] == (
+            "OUTPUT_GATE_PASSED" if mode == "success" else "DENIED"
+        )
+    finally:
+        release()
+        manager.unload()

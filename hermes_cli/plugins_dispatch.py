@@ -48,7 +48,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     # Observer on every local session's commands, fired by the gateway (gateway/session_commands.py).
     "pre_command",
     # Fires inside the compression commit window (lease held): a hung plugin must not wedge the session.
-    "post_compaction",
+    "post_compaction", "on_native_turn_end",
 }
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
@@ -273,6 +273,8 @@ class PluginDispatchMixin:
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
         results: list[Any] = []
         timeout = _resolve_hook_callback_timeout()
+        if hook_name == "on_native_turn_end":
+            timeout = min(timeout, 2.0) if timeout > 0 else 2.0
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):

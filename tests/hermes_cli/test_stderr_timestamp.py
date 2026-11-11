@@ -337,3 +337,27 @@ def test_wrapper_forwards_sigusr1_restart_request_to_child(tmp_path):
 
     assert rc == GATEWAY_SERVICE_RESTART_EXIT_CODE
     assert "restart requested" in log_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("delimiter", [False, True])
+def test_child_isolated_profile_option_does_not_select_wrapper_mode(tmp_path, delimiter):
+    """A child's remainder argv must never become wrapper bootstrap authority."""
+    import json
+    command = [sys.executable, "-m", "hermes_cli.stderr_timestamp", "--error-log", str(tmp_path / "child.error.log")]
+    if delimiter:
+        command.append("--")
+    command.extend([sys.executable, "-c", "import sys,json;print('CHILD_ARGS='+json.dumps(sys.argv[1:]))", "--isolated-profile", "child-option"])
+    result = subprocess.run(command, capture_output=True, text=True, timeout=10,
+                            env={"HOME":str(tmp_path),"HERMES_HOME":str(tmp_path/"profile"),"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"},check=False)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout.split("CHILD_ARGS=", 1)[1]) == ["--isolated-profile", "child-option"]
+
+
+def test_explicit_isolated_profile_cli_stays_closed_without_bootstrap_provider(tmp_path):
+    plan = tmp_path / "plan.json"
+    plan.write_text("{}", encoding="utf-8")
+    result = subprocess.run([sys.executable,"-m","hermes_cli.stderr_timestamp","--isolated-profile",str(plan)],
+        capture_output=True,text=True,timeout=10,check=False,
+        env={"HOME":str(tmp_path),"HERMES_HOME":str(tmp_path/"profile"),"PATH":"/usr/bin:/bin","LANG":"C.UTF-8"})
+    assert result.returncode == 78
+    assert "Isolated native bootstrap unavailable" in result.stderr

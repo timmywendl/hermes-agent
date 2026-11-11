@@ -375,6 +375,6 @@ def isolated_profile_main(argv):
 
 
 if __name__ == "__main__":
-    if "--isolated-profile" in sys.argv[1:]:
+    if sys.argv[1:2] == ["--isolated-profile"]:
         sys.exit(isolated_profile_main(sys.argv[1:]))
     sys.exit(main())

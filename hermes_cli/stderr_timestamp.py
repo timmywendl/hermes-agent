@@ -203,6 +203,59 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 
+def _isolated_output_pump(callback, *args):
+    """Copy only explicit streams/paths while preserving native profile context."""
+    import contextvars
+    return threading.Thread(target=contextvars.copy_context().run,
+                            args=(callback, *args), daemon=True)
+
+
+def _monitor_isolated_children(children, exit_signal, provider, packet):
+    import selectors
+    import socket
+    import uuid
+    selector = selectors.DefaultSelector()
+    for role,item in children.items():selector.register(item['socket'], selectors.EVENT_READ, role)
+    try:
+        while not exit_signal:
+            ended = [item['process'] for item in children.values() if item['process'].poll() is not None]
+            if ended:return _child_returncode_for_supervisor([], ended[0].returncode)
+            for key,_ in selector.select(.02):
+                # Unexpected EOF/unsolicited frames close both children, never promote a successor.
+                if not key.fileobj.recv(1, socket.MSG_PEEK):
+                    if exit_signal:return 128 + exit_signal[0]
+                    try:
+                        rc = children[key.data]['process'].wait(timeout=.2)
+                    except subprocess.TimeoutExpired:
+                        return 127
+                    return _child_returncode_for_supervisor([], rc)
+                raise PermissionError('unsolicited bootstrap data')
+            if callable(getattr(provider, 'should_stop', None)) and provider.should_stop():
+                packet('core', 'revoke', {'operation_id': uuid.uuid4().hex})
+                return 0
+    finally:selector.close()
+    return 128 + exit_signal[0]
+
+
+def _reap_isolated_children(children):
+    import socket
+    # Closing private FDs also lets children terminate on wrapper fail-stop.
+    for item in children.values():
+        try:item['socket'].shutdown(socket.SHUT_RDWR)
+        except OSError:pass
+        item['socket'].close()
+    for item in children.values():
+        proc = item['process']
+        if proc.poll() is None:
+            try:proc.terminate()
+            except ProcessLookupError:pass
+        try:proc.wait(3)
+        except subprocess.TimeoutExpired:proc.kill();proc.wait(2)
+        for pump in item.get('pumps', ()):pump.join(1)
+        for pipe in (proc.stdout,proc.stderr):
+            if pipe:pipe.close()
+
+
 def run_isolated_profile(spec, *, provider=None):
     """Supervise a separately approved disposable Core/Control pair.
 
@@ -210,7 +263,6 @@ def run_isolated_profile(spec, *, provider=None):
     CLI flag cannot establish bootstrap authority; the default is denied.
     """
     import hashlib
-    import selectors
     import socket
     import time
     import uuid
@@ -275,8 +327,8 @@ def run_isolated_profile(spec, *, provider=None):
         finally:child.close()
         item = {'process': proc, 'socket': parent, 'seq': 0, 'channel': uuid.uuid4().hex}
         children[role] = item
-        item['pumps'] = [threading.Thread(target=_copy_stdout_with_timestamps,args=(proc.stdout,),daemon=True),
-                         threading.Thread(target=_copy_stderr_with_timestamps,args=(proc.stderr,log_path),daemon=True)]
+        item['pumps'] = [_isolated_output_pump(_copy_stdout_with_timestamps, proc.stdout),
+                         _isolated_output_pump(_copy_stderr_with_timestamps, proc.stderr, log_path)]
         for pump in item['pumps']:pump.start()
         hello = receive(parent, 5)
         actual = process_snapshot(proc.pid)
@@ -317,46 +369,12 @@ def run_isolated_profile(spec, *, provider=None):
                  'approval_refs': approvals}
         callback = getattr(provider, 'ready', None)
         if callable(callback):callback(ready)
-        selector = selectors.DefaultSelector()
-        for role,item in children.items():selector.register(item['socket'], selectors.EVENT_READ, role)
-        try:
-            while not exit_signal:
-                ended = [item['process'] for item in children.values() if item['process'].poll() is not None]
-                if ended:return _child_returncode_for_supervisor([], ended[0].returncode)
-                for key,_ in selector.select(.02):
-                    # Unexpected EOF/unsolicited frames close both children, never promote a successor.
-                    if not key.fileobj.recv(1, socket.MSG_PEEK):
-                        if exit_signal:return 128 + exit_signal[0]
-                        try:
-                            rc = children[key.data]['process'].wait(timeout=.2)
-                        except subprocess.TimeoutExpired:
-                            return 127
-                        return _child_returncode_for_supervisor([], rc)
-                    raise PermissionError('unsolicited bootstrap data')
-                if callable(getattr(provider, 'should_stop', None)) and provider.should_stop():
-                    packet('core', 'revoke', {'operation_id': uuid.uuid4().hex})
-                    return 0
-        finally:selector.close()
-        return 128 + exit_signal[0]
+        return _monitor_isolated_children(children, exit_signal, provider, packet)
     except (EOFError, OSError):
         if exit_signal:return 128 + exit_signal[0]
         raise
     finally:
-        # Closing private FDs also lets children terminate on wrapper fail-stop.
-        for item in children.values():
-            try:item['socket'].shutdown(socket.SHUT_RDWR)
-            except OSError:pass
-            item['socket'].close()
-        for item in children.values():
-            proc = item['process']
-            if proc.poll() is None:
-                try:proc.terminate()
-                except ProcessLookupError:pass
-            try:proc.wait(3)
-            except subprocess.TimeoutExpired:proc.kill();proc.wait(2)
-            for pump in item.get('pumps', ()):pump.join(1)
-            for pipe in (proc.stdout,proc.stderr):
-                if pipe:pipe.close()
+        _reap_isolated_children(children)
         for signum, handler in previous.items():signal.signal(signum, handler)
         owner_lock.close()
 
@@ -368,7 +386,7 @@ def isolated_profile_main(argv):
     parser.add_argument('--isolated-profile', required=True, type=Path)
     args = parser.parse_args(argv)
     try:
-        return run_isolated_profile(json.loads(args.isolated_profile.read_text()))
+        return run_isolated_profile(json.loads(args.isolated_profile.read_text(encoding="utf-8-sig")))
     except (OSError, ValueError, PermissionError) as exc:
         print(f'Isolated native bootstrap unavailable: {type(exc).__name__}', file=sys.stderr)
         return 78

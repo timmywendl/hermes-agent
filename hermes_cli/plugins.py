@@ -58,7 +58,7 @@ from hermes_cli.plugins_dispatch import (
     is_valid_system_prompt_section_id, resolve_plugin_command_result,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
-from hermes_cli.plugins_native import NativePluginContextMixin
+from hermes_cli.plugins_native import NativePluginContextMixin, NativePluginManagerMixin
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
@@ -129,9 +129,7 @@ VALID_HOOKS: set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset", "on_session_delete",
-    # Bounded cleanup only, after native final gate/commit and capability invalidation.
-    "on_native_turn_end",
+    "on_native_turn_end", "on_session_finalize", "on_session_reset", "on_session_delete",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -1146,7 +1144,7 @@ def _resolve_hook_callback_timeout() -> float:
     return timeout
 
 
-class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+class PluginManager(NativePluginManagerMixin, PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self, scope_key: Optional[str] = None) -> None:
@@ -1155,10 +1153,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # original scope.  Normalize through hermes_home_key so the scope
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
-        self.home_path = Path(self.scope_key)
-        # Core-owned before discovery; never leased to the plugin unload ledger.
-        from agent.native_lifecycle import NativeLifecycleChannel
-        self.native_lifecycle = NativeLifecycleChannel(self.scope_key)
+        self._init_native_runtime()
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
@@ -1236,11 +1231,6 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # and contributed tool names (so `hermes plugins list` still attributes them).
         self._predeclared_modules: dict[str, types.ModuleType] = {}
         self._predeclared_tools: dict[str, list[str]] = {}
-
-    def configure_native_selector(self, bundle):
-        """Core bootstrap installs immutable profile pins outside plugin ledgers."""
-        from agent.native_selector import install_selector
-        install_selector(self.scope_key, bundle)
 
     @property
     def has_gateway_message_injector(self) -> bool:

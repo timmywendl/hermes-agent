@@ -75,3 +75,17 @@ class NativePluginContextMixin:
             finally:
                 current_invocation.reset(token)
         return async_wrapped if is_async else wrapped
+
+
+class NativePluginManagerMixin:
+    """Core-owned native state initialized before plugin discovery and ledgers."""
+    def _init_native_runtime(self):
+        from pathlib import Path
+        from agent.native_lifecycle import NativeLifecycleChannel
+        self.home_path = Path(self.scope_key)
+        self.native_lifecycle = NativeLifecycleChannel(self.scope_key)
+
+    def configure_native_selector(self, bundle):
+        """Core bootstrap installs immutable pins outside plugin ledgers."""
+        from agent.native_selector import install_selector
+        install_selector(self.scope_key, bundle)

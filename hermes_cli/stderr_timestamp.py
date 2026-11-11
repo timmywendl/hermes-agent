@@ -201,5 +201,180 @@ def main(argv: Sequence[str] | None = None) -> int:
     return _child_returncode_for_supervisor(args.command, returncode)
 
 
+
+
+def run_isolated_profile(spec, *, provider=None):
+    """Supervise a separately approved disposable Core/Control pair.
+
+    The programmatic launch owner supplies the provider. A JSON launch plan or
+    CLI flag cannot establish bootstrap authority; the default is denied.
+    """
+    import hashlib
+    import selectors
+    import socket
+    import time
+    import uuid
+    from agent.native_wire import receive, send, verified
+    from agent.native_bootstrap import PinnedBootstrapProvider
+    from hermes_platform.native_peer import process_snapshot
+
+    if provider is None:
+        raise PermissionError('isolated supervisor trust root UNKNOWN')
+    wrapper_digest = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    provider.verify_launch(spec, wrapper_digest)
+    profile = Path(spec['profile']).resolve()
+    if not (profile / '.hermes-isolated-profile').is_file():
+        raise PermissionError('disposable isolated profile required')
+    owner_lock = (profile / '.native-supervisor.lock').open('a')
+    import fcntl
+    try:
+        fcntl.flock(owner_lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        owner_lock.close()
+        raise PermissionError('isolated supervisor owner already alive') from None
+    epoch = uuid.uuid4().hex
+    children = {}
+    exit_signal = []
+    previous = {}
+    wrapper_identity = process_snapshot(os.getpid())
+    log_path = Path(spec['error_log'])
+
+    def forward(signum, _frame):
+        exit_signal.append(signum)
+        for item in children.values():
+            try:item['process'].send_signal(signum)
+            except ProcessLookupError:pass
+
+    def packet(role, operation, data):
+        item = children[role]
+        item['seq'] += 1
+        send(item['socket'], {'contract': 'hermes.private-bootstrap/1', 'role': role,
+            'profile': str(profile), 'supervisor': wrapper_identity, 'channel': item['channel'],
+            'seq': item['seq'], 'operation': operation, 'data': data})
+        reply = receive(item['socket'], 5)
+        if reply.get('channel') != item['channel'] or reply.get('seq') != item['seq']:
+            raise PermissionError('bootstrap acknowledgment mismatch')
+        return reply['result']
+
+    def spawn(role):
+        config = spec[role]
+        artifact = hashlib.sha256(Path(config['artifact']).read_bytes()).hexdigest()
+        if artifact != config['artifact_digest']:
+            raise PermissionError('isolated child artifact mismatch')
+        parent, child = socket.socketpair()
+        parent.set_inheritable(False);child.set_inheritable(False)
+        fd = child.fileno()
+        command = [*config['command'], '--native-bootstrap-fd', str(fd)]
+        env = {'HOME': str(profile.parent), 'HERMES_HOME': str(profile),
+               'PATH': '/usr/bin:/bin', 'LANG': 'C.UTF-8', 'PYTHONDONTWRITEBYTECODE': '1'}
+        try:
+            proc = subprocess.Popen(command, pass_fds=(fd,), close_fds=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        except BaseException:
+            parent.close();raise
+        finally:child.close()
+        item = {'process': proc, 'socket': parent, 'seq': 0, 'channel': uuid.uuid4().hex}
+        children[role] = item
+        item['pumps'] = [threading.Thread(target=_copy_stdout_with_timestamps,args=(proc.stdout,),daemon=True),
+                         threading.Thread(target=_copy_stderr_with_timestamps,args=(proc.stderr,log_path),daemon=True)]
+        for pump in item['pumps']:pump.start()
+        hello = receive(parent, 5)
+        actual = process_snapshot(proc.pid)
+        if (hello.get('contract') != 'hermes.private-bootstrap/1' or hello.get('role') != role
+                or hello.get('profile') != str(profile) or hello.get('process') != actual
+                or hello.get('artifact_digest') != artifact):
+            raise PermissionError('isolated child readiness mismatch')
+        item.update(identity=actual, hello=hello)
+        return item
+
+    try:
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            previous[signum] = signal.signal(signum, forward)
+        core, control = spawn('core'), spawn('control')
+        nonce = uuid.uuid4().hex
+        proof = packet('core', 'prove', {'nonce': nonce, 'control_epoch': control['hello']['data']['control_epoch']})
+        public = core['hello']['data']
+        body = verified(public['manager']['public_key'], proof)
+        if body != {'nonce': nonce, 'control_epoch': control['hello']['data']['control_epoch'], 'public': public}:
+            raise PermissionError('Core Manager bootstrap proof mismatch')
+        approvals = []
+        for role in ('manager', 'business'):
+            identity = public[role]
+            record = {'role': role, 'profile': str(profile), 'process': core['identity'],
+                'approval_ref': uuid.uuid4().hex, 'supervisor_epoch': epoch,
+                'control_epoch': control['hello']['data']['control_epoch'],
+                'artifact_digest': spec['core']['artifact_digest'], 'expires_at': time.time()+300, **identity}
+            # Provider corroborates the owned Popen identities/artifact/profile.
+            provider.verify_child(role, record, core['identity'])
+            PinnedBootstrapProvider(record).verify(record)
+            packet('control', 'approval', record)
+            packet('core', 'approval', record)
+            approvals.append(record['approval_ref'])
+        packet('core', 'connect', {'control': control['identity'], 'path': control['hello']['data']['path']})
+        ready = {'wrapper': wrapper_identity, 'supervisor_epoch': epoch,
+                 'control_epoch': control['hello']['data']['control_epoch'],
+                 'children': {role: item['process'].pid for role,item in children.items()},
+                 'approval_refs': approvals}
+        callback = getattr(provider, 'ready', None)
+        if callable(callback):callback(ready)
+        selector = selectors.DefaultSelector()
+        for role,item in children.items():selector.register(item['socket'], selectors.EVENT_READ, role)
+        try:
+            while not exit_signal:
+                ended = [item['process'] for item in children.values() if item['process'].poll() is not None]
+                if ended:return _child_returncode_for_supervisor([], ended[0].returncode)
+                for key,_ in selector.select(.02):
+                    # Unexpected EOF/unsolicited frames close both children, never promote a successor.
+                    if not key.fileobj.recv(1, socket.MSG_PEEK):
+                        if exit_signal:return 128 + exit_signal[0]
+                        try:
+                            rc = children[key.data]['process'].wait(timeout=.2)
+                        except subprocess.TimeoutExpired:
+                            return 127
+                        return _child_returncode_for_supervisor([], rc)
+                    raise PermissionError('unsolicited bootstrap data')
+                if callable(getattr(provider, 'should_stop', None)) and provider.should_stop():
+                    packet('core', 'revoke', {'operation_id': uuid.uuid4().hex})
+                    return 0
+        finally:selector.close()
+        return 128 + exit_signal[0]
+    except (EOFError, OSError):
+        if exit_signal:return 128 + exit_signal[0]
+        raise
+    finally:
+        # Closing private FDs also lets children terminate on wrapper fail-stop.
+        for item in children.values():
+            try:item['socket'].shutdown(socket.SHUT_RDWR)
+            except OSError:pass
+            item['socket'].close()
+        for item in children.values():
+            proc = item['process']
+            if proc.poll() is None:
+                try:proc.terminate()
+                except ProcessLookupError:pass
+            try:proc.wait(3)
+            except subprocess.TimeoutExpired:proc.kill();proc.wait(2)
+            for pump in item.get('pumps', ()):pump.join(1)
+            for pipe in (proc.stdout,proc.stderr):
+                if pipe:pipe.close()
+        for signum, handler in previous.items():signal.signal(signum, handler)
+        owner_lock.close()
+
+
+def isolated_profile_main(argv):
+    """Launch plans carry no authority; deployment provider is intentionally absent."""
+    import json
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--isolated-profile', required=True, type=Path)
+    args = parser.parse_args(argv)
+    try:
+        return run_isolated_profile(json.loads(args.isolated_profile.read_text()))
+    except (OSError, ValueError, PermissionError) as exc:
+        print(f'Isolated native bootstrap unavailable: {type(exc).__name__}', file=sys.stderr)
+        return 78
+
+
 if __name__ == "__main__":
+    if "--isolated-profile" in sys.argv[1:]:
+        sys.exit(isolated_profile_main(sys.argv[1:]))
     sys.exit(main())

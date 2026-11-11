@@ -654,3 +654,26 @@ def test_native_turn_end_occurs_after_commit_and_capability_invalidation(
     finally:
         release()
         manager.unload()
+
+
+def test_native_turn_end_registration_is_known_and_dispatches_cleanup(native, caplog):
+    import logging
+
+    from hermes_cli.plugins import PluginContext, PluginManager
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    profile, _, _ = native
+    manager = PluginManager(profile)
+    ctx = PluginContext(PluginManifest(name="turn-cleanup"), manager)
+    seen = []
+    caplog.set_level(logging.WARNING, logger="hermes_cli.plugins")
+    ctx.register_hook(
+        "on_native_turn_end",
+        lambda session_id, turn_id: seen.append((session_id, turn_id)),
+    )
+    manager.invoke_hook("on_native_turn_end", session_id="session", turn_id="turn")
+    assert seen == [("session", "turn")]
+    assert not any(
+        "registered unknown hook" in record.message for record in caplog.records
+    )
+    manager.unload()

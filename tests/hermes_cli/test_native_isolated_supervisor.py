@@ -231,3 +231,14 @@ def test_duplicate_wrapper_cannot_create_second_control_owner(owner):
     (root / "stop").touch()
     p.communicate(timeout=8)
     assert p.returncode == 0
+
+
+def test_delayed_startup_waits_for_test_readiness_signal(owner):
+    process, root = owner(first="delay")
+    assert wait_until(lambda: (root / "children.jsonl").exists(), timeout=5)
+    (root / "startup-release").touch()
+    info = ready(process, root)
+    assert set(info["children"]) == {"core", "control"}
+    (root / "stop").touch()
+    process.communicate(timeout=8)
+    assert process.returncode == 0

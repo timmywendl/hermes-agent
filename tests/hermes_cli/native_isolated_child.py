@@ -10,7 +10,6 @@ import stat
 import struct
 import subprocess
 import sys
-import threading
 import uuid
 from pathlib import Path
 
@@ -18,6 +17,7 @@ from agent.native_bootstrap import NativeBootstrapEndpoint
 from agent.native_control_verifier import NativeControlVerifier
 from agent.native_wire import canonical, send
 from hermes_platform.native_peer import process_snapshot
+from tests.waiting import wait_until
 
 
 def record(root, kind, **kw):
@@ -56,9 +56,10 @@ def descriptor_probe(fd, profile):
 
 
 def delayed_start(endpoint):
-    threading.Event().wait(
-        3
-    )  # health: allow HX013 -- actual startup interruption readiness boundary
+    # The owning test releases readiness; startup interruption closes the child.
+    assert wait_until(
+        lambda: (Path(endpoint.profile) / "startup-release").exists(), timeout=10
+    )
     return True
 
 

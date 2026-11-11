@@ -49,8 +49,9 @@ def _read(connection, size, deadline):
     return bytes(result)
 
 
-def receive(connection, timeout=2):
-    deadline = time.monotonic() + timeout
+def receive(connection, timeout=2, *, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + timeout
     size = struct.unpack('!I', _read(connection, 4, deadline))[0]
     if not 0 < size <= LIMIT:
         raise ValueError('native frame too large')

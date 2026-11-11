@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import contextvars
 import copy
+import inspect
 import threading
 from time import monotonic
 from dataclasses import dataclass, field
@@ -35,7 +36,17 @@ def register_gate(host, validate, *, on_commit=None):
     return release
 
 
+def gate_available(host):
+    with _gates_lock:
+        entry = _gates.get((host.profile, host.plugin_id))
+    return entry is not None and entry[0] is host and host.live()
+
+
 def requirements(message):
+    from agent.native_selector import select
+    selection = select(hermes_home_key(), message)
+    if selection is not None:
+        return selection.required if selection.valid() else ("<policy-unavailable>",)
     from hermes_cli.config_effective import load_user_config_effective
     config = load_user_config_effective(fail_closed=True)
     entries = config.get("plugins", {}).get("required_response_gates", [])
@@ -64,6 +75,18 @@ class TurnGate:
     closed: bool = False
     finished: bool = False
     receipt: dict = field(default_factory=dict)
+    selection: object = None
+
+    @property
+    def policy_digest(self):
+        return self.selection.digest if self.selection is not None else None
+
+    @property
+    def intake_allowed(self):
+        return self.selection is not None and self.selection.intake_allowed and self.policy_valid()
+
+    def policy_valid(self):
+        return self.selection is not None and self.selection.valid()
 
     def final_output(self, candidate, *, revalidate=False):
         if not self.required:
@@ -71,6 +94,9 @@ class TurnGate:
         if self.closed and (not revalidate or self.receipt.get("gate_decision") != "OUTPUT_GATE_PASSED"):
             return self.receipt.get("output", UNAVAILABLE)
         self.closed = True  # No late tool/callback can replace the accepted result.
+        if self.selection is not None and not self.policy_valid():
+            from agent.native_selector import POLICY_UNAVAILABLE
+            return self.deny(POLICY_UNAVAILABLE)
         approved = []
         for plugin_id in self.required:
             with _gates_lock:
@@ -117,9 +143,9 @@ class TurnGate:
                                        "query_result_digest": e.query_result_digest} for e in approved])
         return output
 
-    def deny(self):
-        self.receipt.update(gate_decision="DENIED", output=UNAVAILABLE)
-        return UNAVAILABLE
+    def deny(self, output=UNAVAILABLE):
+        self.receipt.update(gate_decision="DENIED", output=output)
+        return output
 
 
 def gated_output(candidate):
@@ -139,7 +165,9 @@ def run_guarded(agent, message, ingress, run):
     except Exception:  # health: allow BLE001 -- unreadable operator policy must never disable a required gate
         # Unreadable policy cannot be treated as no requirement.
         required = ("<policy-unavailable>",)
-    state = TurnGate(native, required)
+    from agent.native_selector import select
+    selection = select(hermes_home_key(), message)
+    state = TurnGate(native, required, selection=selection)
     token = current_turn.set(state)
     saved = {}
     pending = None
@@ -211,9 +239,16 @@ def notify_committed(state, receipt):
         if entry is None or entry[2] is None:
             continue
         done, accepted = threading.Event(), []
-        def observe(callback=entry[2], snapshot=copy.deepcopy(receipt), answer=accepted, signal=done):
+        def observe(callback=entry[2], snapshot=copy.deepcopy(receipt), answer=accepted, signal=done,
+                    native_host=entry[0], native_evidence=state.evidence.get(plugin_id)):
             try:
-                answer.append(callback(snapshot) is True)
+                parameters = inspect.signature(callback).parameters
+                if 'commit_use' in parameters:
+                    from agent.native_capabilities import commit_capability
+                    cap = commit_capability(native_host, native_evidence, state, receipt)
+                    answer.append(callback(snapshot, commit_use=cap) is True)
+                else:
+                    answer.append(callback(snapshot) is True)
             except Exception:  # health: allow BLE001 -- an observer failure keeps its ACK unknown without leaking plugin exception text
                 answer.append(False)
             finally:

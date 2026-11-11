@@ -27,18 +27,24 @@ pytestmark = pytest.mark.platforms('macos')
 @pytest.fixture
 def control_peer(tmp_path, monkeypatch):
     # External runners are not sufficient: bind both HOME and HERMES_HOME here.
-    home = tmp_path / 'user'
-    home.mkdir()
-    (home / '.native-test-fixture').write_text('disposable')
-    monkeypatch.setenv('HOME', str(home))
-    monkeypatch.setenv('HERMES_HOME', str(home / 'hermes'))
-    assert (Path(os.environ['HOME']) / '.native-test-fixture').is_file()
+    monkeypatch.setenv('HOME', str(tmp_path))
+    assert Path(os.environ['HERMES_HOME']).resolve() != Path.home() / '.hermes'
     processes = []
     with tempfile.TemporaryDirectory(prefix='h-native-', dir='/tmp') as sockets:
-        def start(approved=None):
+        def start(approved=None, host=None):
+            assert host is not None
+            from agent.native_bootstrap import PinnedBootstrapProvider
+            epoch = __import__("uuid").uuid4().hex
+            record = {"role":"business", "profile":host.profile, "process":process_snapshot(os.getpid()),
+                "plugin_id":host.plugin_id,"host_instance":host.instance,"host_generation":host.generation,
+                "public_key":host._key.public_key().public_bytes_raw().hex(),"artifact_digest":"a"*64,
+                "approval_ref":"fixture-approval","supervisor_epoch":"fixture-supervisor",
+                "control_epoch":epoch,"expires_at":time.time()+60}
+            host._test_approval = PinnedBootstrapProvider(record).verify(record)
+            server_record = dict(record, process=approved or record["process"])
             path = str(Path(sockets) / f'c{len(processes)}.sock')
             process = subprocess.Popen([sys.executable, '-u', '-m', 'tests.agent.native_control_peer',
-                path, json.dumps(approved or process_snapshot(os.getpid())), hermes_home_key()],
+                path, json.dumps(server_record), hermes_home_key()],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=True, env=dict(os.environ))
             processes.append(process)
@@ -56,7 +62,13 @@ def control_peer(tmp_path, monkeypatch):
 def native_host():
     host = PluginHost('fixture', hermes_home_key())
     ingress = HumanText('project facts', session='s').native_ingress
-    state = TurnGate(consume_ingress(ingress, 's'), ())
+    from tests.agent.test_native_isolated_capabilities import bundle
+    from agent.native_selector import install_selector,select
+    b=bundle(hermes_home_key());install_selector(hermes_home_key(),b)
+    from pathlib import Path
+    Path(hermes_home_key()).mkdir(parents=True,exist_ok=True)
+    Path(hermes_home_key(),"config.yaml").write_text("plugins:\n  required_response_gates: "+json.dumps(b.record["required_response_gates"])+"\n")
+    state = TurnGate(consume_ingress(ingress, 's'), (), selection=select(hermes_home_key(),"hello"))
     turn_token = current_turn.set(state)
     invocation = host.invocation('query')
     call_token = current_invocation.set(invocation)
@@ -73,7 +85,8 @@ def raw_register(path, host, **changes):
     registration = {'contract': 'hermes.native-registration/2', 'plugin_id': host.plugin_id,
                     'profile': host.profile, 'host_instance': host.instance,
                     'host_generation': host.generation, 'process': process_snapshot(os.getpid()),
-                    'public_key': host._key.public_key().public_bytes_raw().hex()}
+                    'public_key': host._key.public_key().public_bytes_raw().hex(),
+                    'approval_ref':host._test_approval.approval_ref}
     registration.update(changes)
     send(connection, registration)
     return connection
@@ -82,15 +95,16 @@ def raw_register(path, host, **changes):
 def proof(connection, host, challenge=None):
     actual = receive(connection)
     send(connection, signed(host._key, actual if challenge is None else challenge))
-    assert receive(connection) == {'registered': actual['channel']}
+    assert receive(connection) == {'registered': actual['channel'], 'control_epoch':actual['control_epoch']}
     return actual
 
 
 def frame(host, invocation, channel, **changes):
-    payload = {'operation': 'query'}
+    payload = {'operation': 'query', 'payload': {}}
     body = {'contract': 'hermes.native-call/2', 'channel': channel,
             'invocation': asdict(invocation), 'nonce': 'test-nonce',
-            'expires_at': time.time() + 30,
+            'expires_at': time.time() + 30, 'control_epoch':host._test_approval.control_epoch,
+            'approval_ref':host._test_approval.approval_ref,
             'payload_digest': hashlib.sha256(canonical(payload)).hexdigest()}
     body.update(changes)
     return {'attestation': signed(host._key, body), 'payload': payload}
@@ -98,47 +112,48 @@ def frame(host, invocation, channel, **changes):
 
 def test_live_registration_restart_reload_result_and_expired_turn(control_peer, native_host):
     host, state, invocation = native_host
-    path, identity, process = control_peer()
-    channel = host.connect_control(path, identity)
-    result = channel.call(invocation, {'operation': 'query'})
+    path, identity, process = control_peer(host=host)
+    channel = host.connect_control(path, identity, supervisor_approval=host._test_approval)
+    result = channel.call(invocation, {'operation': 'query', 'payload': {}})
     assert result['pid'] == process.pid and result['turn'] == invocation.ingress.turn
     with pytest.raises(PermissionError, match='result binding'):
-        channel.call(invocation, {'operation': 'bad-result'})
+        channel.call(invocation, {'operation': 'query', 'payload': {'fixture_bad_result': True}})
     state.closed = True
     with pytest.raises(PermissionError, match='expired'):
-        channel.call(invocation, {})
+        channel.call(invocation, {'operation':'query','payload':{}})
     state.closed = False
     evidence = host.record_result(invocation, control_request_id='r', context_revision='c',
         mission_revision='m', query_result_digest='d', output='verified')
     state.closed = True
-    assert channel.call_evidence(evidence, {})['turn'] == invocation.ingress.turn
+    assert channel.call_evidence(evidence, {'operation':'query','payload':{}})['turn'] == invocation.ingress.turn
     with pytest.raises(PermissionError):
-        channel.call_evidence(copy.copy(evidence), {})
+        channel.call_evidence(copy.copy(evidence), {'operation':'query','payload':{}})
     state.finished = True
     with pytest.raises(PermissionError):
-        channel.call_evidence(evidence, {})
+        channel.call_evidence(evidence, {'operation':'query','payload':{}})
     state.finished = False
     state.closed = False
     process.terminate()
     process.wait(10)
     with pytest.raises((OSError, PermissionError)):
-        channel.call(invocation, {})
-    new_path, new_identity, _ = control_peer()
-    resumed = host.connect_control(new_path, new_identity)
-    assert resumed.call(invocation, {})['turn'] == invocation.ingress.turn
+        channel.call(invocation, {'operation':'query','payload':{}})
+    new_path, new_identity, _ = control_peer(host=host)
+    resumed = host.connect_control(new_path, new_identity, supervisor_approval=host._test_approval)
+    assert resumed.call(invocation, {'operation':'query','payload':{}})['turn'] == invocation.ingress.turn
     host.close()
     with pytest.raises(PermissionError):
-        resumed.call(invocation, {})
+        resumed.call(invocation, {'operation':'query','payload':{}})
     replacement = PluginHost('fixture', hermes_home_key())
     assert replacement.generation != host.generation
     try:
-        reloaded = replacement.connect_control(new_path, new_identity)
+        replacement_path, replacement_identity, _ = control_peer(host=replacement)
+        reloaded = replacement.connect_control(replacement_path, replacement_identity, supervisor_approval=replacement._test_approval)
         with pytest.raises(PermissionError):
-            reloaded.call(invocation, {})
+            reloaded.call(invocation, {'operation':'query','payload':{}})
         next_invocation = replacement.invocation('query')
         token = current_invocation.set(next_invocation)
         try:
-            assert reloaded.call(next_invocation, {})['turn'] == invocation.ingress.turn
+            assert reloaded.call(next_invocation, {'operation':'query','payload':{}})['turn'] == invocation.ingress.turn
         finally:
             current_invocation.reset(token)
     finally:
@@ -150,22 +165,23 @@ def test_wrong_supervisor_pin_rejects_native_peer(control_peer, native_host, fie
     host, _, _ = native_host
     approved = process_snapshot(os.getpid())
     approved[field] = approved[field] + 1 if isinstance(approved[field], (int, float)) else 'wrong'
-    path, identity, _ = control_peer(approved)
+    path, identity, _ = control_peer(approved, host=host)
     with pytest.raises((OSError, EOFError, PermissionError)):
-        host.connect_control(path, identity)
+        host.connect_control(path, identity, supervisor_approval=host._test_approval)
 
 
 @pytest.mark.parametrize('field,value', [('profile', '/wrong/profile'), ('plugin_id', 'stranger')])
 def test_registration_policy_rejects_wrong_profile_plugin(control_peer, native_host, field, value):
     host, _, _ = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     with raw_register(path, host, **{field: value}) as connection:
         with pytest.raises((OSError, EOFError)):
             receive(connection)
 
 
 def test_same_uid_unregistered_process(control_peer, native_host):
-    path, _, _ = control_peer()
+    host, _, _ = native_host
+    path, _, _ = control_peer(host=host)
     script = "import socket,sys; from agent.native_wire import receive; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]);\ntry: receive(s)\nexcept (OSError,EOFError): print('REJECTED')"
     result = subprocess.run([sys.executable, '-c', script, path], capture_output=True, text=True,
                             timeout=10, env=dict(os.environ), check=False)
@@ -174,7 +190,7 @@ def test_same_uid_unregistered_process(control_peer, native_host):
 
 def test_wrong_key_and_challenge_replay(control_peer, native_host):
     host, _, _ = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     with raw_register(path, host) as connection:
         challenge = receive(connection)
         send(connection, signed(Ed25519PrivateKey.generate(), challenge))
@@ -191,7 +207,7 @@ def test_wrong_key_and_challenge_replay(control_peer, native_host):
 @pytest.mark.parametrize('mutation', ['replay', 'expired', 'generation', 'old-channel', 'payload', 'invocation', 'key'])
 def test_signed_call_binding_and_replay(control_peer, native_host, mutation):
     host, _, invocation = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     with raw_register(path, host) as connection:
         challenge = proof(connection, host)
         valid = frame(host, invocation, challenge['channel'])
@@ -216,7 +232,7 @@ def test_signed_call_binding_and_replay(control_peer, native_host, mutation):
 @pytest.mark.parametrize('field', ['pid', 'uid', 'birth', 'boot', 'executable', 'executable_digest'])
 def test_registration_claim_cannot_override_kernel_identity(control_peer, native_host, field):
     host, _, _ = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     claimed = process_snapshot(os.getpid())
     claimed[field] = claimed[field] + 1 if isinstance(claimed[field], (int, float)) else 'forged'
     with raw_register(path, host, process=claimed) as connection:
@@ -226,11 +242,9 @@ def test_registration_claim_cannot_override_kernel_identity(control_peer, native
 
 def test_registered_public_key_must_match_proof(control_peer, native_host):
     host, _, _ = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     other_public = Ed25519PrivateKey.generate().public_key().public_bytes_raw().hex()
     with raw_register(path, host, public_key=other_public) as connection:
-        challenge = receive(connection)
-        send(connection, signed(host._key, challenge))
         with pytest.raises((OSError, EOFError)):
             receive(connection)
 
@@ -238,7 +252,7 @@ def test_registered_public_key_must_match_proof(control_peer, native_host):
 def test_expired_registration_challenge(control_peer, native_host):
     import threading
     host, _, _ = native_host
-    path, _, _ = control_peer()
+    path, _, _ = control_peer(host=host)
     with raw_register(path, host) as connection:
         challenge = receive(connection)
         # Server's finite receive deadline expires even before the proof TTL.
@@ -253,7 +267,7 @@ def test_expired_registration_challenge(control_peer, native_host):
 
 def test_client_checks_control_process_pin(control_peer, native_host):
     host, _, _ = native_host
-    path, identity, _ = control_peer()
+    path, identity, _ = control_peer(host=host)
     identity['birth'] += 1
     with pytest.raises(PermissionError, match='process mismatch'):
-        host.connect_control(path, identity)
+        host.connect_control(path, identity, supervisor_approval=host._test_approval)

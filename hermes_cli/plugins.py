@@ -1154,6 +1154,9 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
         self.home_path = Path(self.scope_key)
+        # Core-owned before discovery; never leased to the plugin unload ledger.
+        from agent.native_lifecycle import NativeLifecycleChannel
+        self.native_lifecycle = NativeLifecycleChannel(self.scope_key)
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and
@@ -1231,6 +1234,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # and contributed tool names (so `hermes plugins list` still attributes them).
         self._predeclared_modules: dict[str, types.ModuleType] = {}
         self._predeclared_tools: dict[str, list[str]] = {}
+
+    def configure_native_selector(self, bundle):
+        """Core bootstrap installs immutable profile pins outside plugin ledgers."""
+        from agent.native_selector import install_selector
+        install_selector(self.scope_key, bundle)
 
     @property
     def has_gateway_message_injector(self) -> bool:

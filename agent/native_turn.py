@@ -115,6 +115,10 @@ class ControlEvidence:
     query_result_digest: str
     output: str
     expires_at: float
+    result_ref: str = ""
+    projection_digest: str = ""
+    control_epoch: str = ""
+    channel_ref: str = ""
 
 
 class PluginHost:
@@ -137,6 +141,10 @@ class PluginHost:
         return (self._active and self.profile == hermes_home_key()
                 and self.process == process_identity())
 
+    def invalidate(self):
+        self._active = False
+        with self._lock:self._leases.clear()
+
     def close(self):
         self._active = False
         with self._lock:
@@ -145,13 +153,13 @@ class PluginHost:
                 channel.close()
             self._channels.clear()
 
-    def connect_control(self, path, approved_control):
+    def connect_control(self, path, approved_control, *, supervisor_approval=None):
         """Trusted plugin startup calls this with the supervisor-approved Control identity."""
         from agent.native_control_channel import NativeControlChannel
         with self._lock:
             if not self.live():
                 raise PermissionError("native host inactive")
-            channel = NativeControlChannel(self, path, approved_control)
+            channel = NativeControlChannel(self, path, approved_control, supervisor_approval=supervisor_approval)
             self._channels.append(channel)
             return channel
 
@@ -203,7 +211,8 @@ class PluginHost:
 
     def record_result(self, invocation: Invocation, *, control_request_id: str,
                       context_revision: str, mission_revision: str, query_result_digest: str,
-                      output: str, ttl: float = 30) -> ControlEvidence:
+                      output: str, ttl: float = 30, result_ref: str = "",
+                      projection_digest: str = "", control_epoch: str = "", channel_ref: str = "") -> ControlEvidence:
         if not self.matches(invocation) or invocation.ingress.source is not TurnSource.TOP_LEVEL_HUMAN:
             raise PermissionError("trusted Human invocation required")
         if (not all(isinstance(v, str) and v for v in (control_request_id, context_revision,
@@ -211,7 +220,8 @@ class PluginHost:
                 or len(output.encode("utf8")) > 65536):
             raise ValueError("invalid Control evidence")
         evidence = ControlEvidence(invocation, control_request_id, context_revision, mission_revision,
-                                   query_result_digest, output, time.monotonic() + ttl)
+                                   query_result_digest, output, time.monotonic() + ttl, result_ref,
+                                   projection_digest or digest(output), control_epoch, channel_ref)
         state = current_turn.get()
         with state.lock:
             state.evidence[self.plugin_id] = evidence

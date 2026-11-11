@@ -276,6 +276,9 @@ class PluginDispatchMixin:
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
         for cb in self._hooks.get(hook_name, []):
+            from agent.native_capabilities import HookScope, hook_scope
+            scope = HookScope(hook_name, kwargs)
+            scope_token = hook_scope.set(scope)
             try:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, timeout)
@@ -291,6 +294,9 @@ class PluginDispatchMixin:
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
                 if fail_closed:  # a guard that raised made no decision: same veto as a timeout
                     results.append(_policy_error_block_directive(hook_name, cb, exc))
+            finally:
+                scope.live = False
+                hook_scope.reset(scope_token)
         return results
 
     def _report_hook_failure(

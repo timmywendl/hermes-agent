@@ -9,6 +9,7 @@ from hermes_platform.native_peer import process_snapshot
 
 
 def serve(path, approved, profile):
+    from agent.native_bootstrap import PinnedBootstrapProvider
     with socket.socket(socket.AF_UNIX) as listener:
         listener.bind(path)
         listener.listen()
@@ -16,16 +17,23 @@ def serve(path, approved, profile):
         while True:
             connection, _ = listener.accept()
             try:
-                verifier = NativeControlVerifier(connection, approved_process=approved,
+                approval = PinnedBootstrapProvider(approved).verify(approved)
+                verifier = NativeControlVerifier(connection, approval=approval,
                                                  plugin_id='fixture', profile=profile)
                 while True:
                     body, payload = verifier.receive_call()
-                    if payload.get('operation') == 'bad-result':
+                    if payload.get('payload', {}).get('fixture_bad_result'):
                         send(connection, {'call_nonce': body['nonce'], 'payload_digest': body['payload_digest'],
+                                          'control_epoch':approval.control_epoch,
                                           'result': {'output': 'different'}, 'result_digest': 'wrong'})
                     else:
-                        verifier.reply(body, {'turn': body['invocation']['ingress']['turn'],
-                                              'pid': __import__('os').getpid(), 'value': payload})
+                        # Synthetic peer only; product responses require Control-owned permit.
+                        result={'turn':body['invocation']['ingress']['turn'],'pid':__import__('os').getpid(),'value':payload}
+                        from agent.native_wire import canonical
+                        import hashlib
+                        send(connection,{'call_nonce':body['nonce'],'payload_digest':body['payload_digest'],
+                            'control_epoch':approval.control_epoch,'result':result,
+                            'result_digest':hashlib.sha256(canonical(result)).hexdigest()})
             except (PermissionError, OSError, EOFError, ValueError, KeyError, TypeError):
                 connection.close()
 

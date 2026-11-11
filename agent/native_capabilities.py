@@ -40,6 +40,43 @@ class _Opaque:
         raise TypeError("opaque native capability")
 
 
+def _bounded_lookup_id(value):
+    if type(value) is not str or not value.strip():
+        return False
+    try:
+        return 0 < len(value.encode("utf8")) <= 256
+    except UnicodeError:
+        return False
+
+
+def _pending_lookup_payload(payload, projects):
+    # A receipt is an untrusted selector for exact durable readback, not an
+    # invocation, authorization, arbitrary operation or old Session capability.
+    if (
+        type(payload) is not dict
+        or set(payload) not in ({"project_id"}, {"project_id", "reconcile_use"})
+        or not _bounded_lookup_id(payload.get("project_id"))
+        or payload["project_id"] not in projects
+    ):
+        return False
+    if "reconcile_use" not in payload:
+        return True
+    receipt = payload["reconcile_use"]
+    if (
+        type(receipt) is not dict
+        or set(receipt) != {"request_id", "result_ref", "projection_digest"}
+        or not _bounded_lookup_id(receipt["request_id"])
+        or not _bounded_lookup_id(receipt["result_ref"])
+    ):
+        return False
+    value = receipt["projection_digest"]
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(char in "0123456789abcdef" for char in value)
+    )
+
+
 class NativeIntakeCapability(_Opaque):
     _scope: HookScope
     _state: Any
@@ -116,7 +153,7 @@ class NativeIntakeCapability(_Opaque):
                     or digest(payload["message"]) != scope.message_digest
                 )
                 or operation == "pending_lookup"
-                and payload.get("project_id") not in state.selection.projects
+                and not _pending_lookup_payload(payload, state.selection.projects)
             ):
                 raise PermissionError("original native message/project required")
             token = current_invocation.set(self._invocation)

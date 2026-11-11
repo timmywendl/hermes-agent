@@ -677,3 +677,145 @@ def test_native_turn_end_registration_is_known_and_dispatches_cleanup(native, ca
         "registered unknown hook" in record.message for record in caplog.records
     )
     manager.unload()
+
+
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        None,
+        {
+            "request_id": "request-1",
+            "result_ref": "result-1",
+            "projection_digest": "a" * 64,
+        },
+        {
+            "request_id": "é" * 128,
+            "result_ref": "r" * 256,
+            "projection_digest": "0" * 64,
+        },
+    ],
+)
+def test_hook_pending_lookup_accepts_only_bound_project_and_exact_use_receipt(
+    native, receipt
+):
+    _, host, state = native
+    channel = _Channel(host)
+    payload = {"project_id": "cloud"}
+    if receipt is not None:
+        payload["reconcile_use"] = receipt
+    scope = HookScope("pre_llm_call", {"user_message": "Check Cloud Test status"})
+    token = hook_scope.set(scope)
+    try:
+        cap = intake_capability(host, channel)
+        assert cap.pending_lookup(payload) == {"state": "RECEIVED"}
+        invocation, sent = channel.calls[0]
+        assert invocation.ingress is state.ingress
+        assert invocation.tool_name == "__native_intake__"
+        assert sent == {"operation": "pending_lookup", "payload": payload}
+        with pytest.raises(PermissionError):
+            cap.pending_lookup(payload)
+        assert len(channel.calls) == 1
+    finally:
+        hook_scope.reset(token)
+
+
+_USE_RECEIPT = {
+    "request_id": "request-1",
+    "result_ref": "result-1",
+    "projection_digest": "a" * 64,
+}
+_INVALID_LOOKUPS = [
+    {},
+    None,
+    [],
+    {"project_id": None},
+    {"project_id": True},
+    {"project_id": "load"},
+    {"project_id": "cloud", "operation": "response_used"},
+    {"project_id": "cloud", "session_id": "old-session"},
+    {"project_id": "cloud", "reconcile_use": None},
+    {"project_id": "cloud", "reconcile_use": []},
+    {"project_id": "cloud", "reconcile_use": {}},
+    {
+        "project_id": "cloud",
+        "reconcile_use": dict(_USE_RECEIPT, authority="human-approved"),
+    },
+    {
+        "project_id": "cloud",
+        "reconcile_use": dict(_USE_RECEIPT, session_id="old-session"),
+    },
+]
+_INVALID_LOOKUPS += [
+    {
+        "project_id": "cloud",
+        "reconcile_use": {k: v for k, v in _USE_RECEIPT.items() if k != missing},
+    }
+    for missing in _USE_RECEIPT
+]
+_INVALID_LOOKUPS += [
+    {"project_id": "cloud", "reconcile_use": dict(_USE_RECEIPT, **{key: value})}
+    for key in ("request_id", "result_ref")
+    for value in (None, True, 7, "", "  ", "x" * 257, "é" * 129, "\ud800")
+]
+_INVALID_LOOKUPS += [
+    {
+        "project_id": "cloud",
+        "reconcile_use": dict(_USE_RECEIPT, projection_digest=value),
+    }
+    for value in (None, True, b"a" * 64, "", "a" * 63, "a" * 65, "g" * 64, "A" * 64)
+]
+
+
+@pytest.mark.parametrize("payload", _INVALID_LOOKUPS)
+def test_hook_pending_lookup_rejects_extra_rpc_fields_and_invalid_receipt_before_send(
+    native, payload
+):
+    _, host, _ = native
+    channel = _Channel(host)
+    scope = HookScope("pre_llm_call", {"user_message": "Check Cloud Test status"})
+    token = hook_scope.set(scope)
+    try:
+        cap = intake_capability(host, channel)
+        with pytest.raises(PermissionError):
+            cap.pending_lookup(payload)
+        assert channel.calls == []
+        with pytest.raises(PermissionError):
+            cap.pending_lookup({"project_id": "cloud"})
+        assert channel.calls == []
+    finally:
+        hook_scope.reset(token)
+
+
+def test_use_ack_selector_reconciliation_uses_fresh_human_session_capability(native):
+    from agent.native_selector import select
+
+    profile, host, old = native
+    channel = _Channel(host)
+    ingress = issue_ingress(
+        TurnSource.TOP_LEVEL_HUMAN,
+        actor="fixture",
+        conversation="fresh-conversation",
+        session="fresh-session",
+    )
+    fresh = TurnGate(
+        consume_ingress(ingress, "fresh-session"),
+        ("fixture",),
+        selection=select(profile, "Check Cloud Test status"),
+    )
+    turn = current_turn.set(fresh)
+    scope = HookScope("pre_llm_call", {"user_message": "Check Cloud Test status"})
+    token = hook_scope.set(scope)
+    try:
+        cap = intake_capability(host, channel)
+        cap.pending_lookup({"project_id": "cloud", "reconcile_use": dict(_USE_RECEIPT)})
+        invocation, payload = channel.calls[0]
+        assert (
+            invocation.ingress is fresh.ingress
+            and invocation.ingress is not old.ingress
+        )
+        assert invocation.ingress.session == "fresh-session"
+        assert payload["payload"]["reconcile_use"] == _USE_RECEIPT
+        assert "session_id" not in payload["payload"]["reconcile_use"]
+    finally:
+        hook_scope.reset(token)
+        current_turn.reset(turn)

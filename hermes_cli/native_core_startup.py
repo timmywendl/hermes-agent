@@ -47,25 +47,48 @@ def _validate_selector(bundle, profile):
         raise PermissionError("qualified selector required before discovery")
 
 
+def _discard_bootstrap_fds(descriptors):
+    for fd in set(descriptors):
+        try:
+            os.close(fd)
+        except OSError:
+            # Invalid options may name already-closed FDs; still close the rest.
+            pass
+
+
 def _take_bootstrap_fd():
-    """Consume only the private option, leaving ordinary Hermes parsing unchanged."""
+    """Scan all private options before rejecting, so appended owned FDs are closed."""
     descriptors, remaining = [], []
-    args = iter(sys.argv[1:])
-    try:
-        for arg in args:
-            if arg == "--native-bootstrap-fd":
-                descriptors.append(int(next(args)))
-            elif arg.startswith("--native-bootstrap-fd="):
-                descriptors.append(int(arg.split("=", 1)[1]))
-            else:
-                remaining.append(arg)
-        if len(descriptors) > 1 or any(fd < 3 for fd in descriptors):
-            raise ValueError("invalid bootstrap descriptor")
-    except (ValueError, StopIteration):
-        for fd in set(descriptors):
-            if fd >= 3:
-                os.close(fd)
-        raise PermissionError("one private bootstrap descriptor required") from None
+    args = sys.argv[1:]
+    index, count, invalid = 0, 0, False
+    while index < len(args):
+        arg = args[index]
+        index += 1
+        if arg == "--native-bootstrap-fd":
+            count += 1
+            if index == len(args) or args[index].startswith("--native-bootstrap-fd"):
+                invalid = True
+                continue
+            raw = args[index]
+            index += 1
+        elif arg.startswith("--native-bootstrap-fd="):
+            count += 1
+            raw = arg.split("=", 1)[1]
+        else:
+            remaining.append(arg)
+            continue
+        try:
+            fd = int(raw)
+        except ValueError:
+            invalid = True
+            continue
+        if not 3 <= fd < 2**31:
+            invalid = True
+            continue
+        descriptors.append(fd)
+    if invalid or count > 1:
+        _discard_bootstrap_fds(descriptors)
+        raise PermissionError("one private bootstrap descriptor required")
     sys.argv[1:] = remaining
     return descriptors[0] if descriptors else None
 

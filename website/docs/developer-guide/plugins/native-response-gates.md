@@ -281,6 +281,9 @@ The CLI console entrypoint `hermes_cli.main:main` and the direct Gateway entrypo
 The normal invocation retains its existing behavior. An explicit
 `--native-bootstrap-fd FD` requests native startup; the flag supplies a descriptor,
 never authority. It is removed before the ordinary parser and fast dispatch paths.
+Malformed or duplicate private options are scanned completely before rejection,
+so a genuine inherited descriptor appended after an invalid option is still closed;
+standard input/output/error descriptors are never reclaimed by this parser.
 A request without independently supplied `CoreLaunchPins` is denied, and a launch
 with pins but no descriptor is denied. A marked disposable profile is required.
 There is no production provider resolver, environment trust switch, writable key

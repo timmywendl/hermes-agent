@@ -265,3 +265,38 @@ def test_selector_invalidated_during_registration_never_becomes_ready(launch, fa
     assert any(r["kind"] == "business" for r in rows(root))
     assert not (root / "ready.json").exists()
     assert not any(r["kind"] == "application_entered" for r in rows(root))
+
+
+@pytest.mark.parametrize("options", [
+    ["--native-bootstrap-fd", "malformed", "--native-bootstrap-fd", "{fd}"],
+    ["--native-bootstrap-fd", "--native-bootstrap-fd", "{fd}"],
+    ["--native-bootstrap-fd", "{fd}", "--native-bootstrap-fd", "{fd}"],
+    ["--native-bootstrap-fd", "{fd}", "--native-bootstrap-fd", "malformed"],
+    ["--native-bootstrap-fd=malformed", "--native-bootstrap-fd={fd}"],
+    ["--native-bootstrap-fd=2", "--native-bootstrap-fd={fd}"],
+    ["--native-bootstrap-fd=" + "9" * 100, "--native-bootstrap-fd={fd}"],
+])
+def test_rejected_private_options_close_all_identifiable_inherited_fds(monkeypatch, options):
+    import socket
+
+    from hermes_cli.main import main
+
+    parent, child = socket.socketpair()
+    fd = child.detach()
+    monkeypatch.setattr(sys, "argv", ["hermes", *(s.format(fd=fd) for s in options)])
+    try:
+        with pytest.raises(PermissionError):
+            main()
+        with pytest.raises(OSError):
+            os.fstat(fd)
+        parent.settimeout(2)
+        assert parent.recv(1) == b""
+        # The parser must never close stdout/stderr as part of malformed input cleanup.
+        os.fstat(1)
+        os.fstat(2)
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        parent.close()

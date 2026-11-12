@@ -9,10 +9,10 @@ import contextvars
 import copy
 import inspect
 import threading
-from time import monotonic
 from dataclasses import dataclass, field
+from time import monotonic
 
-from agent.native_turn import (TurnSource, consume_ingress, current_turn, digest)
+from agent.native_turn import TurnSource, consume_ingress, current_turn, digest
 from hermes_constants import hermes_home_key
 
 UNAVAILABLE = "Current project facts are UNKNOWN: trusted Control evidence is unavailable."
@@ -76,6 +76,7 @@ class TurnGate:
     finished: bool = False
     receipt: dict = field(default_factory=dict)
     selection: object = None
+    recovery_store: object = None
 
     @property
     def policy_digest(self):
@@ -167,7 +168,8 @@ def run_guarded(agent, message, ingress, run):
         required = ("<policy-unavailable>",)
     from agent.native_selector import select
     selection = select(hermes_home_key(), message)
-    state = TurnGate(native, required, selection=selection)
+    state = TurnGate(native, required, selection=selection,
+                     recovery_store=getattr(agent, "_session_db", None))
     token = current_turn.set(state)
     saved = {}
     pending = None

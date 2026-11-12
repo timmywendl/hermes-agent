@@ -9,8 +9,11 @@ import os
 
 from gateway.session_admission import admission_fingerprint
 from hermes_state_runtime import (
-    RuntimeStoreError, _secret_digest, adopt_worker_execution,
-    mutate_worker_execution, register_worker_execution,
+    RuntimeStoreError,
+    _secret_digest,
+    adopt_worker_execution,
+    mutate_worker_execution,
+    register_worker_execution,
 )
 
 _SCOPE = {'profile_id', 'session_id', 'execution_id', 'generation', 'pid', 'birth', 'secret'}
@@ -71,6 +74,9 @@ async def worker_request(connection, ref, params, *, operation):
     if operation == "persist" and params.get("operation") == "child.reserve":
         from gateway.session_worker_child import worker_child_request
         return await worker_child_request(connection, ref, params)
+    if operation == 'persist' and params.get('operation') == 'native.recovery':
+        from gateway.session_worker_native_recovery import native_recovery_request
+        return await native_recovery_request(connection, ref, params)
     extra = {'register': {'kind'}, 'adopt': set(), 'persist': {'epoch', 'sequence', 'operation', 'payload'}}[operation]
     if set(params) != _SCOPE | extra:
         raise RuntimeStoreError('invalid_params')

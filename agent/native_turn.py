@@ -119,6 +119,7 @@ class ControlEvidence:
     projection_digest: str = ""
     control_epoch: str = ""
     channel_ref: str = ""
+    project_id: str = ""
 
 
 class PluginHost:
@@ -143,7 +144,8 @@ class PluginHost:
 
     def invalidate(self):
         self._active = False
-        with self._lock:self._leases.clear()
+        with self._lock:
+            self._leases.clear()
 
     def close(self):
         self._active = False
@@ -212,16 +214,20 @@ class PluginHost:
     def record_result(self, invocation: Invocation, *, control_request_id: str,
                       context_revision: str, mission_revision: str, query_result_digest: str,
                       output: str, ttl: float = 30, result_ref: str = "",
-                      projection_digest: str = "", control_epoch: str = "", channel_ref: str = "") -> ControlEvidence:
+                      projection_digest: str = "", control_epoch: str = "", channel_ref: str = "",
+                      project_id: str = "") -> ControlEvidence:
         if not self.matches(invocation) or invocation.ingress.source is not TurnSource.TOP_LEVEL_HUMAN:
             raise PermissionError("trusted Human invocation required")
         if (not all(isinstance(v, str) and v for v in (control_request_id, context_revision,
                 mission_revision, query_result_digest, output)) or not 0 < ttl <= 60
                 or len(output.encode("utf8")) > 65536):
             raise ValueError("invalid Control evidence")
+        state = current_turn.get()
+        if project_id and (state.selection is None or project_id not in state.selection.projects):
+            raise PermissionError("Control project not selected")
         evidence = ControlEvidence(invocation, control_request_id, context_revision, mission_revision,
                                    query_result_digest, output, time.monotonic() + ttl, result_ref,
-                                   projection_digest or digest(output), control_epoch, channel_ref)
+                                   projection_digest or digest(output), control_epoch, channel_ref, project_id)
         state = current_turn.get()
         with state.lock:
             state.evidence[self.plugin_id] = evidence

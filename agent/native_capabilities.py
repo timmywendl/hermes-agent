@@ -127,23 +127,51 @@ class NativeIntakeCapability(_Opaque):
         self._lock = threading.Lock()
         self._invocation = host.invocation("__native_intake__")
 
+    def _validate(self, *, after_call=False):
+        from agent.response_gate import gate_available
+        scope, state = self._scope, self._state
+        if (
+            self._used and not after_call
+            or not scope.live
+            or time.monotonic() >= scope.deadline
+            or current_turn.get() is not state
+            or state.closed
+            or state.finished
+            or self._invocation is None
+            or state.ingress is not self._invocation.ingress
+            or not gate_available(self._host)
+            or self._host.generation != self._generation
+            or not self._host.live()
+            or not self._channel.live()
+            or self._policy != getattr(state, "policy_digest", None)
+            or callable(getattr(state, "policy_valid", None))
+            and not state.policy_valid()
+        ):
+            raise PermissionError("native intake capability expired")
+
+    def recovery_hints(self, project_id):
+        from agent.native_recovery import UNKNOWN, recovery_operation
+        with self._lock:
+            self._validate()
+            if project_id not in self._state.selection.projects:
+                raise PermissionError("selected native project required")
+            try:
+                result = recovery_operation(self._state, self._host.profile, 'read',
+                                            {'project_id': project_id}, self._scope.deadline)
+                self._validate()
+                if (result.get('state') not in ('NONE', 'ONE', 'AMBIGUOUS', 'EXPIRED', 'UNKNOWN')
+                        or result.get('state') == 'ONE' and not _pending_lookup_payload(
+                            {'project_id': project_id, 'reconcile_use': result.get('selector')},
+                            self._state.selection.projects)):
+                    return dict(UNKNOWN)
+                return result
+            except Exception:  # health: allow BLE001 -- persistence failures are a fixed UNKNOWN, never raw DB details
+                return dict(UNKNOWN)
+
     def _call(self, operation, payload):
         with self._lock:
+            self._validate()
             scope, state = self._scope, self._state
-            if (
-                self._used
-                or not scope.live
-                or time.monotonic() >= scope.deadline
-                or current_turn.get() is not state
-                or state.closed
-                or state.finished
-                or self._host.generation != self._generation
-                or not self._channel.live()
-                or self._policy != getattr(state, "policy_digest", None)
-                or callable(getattr(state, "policy_valid", None))
-                and not state.policy_valid()
-            ):
-                raise PermissionError("native intake capability expired")
             object.__setattr__(self, "_used", True)
             if (
                 not isinstance(payload, dict)
@@ -158,11 +186,17 @@ class NativeIntakeCapability(_Opaque):
                 raise PermissionError("original native message/project required")
             token = current_invocation.set(self._invocation)
             try:
-                return self._channel.call(
+                result = self._channel.call(
                     self._invocation,
                     {"operation": operation, "payload": payload},
                     deadline=scope.deadline,
                 )
+                self._validate(after_call=True)
+                if operation == 'pending_lookup' and 'reconcile_use' in payload:
+                    from agent.native_recovery import settle
+                    settle(state, self._host.profile, payload['project_id'],
+                           payload['reconcile_use']['request_id'], result, scope.deadline)
+                return result
             finally:
                 current_invocation.reset(token)
 
@@ -201,6 +235,8 @@ class CommitUseCapability(_Opaque):
             or not evidence.result_ref
             or not evidence.control_epoch
             or not evidence.channel_ref
+            or not evidence.project_id
+            or evidence.project_id not in state.selection.projects
             or evidence.projection_digest != digest(evidence.output)
             or not state.policy_valid()
             or not gate_available(host)
@@ -212,11 +248,11 @@ class CommitUseCapability(_Opaque):
         self._used = False
         self._lock = threading.Lock()
 
-    def response_used(self, payload=None):
-        with self._lock:
-            e, state, host = self._evidence, self._state, self._host
-            if (
-                self._used
+    def _validate(self, *, after_persist=False):
+        from agent.response_gate import gate_available
+        e, state, host = self._evidence, self._state, self._host
+        if (
+                self._used and not after_persist
                 or time.monotonic() >= self._deadline
                 or state.finished
                 or current_turn.get() is not state
@@ -227,8 +263,15 @@ class CommitUseCapability(_Opaque):
                 or digest(e.output) != self._receipt["final_output_digest"]
                 or callable(getattr(state, "policy_valid", None))
                 and not state.policy_valid()
-            ):
-                raise PermissionError("native commit-use capability expired")
+        ):
+            raise PermissionError("native commit-use capability expired")
+        if not state.closed or not gate_available(host):
+            raise PermissionError("native commit-use gate unavailable")
+
+    def response_used(self, payload=None):
+        with self._lock:
+            e, state, host = self._evidence, self._state, self._host
+            self._validate()
             expected = {
                 "request_id": e.control_request_id,
                 "result_ref": e.result_ref,
@@ -246,17 +289,31 @@ class CommitUseCapability(_Opaque):
             if len(channels) != 1:
                 raise PermissionError("native evidence channel ambiguous")
             object.__setattr__(self, "_used", True)
+            from agent.native_recovery import UNKNOWN, persist, settle
+            try:
+                if persist(state, e, self._deadline) != {'state': 'PERSISTED'}:
+                    return dict(UNKNOWN)
+            except Exception:  # health: allow BLE001 -- no response-use RPC without a known durable hint commit
+                return dict(UNKNOWN)
+            self._validate(after_persist=True)
             # Only this original capability can invoke response_used after output commit.
             if not channels[0].lock.acquire(
                 timeout=max(0, self._deadline - time.monotonic())
             ):
                 raise TimeoutError("native commit lock expired")
             try:
-                return channels[0]._call(
+                self._validate(after_persist=True)
+                result = channels[0]._call(
                     e.invocation,
                     {"operation": "response_used", "payload": expected},
                     deadline=self._deadline,
                 )
+                try:
+                    settle(state, host.profile, e.project_id, e.control_request_id,
+                           result, self._deadline)
+                except Exception:  # health: allow BLE001 -- cleanup failure preserves durable recovery and an UNKNOWN observer
+                    return dict(UNKNOWN)
+                return result
             finally:
                 channels[0].lock.release()
 

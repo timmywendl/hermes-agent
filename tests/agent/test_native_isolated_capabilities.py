@@ -108,11 +108,15 @@ def native(tmp_path, monkeypatch):
         selection=select(profile, "Check Cloud Test status"),
     )
     from agent.response_gate import register_gate
+    from hermes_state import SessionDB
+    recovery_store = SessionDB(Path(profile) / 'state.db')
+    state.recovery_store = recovery_store
 
     cleanup = register_gate(host, lambda evidence: True)
     token = current_turn.set(state)
     yield profile, host, state
     cleanup()
+    recovery_store.close()
     host.close()
     state.finished = True
     current_turn.reset(token)
@@ -304,6 +308,7 @@ def test_original_commit_evidence_only_and_finished_unload_expiry(native):
             result_ref="result1",
             control_epoch="control1",
             channel_ref="channel1",
+            project_id="cloud",
         )
     finally:
         current_invocation.reset(t)
@@ -457,6 +462,7 @@ def test_commit_capability_wrong_projection_changed_evidence_and_deadline(
             result_ref="result",
             control_epoch="control1",
             channel_ref="channel1",
+            project_id="cloud",
         )
     finally:
         current_invocation.reset(t)
@@ -511,6 +517,7 @@ def test_late_commit_observer_cannot_send_after_turn_finish(native):
             result_ref="result",
             control_epoch="control1",
             channel_ref="channel1",
+            project_id="cloud",
         )
     finally:
         current_invocation.reset(t)
@@ -638,6 +645,7 @@ def test_native_turn_end_occurs_after_commit_and_capability_invalidation(
                     result_ref="result",
                     control_epoch="control1",
                     channel_ref="channel1",
+            project_id="cloud",
                 )
             finally:
                 current_invocation.reset(token)
@@ -645,7 +653,7 @@ def test_native_turn_end_occurs_after_commit_and_capability_invalidation(
 
     try:
         result = run_guarded(
-            SimpleNamespace(session_id="s"), "Check Cloud Test status", ingress, run
+            SimpleNamespace(session_id="s", _session_db=native[2].recovery_store), "Check Cloud Test status", ingress, run
         )
         assert order == (["commit", "end"] if mode == "success" else ["end"])
         assert result["native_response_receipt"]["gate_decision"] == (

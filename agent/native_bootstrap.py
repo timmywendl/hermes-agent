@@ -137,9 +137,11 @@ class NativeBootstrapEndpoint:
             provider is None
             or not provider.verify_supervisor(approved_supervisor, profile)
             or not isinstance(approved_supervisor, dict)
-            or approved_supervisor != process_snapshot(os.getppid())
         ):
             raise PermissionError("approved supervisor process required")
+        from hermes_platform.native_peer import ProcessLivenessPin
+
+        self.owner_liveness = ProcessLivenessPin(os.getppid(), approved_supervisor)
         self.socket = socket.socket(fileno=fd)
         self.socket.set_inheritable(False)
         self.role, self.profile = role, profile

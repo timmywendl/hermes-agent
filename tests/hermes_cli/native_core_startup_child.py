@@ -124,7 +124,11 @@ def run():
                 assert requirements("hello") == ("<policy-unavailable>",)
                 assert requirements("Cloud Test status") == ("<policy-unavailable>",)
         record(root, "downstream", manager_alive=True)
-        assert wait_until(lambda: (root / "finish").exists(), timeout=10)
+        if fault == "liveness_idle":
+            from tests.hermes_cli.native_liveness_probe import measure_phase
+            measure_phase(root, "idle")
+        else:
+            assert wait_until(lambda: (root / "finish").exists(), timeout=10)
         return True
 
     if entry == "gateway":

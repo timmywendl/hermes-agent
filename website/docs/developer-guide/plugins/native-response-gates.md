@@ -381,3 +381,39 @@ test marker; cleanup still verifies the child's captured birth identity. Origina
 red failures and the green process records are retained separately. Production
 trust remains UNKNOWN/default DENY, Native Admission CLOSED and M1 Golden
 NOT_QUALIFIED; the 2.000-second release bound remains NOT_PROVEN.
+
+### Owner liveness polling and executable identity
+
+The existing Endpoint performs initial Supervisor approval and full executable
+SHA-256 verification once. `ProcessLivenessPin` binds that digest to the open file's
+device/inode, size, mtime/ctime in nanoseconds, mode and file owner/group, checking
+the descriptor before/after hashing, its current path and the process instance.
+This does not establish a trust root: the independent provider and exact approved
+Supervisor snapshot are still mandatory. Wire identity fields remain unchanged.
+
+Frequent Core checks keep the direct-parent relationship plus fresh kernel PID,
+birth, boot UUID, effective UID and executable path. They compare the executable's
+metadata fingerprint and never open/read/hash its contents. Any instance mismatch,
+metadata change or unavailable inspection fails closed; there is no same-UID
+fallback, automatic re-pin or periodic full-file scan. An updated executable,
+including an identical-content replacement inode, requires fresh approved bootstrap.
+Initial full verification remains outside the existing early owner-watch interval;
+no additional worker/listener/Store/Supervisor is introduced.
+
+**Residual same-interpreter re-exec limitation:** a re-exec that retains the observed
+PID/birth, boot, UID, executable path and file fingerprint is not detected by this
+monitor. Rehashing identical interpreter bytes would not establish that a trusted
+Supervisor script is still running either. The private FD is non-inheritable, but
+this process monitor alone does not prove exec absence while startup is blocked.
+This limitation remains an explicit production launch/trust qualification boundary;
+do not treat metadata liveness as Supervisor code attestation or production approval.
+
+`test_native_owner_liveness.py` asserts full initial verification, zero digest
+calls across repeated owner checks, fail-stop on reparenting/identity mismatch,
+artifact replacement and unavailable metadata, and CPU/I/O bounds in an actual
+idle disposable Gateway entrypoint. The six startup owner-loss process cases and
+normal revoke/ACK regressions remain required. Longer local measurements record
+Core process CPU (including fixture overhead), hot-loop digest calls/logical bytes
+and OS block counters; cached logical reads are distinct from physical disk I/O.
+Native Admission stays CLOSED, production unchanged, M1 Golden NOT_QUALIFIED and
+the 2.000-second hard release bound NOT_PROVEN.

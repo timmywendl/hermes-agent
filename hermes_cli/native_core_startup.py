@@ -22,7 +22,6 @@ from agent.native_bootstrap import NativeBootstrapEndpoint
 from agent.native_selector import CandidateSelectorBundle, require_selector
 from agent.native_turn import PluginHost
 from hermes_constants import hermes_home_key
-from hermes_platform.native_peer import process_snapshot
 
 
 @dataclass(frozen=True)
@@ -99,6 +98,7 @@ class NativeCoreStartup:
 
     def __init__(self, endpoint, pins):
         self.endpoint, self.pins = endpoint, pins
+        self.owner_liveness = endpoint.owner_liveness
         self.manager = None
         self.host = None
         self.approvals = {}
@@ -108,10 +108,10 @@ class NativeCoreStartup:
 
     def _check_owner(self):
         # Endpoint construction already independently approved this exact parent.
-        # Reparenting, PID reuse or exec/identity change must never become approval.
+        # Reparenting or an instance/file identity change cannot become approval.
         parent = self.endpoint.parent
         try:
-            alive = os.getppid() == parent["pid"] and process_snapshot(parent["pid"]) == parent
+            alive = os.getppid() == parent["pid"] and self.owner_liveness.is_alive()
         except PermissionError:
             alive = False
         if not alive:

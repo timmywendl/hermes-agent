@@ -65,6 +65,8 @@ def launch(tmp_path):
             "registration_artifact": "    from pathlib import Path\n    path = Path(__file__)\n    path.write_text(path.read_text() + '\\n# invalidated during registration\\n')\n",
         }
         plugin_source += registration_changes.get(fault, "")
+        if fault == "liveness_startup":
+            plugin_source += "    from tests.hermes_cli.native_liveness_probe import measure_phase\n    measure_phase(get_hermes_home(), 'startup')\n"
         if fault == "owner_loss_registration":
             plugin_source += "    from tests.hermes_cli.native_core_startup_child import owner_loss_boundary\n    with ctx.native_host._lock:\n        owner_loss_boundary(get_hermes_home(), 'registration')\n"
         if fault == "owner_loss_discovery":

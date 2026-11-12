@@ -39,6 +39,63 @@ def process_snapshot(pid):
         raise PermissionError('native peer identity unavailable') from None
 
 
+def _process_instance_snapshot(pid):
+    """Fresh kernel metadata only; never read executable content in a poll."""
+    try:
+        process = psutil.Process(pid)
+        with process.oneshot():
+            if process.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+                raise PermissionError('native owner exited')
+            return {'pid': pid, 'uid': process.uids().effective,
+                    'birth': process.create_time(), 'boot': _boot_identity(),
+                    'executable': str(Path(process.exe()).resolve())}
+    except (psutil.Error, OSError):
+        raise PermissionError('native owner identity unavailable') from None
+
+
+def _stat_identity(info):
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+            info.st_ctime_ns, info.st_mode, info.st_uid, info.st_gid)
+
+
+def _executable_identity(path):
+    return _stat_identity(os.stat(path))
+
+
+class ProcessLivenessPin:
+    """Full verification once, conservative metadata fencing on subsequent polls.
+
+    Metadata changes require a fresh approved bootstrap, never implicit re-pinning.
+    Same-interpreter re-exec with unchanged instance/file metadata is not detected.
+    This private monitor does not establish a Supervisor trust root by itself.
+    """
+
+    def __init__(self, pid, approved):
+        instance = _process_instance_snapshot(pid)
+        try:
+            with open(instance['executable'], 'rb') as source:
+                before = _stat_identity(os.fstat(source.fileno()))
+                digest = hashlib.file_digest(source, 'sha256').hexdigest()
+                after = _stat_identity(os.fstat(source.fileno()))
+            # Bind metadata to the descriptor actually hashed, not a separately
+            # sampled path that could name another file during verification.
+            stable = (before == after == _executable_identity(instance['executable'])
+                      and instance == _process_instance_snapshot(pid))
+        except OSError:
+            raise PermissionError('native owner artifact unavailable') from None
+        if not stable or dict(instance, executable_digest=digest) != approved:
+            raise PermissionError('native owner pin mismatch')
+        self.__instance, self.__executable = instance, after
+
+    def is_alive(self):
+        try:
+            actual = _process_instance_snapshot(self.__instance['pid'])
+            return (actual == self.__instance
+                    and _executable_identity(actual['executable']) == self.__executable)
+        except (PermissionError, OSError):
+            return False
+
+
 def kernel_peer(connection):
     if sys.platform != 'darwin':
         raise PermissionError('native peer platform unqualified')

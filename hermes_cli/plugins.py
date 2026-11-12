@@ -58,6 +58,7 @@ from hermes_cli.plugins_dispatch import (
     is_valid_system_prompt_section_id, resolve_plugin_command_result,
 )
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
+from hermes_cli.plugins_native import NativePluginContextMixin, NativePluginManagerMixin
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
@@ -128,7 +129,7 @@ VALID_HOOKS: set[str] = {
     # Run-all-then-pick-first (see get_plugin_error_classification). Privacy: error_message/
     # error_body may be unredacted.
     "transform_api_error_classification", "on_session_start", "on_session_end",
-    "on_session_finalize", "on_session_reset", "on_session_delete",
+    "on_native_turn_end", "on_session_finalize", "on_session_reset", "on_session_delete",
     # on_skill_lifecycle: successful skill lifecycle facts (local skill name visible to plugins).
     "on_skill_lifecycle", "subagent_start", "subagent_stop",
     # pre_gateway_dispatch: once per incoming MessageEvent, after the internal-event guard, BEFORE
@@ -225,7 +226,7 @@ class LoadedPlugin:
     deferred: bool = False
 
 
-class PluginContext:
+class PluginContext(NativePluginContextMixin):
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: PluginManager):
@@ -235,10 +236,6 @@ class PluginContext:
         # Set when this context's load overran ``plugins.load_timeout_seconds``: the abandoned worker may
         # still be running register(), and nothing it registers from then on may reach a registry.
         self._load_abandoned = False
-
-    def _abandon_load(self) -> None:
-        """Mark this load as timed out; every later ``register_*``/``subscribe``/``on_unload`` is ignored."""
-        self._load_abandoned = True
 
     @property
     def plugin_id(self) -> str:
@@ -473,6 +470,7 @@ class PluginContext:
             logger.warning("Plugin %s tried to shadow global tool %s without override=True",
                            self.manifest.name, name)
             return None
+        handler = self._bind_native_handler(name, handler, is_async=is_async)
         registry.register(
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
@@ -1146,7 +1144,7 @@ def _resolve_hook_callback_timeout() -> float:
     return timeout
 
 
-class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
+class PluginManager(NativePluginManagerMixin, PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
     """Central manager that discovers, loads, and invokes plugins."""
 
     def __init__(self, scope_key: Optional[str] = None) -> None:
@@ -1155,7 +1153,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         # original scope.  Normalize through hermes_home_key so the scope
         # matches the key the registries store under (normcase on Windows).
         self.scope_key = hermes_home_key(scope_key)
-        self.home_path = Path(self.scope_key)
+        self._init_native_runtime()
         self._discovery_lock = threading.RLock()
         self._discovered: bool = False
         # True once a discovery re-applied plugin secret sources for this home: the per-home snapshot and

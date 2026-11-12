@@ -8,15 +8,21 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
-from concurrent.futures import ThreadPoolExecutor
 import json
 import logging
 import os
-from pathlib import Path
 import queue
 import sys
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
 from hermes_dir_acl import make_user_dir
+
+from agent.runtime_session_compression import RuntimeSessionCompressionMixin
+from agent.runtime_session_lifecycle import RuntimeSessionLifecycleMixin
+from agent.runtime_session_native_recovery import RuntimeNativeRecoveryMixin
 
 logger = logging.getLogger(__name__)
 
@@ -135,11 +141,13 @@ class WorkerRPC:
                 return self.link
             # The owner closed it while idle, before any send: redial with a fresh ticket.
             self._drop()
-        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
-        from hermes_cli.gateway_runtime_discovery import query_identify
         from websockets.sync.client import connect
+
+        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
+
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
+        from hermes_cli.gateway_runtime_discovery import query_identify
         discovery = discover_gateway_endpoint(self.home, timeout=5)
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
@@ -169,7 +177,7 @@ class WorkerRPC:
         with self.lock:
             self._drop()
 
-    def __call__(self, method, **params):
+    def __call__(self, method, *, _deadline=None, **params):
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -179,12 +187,22 @@ class WorkerRPC:
                            method, threading.current_thread().name, _caller_summary())
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
         from websockets.exceptions import ConnectionClosed
-        with self.lock:
+        patience = 20 if _deadline is None else max(0, _deadline - time.monotonic())
+        if not self.lock.acquire(timeout=patience):
+            raise TimeoutError('worker_receipt_timeout')
+        try:
             self.request_id += 1
             request_id = self.request_id
             message = json.dumps({'jsonrpc': '2.0', 'id': request_id, 'method': method, 'params': params})
             try:
-                link = self._connection()
+                if _deadline is not None:
+                    # Bounded native recovery never performs discovery/reconnect.
+                    # The ordinary adopted worker path established this owner link.
+                    if self.link is None or not self.link.reader.is_alive():
+                        raise WorkerPersistenceError('owner_unavailable')
+                    link = self.link
+                else:
+                    link = self._connection()
                 try:
                     link.send(request_id, message)
                 except ConnectionClosed:
@@ -192,9 +210,11 @@ class WorkerRPC:
                     # on entry, or the socket write failed): the owner closed the link after the idle
                     # check and never saw this request, so redial and send it once more.
                     self._drop()
+                    if _deadline is not None:
+                        raise
                     link = self._connection()
                     link.send(request_id, message)
-                response = link.receive(20)
+                response = link.receive(20 if _deadline is None else max(0, _deadline - time.monotonic()))
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -205,15 +225,13 @@ class WorkerRPC:
                 global _worker_process
                 _worker_process = True
             return response['result']
+        finally:
+            self.lock.release()
 
 
-from agent.runtime_session_compression import RuntimeSessionCompressionMixin
 
 
-from agent.runtime_session_lifecycle import RuntimeSessionLifecycleMixin
-
-
-class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycleMixin):
+class RuntimeSessionStore(RuntimeNativeRecoveryMixin, RuntimeSessionCompressionMixin, RuntimeSessionLifecycleMixin):
     """Synchronous durable results with a private byte-bounded retry journal.
 
     A failed write remains pending, and failure is sticky until explicit retry or

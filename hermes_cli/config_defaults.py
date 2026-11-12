@@ -17,17 +17,7 @@ DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
 LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
 
 
-def _aux(timeout, *, reasoning_effort=True, **extra):
-    """Standard auxiliary-task model block (see DEFAULT_CONFIG["auxiliary"]).
-
-    reasoning_effort=False omits that key (MoA blocks configure depth per slot);
-    ``extra`` keys are appended after the standard ones.
-    """
-    d = {"provider": "auto", "model": "", "base_url": "", "api_key": "", "timeout": timeout, "extra_body": {}}
-    if reasoning_effort:
-        d["reasoning_effort"] = ""
-    d.update(extra)
-    return d
+from hermes_cli.config_default_helpers import _aux
 
 
 DEFAULT_CONFIG = {
@@ -1729,6 +1719,9 @@ DEFAULT_CONFIG = {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.
         "clone_timeout_seconds": 300,
+        # Host-owned scopes survive a missing/unloaded evidence plugin.
+        # [{"plugin_id": "project-facts", "request_terms": ["my project"]}]
+        "required_response_gates": [],
         # Wall-clock cap (seconds) for one in-process Python plugin hook callback; shell hooks keep
         # their own per-entry `timeout`. 0 = no cap (sync call on agent thread). Max 600.
         "hook_callback_timeout": 30,

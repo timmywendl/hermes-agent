@@ -522,6 +522,10 @@ class PluginLoaderMixin:
                 register_fn = module
                 module = sys.modules.get(getattr(register_fn, "__module__", ""))
             loaded.module = module
+            if plugin_key in getattr(self, "_native_bootstrap_hosts", {}):
+                if not callable(getattr(module, "register_native", None)):
+                    raise PermissionError("native bootstrap registration required")
+                return True
             if register_fn is None:
                 register_fn = getattr(module, "register", None)
             if register_fn is None:

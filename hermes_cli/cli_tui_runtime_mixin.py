@@ -28,6 +28,13 @@ logger = logging.getLogger("cli")
 class CLITuiRuntimeMixin:
     """Classic-TUI run loop phases: input processing, after-turn bookkeeping, startup banner/prewarm/maintenance, prompt_toolkit application build, signal handlers and shutdown."""
 
+    def _tui_wake_startup(self):
+        from cli import logger
+        try:
+            self._maybe_start_wake_word()
+        except Exception as e:
+            logger.debug("wake-word startup skipped: %s", e)
+
     def _tui_process_loop(self):
         """REPL worker thread: drain ``_pending_input``, run idle housekeeping, dispatch each input."""
         held = None
@@ -100,6 +107,9 @@ class CLITuiRuntimeMixin:
         from cli import _DIM, _PASTE_REF_RE, _RST, _cprint, _detect_file_drop, _looks_like_slash_command, _strip_leaked_bracketed_paste_wrappers, _strip_leaked_terminal_responses_with_meta
         from tools.process_registry_notifications import TimelineNotification
         self._tui_dock_drop_dequeued()
+        envelope = user_input[0] if isinstance(user_input, tuple) else user_input
+        from agent.native_turn import HumanText
+        native_ingress = envelope.native_ingress if isinstance(envelope, HumanText) else None
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
         if not user_input:
             return
@@ -159,7 +169,8 @@ class CLITuiRuntimeMixin:
         self._turn_summary_begin()
         self._app.invalidate()
         try:
-            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
+            self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input,
+                      native_ingress=native_ingress)
         finally:
             self._tui_after_turn()
 

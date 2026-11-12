@@ -286,7 +286,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 # (schema_read_probe_statements), never by this number, and its catch-up is the declarative
 # executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
 # idempotent). The bump only records that the declared shape changed; a new table or column needs no bump.
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -635,6 +635,25 @@ CREATE TABLE IF NOT EXISTS worker_receipts (
     payload_digest TEXT NOT NULL,
     result_json TEXT NOT NULL,
     PRIMARY KEY (execution_id, sequence)
+);
+
+-- v33: private operational selectors, deliberately outside transcript/exports.
+-- No session FK: deleting a conversation must not erase uncertain response use.
+CREATE TABLE IF NOT EXISTS native_response_use_hints (
+    project_id TEXT NOT NULL,
+    request_id TEXT NOT NULL,
+    result_ref TEXT NOT NULL,
+    projection_digest TEXT NOT NULL,
+    original_session_id TEXT NOT NULL,
+    original_turn_id TEXT NOT NULL,
+    original_control_epoch TEXT NOT NULL,
+    original_channel_ref TEXT NOT NULL,
+    original_host_generation TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    recovery_expires_at REAL NOT NULL,
+    retained_until REAL NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('PENDING','EXPIRED','BLOCKED')),
+    PRIMARY KEY (project_id, request_id, result_ref, projection_digest)
 );
 
 CREATE TABLE IF NOT EXISTS state_meta (

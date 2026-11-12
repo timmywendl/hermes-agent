@@ -32,11 +32,15 @@ class StreamDeliveryMixin:
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
         """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it."""
+        if getattr(self, "_native_output_held", False):
+            return False
         results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
         return any(results)
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
+        if getattr(self, "_native_output_held", False):
+            return
         try:
             from agent.plugin_stream_hooks import enqueue_plugin_stream_hook
 
@@ -297,6 +301,8 @@ class StreamDeliveryMixin:
 
     def _fire_stream_delta(self, text: str) -> None:
         """Fire all registered stream delta callbacks (display + TTS)."""
+        if getattr(self, "_native_output_held", False):
+            return
         # A superseded stream must not interleave its tokens alongside the retry that replaced it.
         if self._stream_writer_superseded():
             # See #65991.

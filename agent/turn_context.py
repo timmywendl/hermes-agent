@@ -589,6 +589,10 @@ def _bind_turn_identity(
         f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
     )
     agent._relay_pending_turn_id = None
+    from agent.native_turn import current_turn
+    native = current_turn.get()
+    if native is not None and native.ingress is not None:
+        turn_id = native.ingress.turn
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn when this turn starts before the previous turn-end persist

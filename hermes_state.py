@@ -50,6 +50,7 @@ from hermes_state_guard import (
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
 from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+from hermes_state_native_recovery import NativeRecoveryMixin
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin, load_fts5_cjk_extension
 from hermes_state_portability import SessionPortabilityMixin
@@ -447,8 +448,6 @@ def divert_session_transcript_jsonl(session_id: str, messages) -> Optional[Path]
     return path
 
 
-# Process-wide shared SessionDB registry: long-lived in-process callers share ONE writer
-# connection per resolved path via hermes_state_registry.acquire(); one-shots use SessionDB() + close().
 def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     """Compatibility delegate to the state-holder authority."""
     return _state_holders.foreign_state_db_holders(db_path)
@@ -461,7 +460,7 @@ def _foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
 
 
 class SessionDB(
-    SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
+    NativeRecoveryMixin, SessionSessionsMixin, SessionFtsSetupMixin, SessionSearchMixin, SessionSchemaMixin,
     SessionPortabilityMixin, SessionTelegramTopicsMixin, SessionCompressionMixin,
     SessionGatewayMixin, SessionMaintenanceMixin, SessionUsageMixin, SessionTitlesMixin,
     SessionMessagesMixin, SessionPruneRewriteMixin, SessionApiContentMixin, SessionCoverageMixin, SessionRewindMixin, SessionProfileRepairMixin,
@@ -1006,13 +1005,14 @@ class SessionDB(
             self._wal_lock_guard = _lockguard.hold(self.db_path)
 
     def _execute_write(
-        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
+        self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None, *, _owner_deadline=None,
     ) -> T:
         """Run *fn(conn)* inside BEGIN IMMEDIATE with jittered lock retry; commit
         is handled here (callers must not commit). Returns *fn*'s result.
         BEGIN IMMEDIATE takes the WAL write lock up front so contention surfaces
         immediately; on locked/busy the Python lock is released, a jitter slept,
         and the WHOLE callback retried — *fn* must stay idempotent under retry."""
+        from hermes_state_write_deadline import begin_owner_write, owner_write_lock
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
@@ -1038,11 +1038,11 @@ class SessionDB(
             # stable post-close state (identity cleared → adopt / reopen path).
             fn_started = False
             try:
-                with self._lock:
+                with owner_write_lock(self._lock, _owner_deadline):
                     self._raise_if_db_replaced()
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
-                    self._conn.execute("BEGIN IMMEDIATE")
+                    begin_owner_write(self._conn, _owner_deadline)
                     try:
                         fn_started = True
                         result = fn(self._conn)

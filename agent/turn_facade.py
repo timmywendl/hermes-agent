@@ -30,6 +30,7 @@ class TurnFacadeMixin:
         relay_metadata: Optional[dict[str, Any]] = None,
         title_user_message: Optional[str]=None,
         prelude: Optional[Generator]=None,
+        native_ingress: Any = None,
     ) -> dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         # A review shares this session_id for cache parity: fence review startup or interrupt
@@ -93,7 +94,8 @@ class TurnFacadeMixin:
                 relay_outcome = (
                     "cancelled" if admission.early_result.get("interrupted") else "timed_out"
                 )
-                return admission.early_result
+                from agent.response_gate import run_guarded
+                return run_guarded(self, user_message, native_ingress, lambda state: admission.early_result)
             lease = admission.lease
             conversation_history = admission.conversation_history
 
@@ -145,17 +147,20 @@ class TurnFacadeMixin:
                 try:
                     if lease is not None:
                         lease.start()
-                    result = run_conversation(
-                        self, user_message, system_message, conversation_history, effective_task_id,
-                        stream_callback, persist_user_message,
-                        persist_user_timestamp=persist_user_timestamp,
-                        persist_user_display_kind=persist_user_display_kind,
-                        persist_user_display_metadata=persist_user_display_metadata,
-                        persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
-                        turn_author=turn_author,
-                        title_user_message=title_user_message,
-                        prelude=prelude,
-                    )
+                    from agent.response_gate import run_guarded
+                    def run_native(state):
+                        return run_conversation(
+                            self, user_message, system_message, conversation_history, effective_task_id,
+                            None if state.required else stream_callback, persist_user_message,
+                            persist_user_timestamp=persist_user_timestamp,
+                            persist_user_display_kind=persist_user_display_kind,
+                            persist_user_display_metadata=persist_user_display_metadata,
+                            persist_user_platform_id=persist_user_platform_id, moa_config=moa_config,
+                            turn_author=turn_author,
+                            title_user_message=title_user_message,
+                            prelude=prelude,
+                        )
+                    result = run_guarded(self, user_message, native_ingress, run_native)
                 finally:
                     # Post-loop relay/task finalization must not receive a late refresh interrupt;
                     # the interrupt clear itself waits for the thread join in the outer finally.

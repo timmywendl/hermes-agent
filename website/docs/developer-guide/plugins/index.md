@@ -2070,6 +2070,12 @@ gateway (`reload-plugins` control-socket verb), `plugins.manage install/toggle/u
 This guide covers **general plugins** (tools, hooks, slash commands, CLI commands). The sections below sketch the authoring pattern for each specialized plugin type; each links to its full guide for field reference and examples.
 :::
 
+## Native trusted turns and required output
+
+An opt-in [native response gate](native-response-gates.md) can require current
+external evidence before releasing a scoped turn. The candidate contract covers
+identity, pre-stream holding, commit receipts and its qualification limits.
+
 ## Specialized plugin types
 
 Hermes has five specialized plugin types beyond the general surface. Each ships as a directory under `plugins/<category>/<name>/` (bundled) or `~/.hermes/plugins/<category>/<name>/` (user). The contract differs by category — pick the one you need, then read its full guide.

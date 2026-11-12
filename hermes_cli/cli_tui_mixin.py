@@ -1361,13 +1361,6 @@ class CLITuiMixin:
             st["selected"] = max(0, st["selected"] - 1)
             event.app.invalidate()
 
-    def _tui_wake_startup(self):
-        from cli import logger
-        try:
-            self._maybe_start_wake_word()
-        except Exception as e:
-            logger.debug("wake-word startup skipped: %s", e)
-
     def _tui_suppress_closed_loop_errors(self, loop, context):
         exc = context.get("exception")
         if isinstance(exc, RuntimeError) and "Event loop is closed" in str(exc):
@@ -1422,6 +1415,8 @@ class CLITuiMixin:
         images = list(self._attached_images)
         self._attached_images.clear()
         event.app.invalidate()
+        from agent.native_turn import HumanText
+        text = HumanText(text, session=self.session_id)
         payload = (text, images) if images else text
         # A bang command is treated like a slash command while the agent is busy: it must never
         # be routed into steer/redirect (injecting `!git status` into the model's context as a

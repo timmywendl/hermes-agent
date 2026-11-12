@@ -185,8 +185,6 @@ class Selection:
     projects: tuple = ()
 
     def valid(self):
-        if not self.candidate:
-            return True
         with _lock:
             if _profiles.get(self.profile) is not self.bundle:
                 return False
@@ -198,6 +196,10 @@ class Selection:
 
             if hermes_home_key() != self.profile:
                 return False
+            if not self.candidate:
+                # Unrelatedness is proved by independent immutable selector pins,
+                # even when the candidate-only mutable gate policy is unavailable.
+                return self.bundle.valid(self.bundle.record["required_response_gates"])
             policy = (
                 load_user_config_effective(fail_closed=True)
                 .get("plugins", {})

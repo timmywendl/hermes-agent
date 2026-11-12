@@ -3255,10 +3255,6 @@ def _advertise_agent_env() -> None:
     value must be our id in the public agent-harness registry
     (``hermes-agent``) — matching is exact. ``HERMES_AGENT`` is the
     Hermes-specific marker. setdefault: never clobber an outer harness.
-
-    ``AI_AGENT`` is the emerging cross-agent standard (huggingface_hub's agent detection reads it; pi and
-    other agents set it — earendil-works/pi#7493) so generic tooling can attribute subprocesses to the
-    harness that spawned them. Hermes running inside another agent's terminal).
     """
     os.environ.setdefault("AI_AGENT", "hermes-agent")
     os.environ.setdefault("HERMES_AGENT", "true")
@@ -3467,6 +3463,10 @@ def _default_to_chat(args) -> None:
     cmd_chat(args)
 
 
+from hermes_cli.native_core_startup import native_core_entrypoint
+
+
+@native_core_entrypoint
 def main():
     """Main entry point for hermes CLI."""
     _set_process_title()

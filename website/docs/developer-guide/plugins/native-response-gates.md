@@ -272,3 +272,68 @@ marked disposable HOME. Existing streaming, gate, transcript and commit/transpor
 contracts remain mandatory. Other operating systems and Gateway/voice/cron/Telegram
 entry provenance are not qualified by these tests. Isolated plugin-host transport
 remains unsupported; this channel connects the native in-process host to Control.
+
+
+## Supported private-FD Core startup (isolated candidate)
+
+The CLI console entrypoint `hermes_cli.main:main` and the direct Gateway entrypoint
+`gateway.run:main` now wrap their existing bodies with `native_core_entrypoint`.
+The normal invocation retains its existing behavior. An explicit
+`--native-bootstrap-fd FD` requests native startup; the flag supplies a descriptor,
+never authority. It is removed before the ordinary parser and fast dispatch paths.
+A request without independently supplied `CoreLaunchPins` is denied, and a launch
+with pins but no descriptor is denied. A marked disposable profile is required.
+There is no production provider resolver, environment trust switch, writable key
+file, same-UID approval, launchd change or installation path in this integration.
+
+The approved embedding owner supplies `CoreLaunchPins` in process: exact profile,
+Supervisor snapshot/provider, entrypoint artifact digest and immutable
+`CandidateSelectorBundle`. The existing endpoint independently verifies the
+Supervisor process before consuming its private channel. These dependencies can
+be synthetic in tests; constructing them does not qualify a production owner.
+
+The supported call sequence is:
+
+1. Entry wrapper marks the project profile closed with `require_selector`.
+2. Consume the FD; instantiate `NativeBootstrapEndpoint`; verify Supervisor pins.
+3. Resolve the profile's existing PluginManager (its Manager lifecycle is created
+   by its constructor), reject any already-discovered manager, validate the selector
+   against current effective policy and actual artifact identity, then install pins.
+4. Create the preapproved Business Host identity; announce Manager and Business
+   public identities plus selector digest over the existing private FD.
+5. Handle the existing Supervisor proof and separate role approvals. Connect Manager
+   to the independently authenticated Control before discovery.
+6. Normal discovery imports the pinned in-process plugin. For this explicit native
+   launch only, it defers stock `register(ctx)` and requires the module's
+   `register_native(ctx, channel)`. Core connects Business, calls that function with
+   the existing PluginContext, checks the actual response gate, then asks Manager
+   to approve the generation. Other plugins retain ordinary registration.
+7. Enter the original CLI/Gateway body. The Core-owned private-channel thread handles
+   revoke/parent loss. A completed revoke exits Core after its ACK; owner EOF or
+   an invalid running bootstrap frame fails the isolated Core process closed with
+   exit 78, so the application body cannot outlive its owner. Return or startup
+   failure closes channels and restores the profile denial sentinel. No additional
+   Supervisor or resident service is added.
+
+An absent, empty, malformed, stale, wrong-profile or identity/policy-mismatched
+selector fails before discovery. After discovery the policy/identity is rechecked
+before Business activation. Failure to import or register the pinned plugin or its
+required response gate prevents startup. Plugin unload cannot erase selector pins;
+selected facts remain denied. An unrelated turn requires valid independent selector
+pins, expiry, profile and artifact identity; candidate turns additionally require
+the current mutable gate policy to match. Thus removing that policy cannot release
+project facts, while the intact selector can still prove an unrelated chat safe.
+
+`tests/hermes_cli/test_native_core_startup.py` executes both actual entrypoints under
+the existing two-child wrapper with disposable profiles, synthetic launch pins and
+synthetic Control. Its fixture supplies dependencies and intercepts the downstream
+application body to avoid models/transports; it never constructs the Core Endpoint,
+Manager, selector installation or native activation itself. Separate in-process
+entrypoint regressions inspect rejected-descriptor closure and persistent denial.
+These are source/startup qualification tests, not physical Human input, approved
+real-model execution, actual Gateway transport or production bootstrap proof.
+
+Production trust-root qualification remains UNKNOWN/default DENY; Native Admission
+remains CLOSED. The 2.000-second hard release bound remains NOT_PROVEN and is not
+changed by this wiring. M1 Golden and any production cutover require their separate
+remaining evidence and authorization.

@@ -5108,13 +5108,16 @@ def _guard_corrupt_user_config() -> None:
         raise SystemExit(2) from exc
 
 
+from hermes_cli.native_core_startup import native_core_entrypoint
+
+
+@native_core_entrypoint
 def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
     _guard_corrupt_user_config()
 
-    # Advertise the harness to children (mirrors _advertise_agent_env in hermes_cli/main.py, inlined to
-    # avoid its startup side effects). Value must equal registry id ``hermes-agent`` exactly.
+    # Match the CLI harness id without importing its startup side effects.
     os.environ.setdefault("AI_AGENT", "hermes-agent")
     os.environ.setdefault("HERMES_AGENT", "true")
 
@@ -5125,8 +5128,7 @@ def main():
         attach_self_to_kill_on_close_job()
 
     def _arm_watchdog() -> None:
-        # Armed before config load / DB opens so a pre-loop deadlock is respawned by the supervisor instead
-        # of wedging as a live-PID zombie. GatewayRunner disarms it.
+        # Before config/DB opens; GatewayRunner disarms after startup.
         from hermes_startup_watchdog import arm_startup_watchdog
         arm_startup_watchdog()
 
@@ -5138,10 +5140,7 @@ def main():
     for _step in (_register_identity, _arm_watchdog, _utf8_stdio):
         _best_effort(_step)
 
-    # pm startup contract (PATH provisioning for the store's tools), then
-    # the post-update bootstrap: the same one-pass record-gated maintenance
-    # registry the CLI dispatch path runs (hermes_cli/main.py) — this
-    # entrypoint bypasses that dispatch, so run it here too. Never raises.
+    # Run the same PM and one-pass post-update maintenance as CLI dispatch.
     try:
         from hermes_cli.venv_sync import check_runtime
         from pm.paths import install_root

@@ -13,6 +13,15 @@ from tests.hermes_cli.native_isolated_child import SyntheticParentPins, record
 from tests.waiting import wait_until
 
 
+def owner_loss_boundary(root, phase, **extra):
+    import threading
+
+    record(root, "owner_loss_boundary", phase=phase,
+           process=process_snapshot(os.getpid()), supervisor=process_snapshot(os.getppid()), **extra)
+    threading.Event().wait()  # Only test teardown or Core fail-stop may end this blocked operation.
+
+
+
 def run():
     root = Path(sys.argv.pop(1))
     fault = sys.argv.pop(1)
@@ -130,6 +139,30 @@ def run():
         from hermes_cli import boot_bootstrap, venv_sync
         boot_bootstrap.maybe_run_boot_bootstrap = lambda *a: None
         venv_sync.check_runtime = lambda *a: None
+    if fault.startswith("owner_loss_"):
+        from agent.native_bootstrap import NativeBootstrapEndpoint
+        from agent.native_lifecycle import NativeLifecycleChannel
+
+        original_approve = NativeLifecycleChannel.approve
+        original_acknowledge = NativeBootstrapEndpoint.acknowledge
+
+        def observed_approve(manager, *args, **kwargs):
+            if fault == "owner_loss_manager_approval":
+                with manager._NativeLifecycleChannel__lock:
+                    owner_loss_boundary(root, "manager_approval_with_lifecycle_lock")
+            result = original_approve(manager, *args, **kwargs)
+            record(root, "manager_approved", active=not manager.admission_closed,
+                   manager_epoch=manager.manager_epoch)
+            return result
+
+        def observed_acknowledge(endpoint, result):
+            if fault == "owner_loss_after_approval" and result == {"connected": True}:
+                owner_loss_boundary(root, "after_approval_before_connect_ack")
+            return original_acknowledge(endpoint, result)
+
+        NativeLifecycleChannel.approve = observed_approve
+        NativeBootstrapEndpoint.acknowledge = observed_acknowledge
+
     try:
         facade.main(**({} if fault == "untrusted" else {"native_bootstrap": pins}))
     finally:

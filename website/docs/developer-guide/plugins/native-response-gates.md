@@ -342,3 +342,42 @@ Production trust-root qualification remains UNKNOWN/default DENY; Native Admissi
 remains CLOSED. The 2.000-second hard release bound remains NOT_PROVEN and is not
 changed by this wiring. M1 Golden and any production cutover require their separate
 remaining evidence and authorization.
+
+
+### Startup Owner-loss fence
+
+After the existing Endpoint independently verifies the approved Supervisor, the
+same Core-owned `native-bootstrap` worker starts before PluginManager construction.
+It checks the exact approved parent process identity throughout discovery/import,
+native registration, Manager approval, connect ACK and potentially blocking
+cleanup. Parent reparenting, birth/executable/boot/UID/digest mismatch or unavailable
+identity fails the isolated Core process closed with exit 78. No plugin or Manager
+lock, unload callback or channel shutdown is awaited on this fail-stop path; kernel
+exit closes its channels. This adds no process, listener, trust provider or recovery
+service.
+
+During startup the worker only checks process lifecycle: the foreground remains
+the sole reader of the private bootstrap FD. After the connect ACK is complete,
+`runtime_ready` hands FD reading to that same worker for normal revoke handling.
+Synchronous owner checks also fence startup actions, Manager approval, connect ACK
+and entry into the application body. Cleanup returns the worker to process-only
+monitoring and stops it after channels close. Normal revoke still sends its ACK
+before Core exits.
+
+`test_native_startup_owner_loss.py` blocks the real CLI/Gateway startup inside
+native registration while holding the Host lock, and after Manager approval but
+before connect ACK; it SIGKILLs the real disposable Supervisor. Additional process
+regressions block plugin discovery and Manager approval while holding its lifecycle
+lock. The assertions observe Core exit/reaping **before** any test cleanup, no
+Supervisor Ready or application body, and actual verifier closure/zero remaining
+active-generation state in the synthetic Control listener. Recorded PID, birth,
+boot, executable and Supervisor identities distinguish this evidence from fixture
+booleans. Those Control observations do not qualify production #127 persistence
+or its full product recovery path.
+
+All fault injection and signal cleanup is restricted to recorded disposable test
+children. Their deliberate reparenting uses the repository's explicit real-process
+test marker; cleanup still verifies the child's captured birth identity. Original
+red failures and the green process records are retained separately. Production
+trust remains UNKNOWN/default DENY, Native Admission CLOSED and M1 Golden
+NOT_QUALIFIED; the 2.000-second release bound remains NOT_PROVEN.

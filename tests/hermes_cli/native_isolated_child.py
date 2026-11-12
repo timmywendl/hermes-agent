@@ -222,7 +222,7 @@ class ControlFixture:
         data = connection.recv(131072)
         if not data:
             self.selector.unregister(connection)
-            connection.close()
+            self.close_client(connection, state, "peer_eof")
             self.clients.pop(connection)
             return
         state["buffer"].extend(data)
@@ -258,6 +258,11 @@ class ControlFixture:
     def call(self, connection, state, value):
         body, payload = state["verifier"].verify_call(value)
         assert state["verifier"].role == "manager"
+        if payload["operation"] in ("approve", "revoke"):
+            state["generation_active"] = payload["operation"] == "approve"
+        record(self.endpoint.profile, "control_lifecycle", operation=payload["operation"],
+               generation_active=state.get("generation_active", False),
+               manager_epoch=state["verifier"].approval.manager_epoch)
         result = (
             {"state": "ACTIVE"}
             if payload["operation"] == "state_sync"
@@ -277,14 +282,28 @@ class ControlFixture:
             },
         )
 
+    def close_client(self, connection, state, reason):
+        verifier = state.get("verifier")
+        if verifier is None:
+            connection.close()
+            return
+        was_active = state.get("generation_active", False)
+        verifier.close()
+        state["generation_active"] = False
+        record(self.endpoint.profile, "control_generation_closed", role=verifier.role,
+               was_active=was_active, generation_active=False, verifier_active=verifier.active,
+               process=verifier.approved_process, reason=reason)
+
     def run(self):
         try:
             while self.running:
                 for key, _ in self.selector.select(2):
                     self.events[key.data](key.fileobj)
         finally:
-            for connection in self.clients:
-                connection.close()
+            for connection, state in self.clients.items():
+                self.close_client(connection, state, "control_shutdown")
+            record(self.endpoint.profile, "control_shutdown",
+                   active_generations=sum(bool(s.get("generation_active")) for s in self.clients.values()))
             self.selector.close()
             self.listener.close()
             self.path.unlink(missing_ok=True)

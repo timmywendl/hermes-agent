@@ -22,6 +22,7 @@ from agent.native_bootstrap import NativeBootstrapEndpoint
 from agent.native_selector import CandidateSelectorBundle, require_selector
 from agent.native_turn import PluginHost
 from hermes_constants import hermes_home_key
+from hermes_platform.native_peer import process_snapshot
 
 
 @dataclass(frozen=True)
@@ -97,16 +98,38 @@ class NativeCoreStartup:
     """Own the existing endpoint/Manager/Business channels for one entrypoint call."""
 
     def __init__(self, endpoint, pins):
-        from hermes_cli.plugins import get_plugin_manager
-
         self.endpoint, self.pins = endpoint, pins
-        self.manager = get_plugin_manager()
+        self.manager = None
         self.host = None
         self.approvals = {}
         self.stopped = threading.Event()
         self.worker = None
+        self.runtime_ready = threading.Event()
+
+    def _check_owner(self):
+        # Endpoint construction already independently approved this exact parent.
+        # Reparenting, PID reuse or exec/identity change must never become approval.
+        parent = self.endpoint.parent
+        try:
+            alive = os.getppid() == parent["pid"] and process_snapshot(parent["pid"]) == parent
+        except PermissionError:
+            alive = False
+        if not alive:
+            # Do not acquire plugin/Manager locks: the blocked startup operation
+            # may hold them. Kernel exit closes every channel and its grants.
+            os._exit(78)
 
     def prepare(self):
+        worker = threading.Thread(
+            target=contextvars.copy_context().run, args=(self._watch,),
+            name="native-bootstrap", daemon=True,
+        )
+        worker.start()
+        self.worker = worker
+        self._check_owner()
+        from hermes_cli.plugins import get_plugin_manager
+
+        self.manager = get_plugin_manager()
         bundle, manager = self.pins.selector, self.manager
         _validate_selector(bundle, self.pins.profile)
         if manager._discovered or manager._plugins:
@@ -135,17 +158,20 @@ class NativeCoreStartup:
         self._expect("approval", self._approve)
         self._expect("approval", self._approve)
         self._expect("connect", self._connect)
-        self.worker = threading.Thread(
-            target=contextvars.copy_context().run, args=(self._watch,),
-            name="native-bootstrap", daemon=True,
-        )
-        self.worker.start()
+        # Until the connect ACK completes, only the foreground reads the private
+        # FD. The same worker already monitors process identity throughout startup.
+        self.runtime_ready.set()
 
     def _expect(self, operation, action):
+        self._check_owner()
         packet = self.endpoint.receive()
+        self._check_owner()
         if packet.get("operation") != operation:
             raise PermissionError("bootstrap startup order mismatch")
-        self.endpoint.acknowledge(action(packet))
+        result = action(packet)
+        self._check_owner()
+        self.endpoint.acknowledge(result)
+        self._check_owner()
 
     def _prove(self, packet):
         data = packet["data"]
@@ -171,6 +197,7 @@ class NativeCoreStartup:
             raise PermissionError("both bootstrap roles required")
         manager.native_lifecycle.connect_control(data["path"], data["control"])
         _validate_selector(self.pins.selector, self.pins.profile)
+        self._check_owner()
         # Normal discovery imports the pinned module, but defers its registration
         # until Core can supply the separately approved Business channel.
         discover_plugins()
@@ -189,7 +216,9 @@ class NativeCoreStartup:
         if not gate_available(host):
             raise PermissionError("native response gate unavailable")
         _validate_selector(self.pins.selector, self.pins.profile)
+        self._check_owner()
         manager.native_lifecycle.approve(uuid.uuid4().hex, {"host_generation": host.generation})
+        self._check_owner()
         _validate_selector(self.pins.selector, self.pins.profile)
         return {"connected": True}
 
@@ -197,24 +226,25 @@ class NativeCoreStartup:
         exit_code = 78
         try:
             while not self.stopped.is_set():
-                readable, _, _ = select.select([self.endpoint.socket], [], [], .1)
-                if not readable:
+                self._check_owner()
+                if not self.runtime_ready.wait(.05):
                     continue
-                packet = self.endpoint.receive()
-                if packet.get("operation") != "revoke":
-                    raise PermissionError("unexpected running bootstrap operation")
-                require_selector(self.pins.profile)
-                result = self.manager.native_lifecycle.revoke(packet["data"]["operation_id"])
-                self.endpoint.acknowledge(result)
-                exit_code = 0
-                return
-        except (EOFError, OSError, ValueError, PermissionError):
-            # Parent loss cannot remove the pinned denial or revive an old host.
-            pass
+                try:
+                    readable, _, _ = select.select([self.endpoint.socket], [], [], .1)
+                    if not self.runtime_ready.is_set() or not readable:
+                        continue
+                    packet = self.endpoint.receive()
+                    if packet.get("operation") != "revoke":
+                        raise PermissionError("unexpected running bootstrap operation")
+                    require_selector(self.pins.profile)
+                    result = self.manager.native_lifecycle.revoke(packet["data"]["operation_id"])
+                    self.endpoint.acknowledge(result)
+                    exit_code = 0
+                    return
+                except (EOFError, OSError, ValueError, PermissionError):
+                    if self.runtime_ready.is_set():
+                        raise
         finally:
-            require_selector(self.pins.profile)
-            if self.host is not None:
-                self.host.invalidate()
             if not self.stopped.is_set():
                 # The approved isolated owner is gone or has revoked us. A real
                 # application body cannot outlive it as an orphaned native Core.
@@ -223,20 +253,30 @@ class NativeCoreStartup:
                 os._exit(exit_code)
 
     def close(self):
-        self.stopped.set()
+        # Return FD ownership to foreground cleanup, but keep the existing worker
+        # checking the owner while plugin unload / channel shutdown may block.
+        self.runtime_ready.clear()
         require_selector(self.pins.profile)
         try:
-            self.endpoint.socket.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        if self.worker is not None:
-            self.worker.join(3)
-        if self.host is not None:
-            self.manager.unload(self.host.plugin_id)
-            self.host.close()
-        self.manager.native_lifecycle.close()
-        self.manager._native_bootstrap_hosts = {}
-        self.endpoint.close()
+            if self.host is not None:
+                self.manager.unload(self.host.plugin_id)
+                self.host.close()
+            if self.manager is not None:
+                self.manager.native_lifecycle.close()
+                self.manager._native_bootstrap_hosts = {}
+        finally:
+            self._check_owner()
+            self.stopped.set()
+            if self.worker is not None:
+                self.worker.join(3)
+            self._check_owner()
+            # EOF is the Supervisor's completion signal. Do no blocking identity
+            # or thread work after it: the existing wrapper already bounds exit.
+            try:
+                self.endpoint.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.endpoint.close()
 
 
 def run_core_entrypoint(entrypoint, pins=None):
@@ -265,6 +305,7 @@ def run_core_entrypoint(entrypoint, pins=None):
         )
         startup = NativeCoreStartup(endpoint, pins)
         startup.prepare()
+        startup._check_owner()
         return entrypoint()
     finally:
         require_selector(profile)

@@ -1,6 +1,7 @@
 """Private response-use sidecar survives Session deletion and owner replacement."""
 import json
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -132,3 +133,32 @@ def test_real_sqlite_full_propagates_without_partial_selector(tmp_path):
                 break
         else:
             pytest.fail('fixture did not reach real SQLite page exhaustion')
+
+
+def test_native_selector_owner_lock_respects_deadline(tmp_path):
+    db = SessionDB(tmp_path / 'state.db')
+    entered, done = threading.Event(), threading.Event()
+    outcomes = []
+    db._lock.acquire()
+    def read():
+        entered.set()
+        try:
+            db.native_response_use(str(tmp_path), 'read', {'project_id': 'cloud'},
+                                   deadline=time.monotonic() + .05)
+        except Exception as error:
+            outcomes.append(type(error).__name__)
+        finally:
+            done.set()
+    worker = threading.Thread(target=read)
+    worker.start()
+    try:
+        assert entered.wait(1)
+        # Keep the ordinary owner's lock held until the bounded operation has
+        # failed. It must not wait for unrelated maintenance to release it.
+        bounded = done.wait(1)
+    finally:
+        db._lock.release()
+        worker.join(5)
+        db.close()
+    assert not worker.is_alive()
+    assert bounded, {'completed_before_owner_lock_release': bounded, 'outcomes_after_release': outcomes}

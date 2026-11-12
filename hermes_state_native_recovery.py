@@ -111,4 +111,5 @@ class NativeRecoveryMixin:
             if _guard is not None:
                 _guard(conn)
             return apply_native_recovery(conn, action, payload, time.time())
-        return self._execute_write(write, patience_s=min(self._ACTIVITY_WRITE_PATIENCE_S, remaining))
+        return self._execute_write(write, patience_s=min(self._ACTIVITY_WRITE_PATIENCE_S, remaining),
+                                   _owner_deadline=min(deadline, time.monotonic() + self._ACTIVITY_WRITE_PATIENCE_S))

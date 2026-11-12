@@ -25,13 +25,18 @@ def _boot_identity():
 
 
 def process_snapshot(pid):
-    process = psutil.Process(pid)
-    executable = str(Path(process.exe()).resolve())
-    with open(executable, 'rb') as source:
-        executable_digest = hashlib.file_digest(source, 'sha256').hexdigest()
-    return {'pid': pid, 'uid': process.uids().effective, 'birth': process.create_time(),
-            'boot': _boot_identity(), 'executable': executable,
-            'executable_digest': executable_digest}
+    try:
+        process = psutil.Process(pid)
+        executable = str(Path(process.exe()).resolve())
+        with open(executable, 'rb') as source:
+            executable_digest = hashlib.file_digest(source, 'sha256').hexdigest()
+        return {'pid': pid, 'uid': process.uids().effective, 'birth': process.create_time(),
+                'boot': _boot_identity(), 'executable': executable,
+                'executable_digest': executable_digest}
+    except (psutil.Error, OSError):
+        # Peer death during final release is a normal identity denial. Preserve
+        # every successful identity pin; never let a missing peer kill Control.
+        raise PermissionError('native peer identity unavailable') from None
 
 
 def kernel_peer(connection):

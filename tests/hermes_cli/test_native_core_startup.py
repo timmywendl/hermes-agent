@@ -19,6 +19,7 @@ PLUGIN = '''from tests.hermes_cli.native_isolated_child import record
 from hermes_constants import get_hermes_home
 from hermes_cli.plugins import get_plugin_manager
 from agent.response_gate import requirements
+record(get_hermes_home(), "discovery_entered")
 manager = get_plugin_manager()
 assert manager.native_lifecycle.manager_epoch
 assert manager.native_lifecycle.closed is False
@@ -59,6 +60,11 @@ def launch(tmp_path):
             "no_gate": PLUGIN.replace("    ctx.register_response_gate(lambda evidence: False)\n", ""),
             "register_failure": PLUGIN.replace("    ctx.register_response_gate(lambda evidence: False)", "    raise RuntimeError('native registration failed')"),
         }.get(fault, PLUGIN)
+        registration_changes = {
+            "registration_policy": "    import json\n    path = get_hermes_home() / 'config.yaml'\n    config = json.loads(path.read_text())\n    config['plugins']['required_response_gates'] = []\n    path.write_text(json.dumps(config))\n",
+            "registration_artifact": "    from pathlib import Path\n    path = Path(__file__)\n    path.write_text(path.read_text() + '\\n# invalidated during registration\\n')\n",
+        }
+        plugin_source += registration_changes.get(fault, "")
         (plugin / "__init__.py").write_text(plugin_source)
         artifact = REPO / ("gateway/run.py" if entry == "gateway" else "hermes_cli/main.py")
         policy = [{"plugin_id": "fixture", "request_terms": ["Cloud Test"]}]
@@ -88,7 +94,7 @@ def launch(tmp_path):
         if supervised:
             control = REPO / "tests/hermes_cli/native_isolated_child.py"
             spec = {
-                "profile": str(root), "error_log": str(root / "stderr.log"),
+                "profile": str(root), "error_log": str(root / "stderr.log"), "startup_fault": fault,
                 "core": {"command": command, "artifact": str(artifact), "artifact_digest": hashlib.sha256(artifact.read_bytes()).hexdigest()},
                 "control": {"command": [sys.executable, "-B", "-m", "tests.hermes_cli.native_isolated_child", "control", str(root)],
                             "artifact": str(control), "artifact_digest": hashlib.sha256(control.read_bytes()).hexdigest()},
@@ -96,6 +102,8 @@ def launch(tmp_path):
             plan = root / "plan.json"
             plan.write_text(json.dumps(spec))
             command = [sys.executable, "-B", "-m", "tests.hermes_cli.native_isolated_owner", str(plan)]
+            if fault.startswith("handshake_"):
+                command = [sys.executable, "-B", "-m", "tests.hermes_cli.native_core_startup_child", "owner", str(plan)]
         env = {"HOME": str(tmp_path), "HERMES_HOME": str(root), "PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "PYTHONDONTWRITEBYTECODE": "1"}
         proc = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=REPO)
         owners.append(proc)
@@ -238,3 +246,22 @@ def test_owner_revoke_is_acknowledged_before_core_exit(launch):
     (root / "stop").touch()
     stdout, stderr = proc.communicate(timeout=12)
     assert proc.returncode == 0, (stdout, stderr, (root / "stderr.log").read_text())
+
+
+@pytest.mark.parametrize("fault", ["handshake_policy", "handshake_artifact"])
+def test_selector_invalidated_during_handshake_fails_before_discovery(launch, fault):
+    proc, root = launch(fault)
+    stdout, stderr = proc.communicate(timeout=12)
+    assert (root / "handshake-invalidated").exists()
+    assert proc.returncode != 0, (stdout, stderr)
+    assert not any(r["kind"] in ("discovery_entered", "discovery", "business", "application_entered") for r in rows(root))
+
+
+@pytest.mark.parametrize("fault", ["registration_policy", "registration_artifact"])
+def test_selector_invalidated_during_registration_never_becomes_ready(launch, fault):
+    proc, root = launch(fault)
+    stdout, stderr = proc.communicate(timeout=12)
+    assert proc.returncode != 0, (stdout, stderr)
+    assert any(r["kind"] == "business" for r in rows(root))
+    assert not (root / "ready.json").exists()
+    assert not any(r["kind"] == "application_entered" for r in rows(root))

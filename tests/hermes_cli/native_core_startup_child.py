@@ -53,6 +53,7 @@ def run():
     )
 
     def downstream():
+        record(root, "application_entered")
         # Reached from real main only AFTER its native startup completed. No
         # Endpoint/Manager/selector installation is performed by this fixture.
         from agent.native_selector import POLICY_UNAVAILABLE
@@ -135,5 +136,37 @@ def run():
         record(root, "exit", role="core")
 
 
+def run_owner():
+    from hermes_cli.stderr_timestamp import run_isolated_profile
+    from tests.hermes_cli.native_isolated_owner import Provider
+
+    spec = json.loads(Path(sys.argv[2]).read_text())
+
+    class HandshakeOwner(Provider):
+        def verify_child(self, role, record, actual):
+            super().verify_child(role, record, actual)
+            if role != "business":
+                return
+            fault = spec["startup_fault"]
+            if fault == "handshake_policy":
+                path = self.root / "config.yaml"
+                config = json.loads(path.read_text())
+                config["plugins"]["required_response_gates"] = []
+                path.write_text(json.dumps(config))
+            else:
+                path = self.root / "plugins/fixture/__init__.py"
+                path.write_text(path.read_text() + "\n# invalidated during handshake\n")
+            (self.root / "handshake-invalidated").touch()
+
+    try:
+        result = run_isolated_profile(spec, provider=HandshakeOwner(spec))
+    except (PermissionError, OSError, EOFError, ValueError):
+        result = 127
+    raise SystemExit(result)
+
+
 if __name__ == "__main__":
-    run()
+    if sys.argv[1:2] == ["owner"]:
+        run_owner()
+    else:
+        run()

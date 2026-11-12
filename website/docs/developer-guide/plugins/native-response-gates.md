@@ -317,7 +317,9 @@ The supported call sequence is:
 
 An absent, empty, malformed, stale, wrong-profile or identity/policy-mismatched
 selector fails before discovery. After discovery the policy/identity is rechecked
-before Business activation. Failure to import or register the pinned plugin or its
+before discovery, before Business activation, after native registration and before
+Manager approval, and again before startup returns Ready. Failure to import or
+register the pinned plugin or its
 required response gate prevents startup. Plugin unload cannot erase selector pins;
 selected facts remain denied. An unrelated turn requires valid independent selector
 pins, expiry, profile and artifact identity; candidate turns additionally require

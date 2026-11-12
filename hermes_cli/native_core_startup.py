@@ -147,6 +147,7 @@ class NativeCoreStartup:
         if set(self.approvals) != {"manager", "business"}:
             raise PermissionError("both bootstrap roles required")
         manager.native_lifecycle.connect_control(data["path"], data["control"])
+        _validate_selector(self.pins.selector, self.pins.profile)
         # Normal discovery imports the pinned module, but defers its registration
         # until Core can supply the separately approved Business channel.
         discover_plugins()
@@ -157,13 +158,16 @@ class NativeCoreStartup:
         channel = host.connect_control(
             data["path"], data["control"], supervisor_approval=self.approvals["business"]
         )
+        _validate_selector(self.pins.selector, self.pins.profile)
         ctx = PluginContext(loaded.manifest, manager)
         start = len(manager._registration_order)
         loaded.module.register_native(ctx, channel)
         manager._attribute_registrations(loaded, host.plugin_id, start)
         if not gate_available(host):
             raise PermissionError("native response gate unavailable")
+        _validate_selector(self.pins.selector, self.pins.profile)
         manager.native_lifecycle.approve(uuid.uuid4().hex, {"host_generation": host.generation})
+        _validate_selector(self.pins.selector, self.pins.profile)
         return {"connected": True}
 
     def _watch(self):

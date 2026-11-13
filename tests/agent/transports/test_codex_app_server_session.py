@@ -1334,6 +1334,29 @@ def test_reviewer_does_not_bypass_direct_rpc_subagent_denial(reviewer_session):
     assert not any(m == 'turn/start' for m, _ in client.requests)
 
 
+@pytest.mark.parametrize('invalid', ['numeric_type', 'duplicate', 'structured_conflict'])
+def test_reviewer_identity_requires_exact_types_and_unique_fields(reviewer_session, invalid):
+    import json
+    session, client, wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        response = original(method, params)
+        if method == 'mcpServer/tool/call':
+            if invalid == 'numeric_type':
+                identity = dict(wire['identity'], run_id=float(wire['identity']['run_id']))
+                response['content'][0]['text'] = json.dumps({'ok': True, 'reviewer_identity': identity})
+            elif invalid == 'duplicate':
+                response['content'][0]['text'] = response['content'][0]['text'].replace('"ok": true', '"ok": false, "ok": true')
+            else:
+                identity = dict(wire['identity'], run_id=float(wire['identity']['run_id']))
+                response['structuredContent'] = {'result': json.dumps({'ok': True, 'reviewer_identity': identity})}
+        return response
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and not result.model_turn_sent and client._closed
+    assert not any(m == 'turn/start' for m, _ in client.requests)
+
+
 def test_reviewer_second_turn_observes_drift(reviewer_session):
     session, client, wire = reviewer_session
     assert session.run_turn('Review', turn_timeout=2).error is None

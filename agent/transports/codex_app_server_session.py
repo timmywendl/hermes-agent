@@ -473,6 +473,14 @@ class CodexAppServerSession:
         raise ValueError('Reviewer pagination budget exceeded')
 
     def _reviewer_identity_preflight(self):
+        def strict_object(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError('Reviewer duplicate evidence field')
+                obj[key] = value
+            return obj
+
         binding = self._reviewer_binding
         response = self._client.request('mcpServer/tool/call', {
             'threadId': self._thread_id, 'server': 'hermes-tools', 'tool': 'kanban_heartbeat',
@@ -484,15 +492,18 @@ class CodexAppServerSession:
         if (not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
                 or content[0].get('type') != 'text' or not isinstance(content[0].get('text'), str)):
             raise ValueError('Reviewer direct RPC evidence missing')
-        payload = json.loads(content[0]['text'])
+        payload = json.loads(content[0]['text'], object_pairs_hook=strict_object)
         structured = response.get('structuredContent')
         # SDK 2.0 wraps a string-returning tool in its declared result schema.
         if isinstance(structured, dict) and set(structured) == {'result'} and isinstance(structured['result'], str):
-            structured = json.loads(structured['result'])
-        if structured is not None and structured != payload:
+            structured = json.loads(structured['result'], object_pairs_hook=strict_object)
+        if structured is not None and json.dumps(structured, sort_keys=True) != json.dumps(payload, sort_keys=True):
             raise ValueError('Reviewer conflicting evidence')
+        expected = asdict(binding)
+        identity = payload.get('reviewer_identity') if isinstance(payload, dict) else None
         if (not isinstance(payload, dict) or payload.get('ok') is not True
-                or payload.get('reviewer_identity') != asdict(binding)):
+                or not isinstance(identity, dict) or identity != expected
+                or any(type(identity[k]) is not type(v) for k, v in expected.items())):
             raise ValueError('Reviewer actual connection identity mismatch')
 
     def _reviewer_current_status(self):

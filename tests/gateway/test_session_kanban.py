@@ -390,3 +390,191 @@ def test_notifier_preserves_exact_developer_and_synthesized_operator_delivery(tm
     assert asyncio.run(notification._send_event(event, 'Work delivered')) is True
     adapter.send_document.assert_awaited_once()
     assert Path(adapter.send_document.await_args.kwargs['file_path']).read_text() == 'permitted disposable output'
+
+
+def _f7_historical_delivery(tmp_path, monkeypatch, *, kind, origin='developer', payload='artifacts',
+                            mutation=None, later='manual'):
+    from contextlib import closing
+    from types import MethodType
+    from unittest.mock import AsyncMock
+    from gateway import kanban_watchers_notifier as notifier
+    from gateway.config import Platform
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli import kanban_db as kb, kanban_db_notify as kbn
+    from hermes_cli.kanban_db_connect import connect
+
+    for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD_CONTEXT'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    original, future = tmp_path / 'original-event.txt', tmp_path / 'LATER_RESULT_SECRET.txt'
+    original.write_text('ORIGINAL_FILE_CONTENT')
+    future.write_text('LATER_FILE_CONTENT')
+    assert BasePlatformAdapter.filter_local_delivery_paths([str(original), str(future)]) == [str(original), str(future)]
+    kb.create_board('f7-history')
+    with closing(connect(board='f7-history')) as conn:
+        tid = kb.create_task(conn, title='Historical event', assignee='default', session_id='owner-session')
+        kbn.add_notify_sub(conn, task_id=tid, platform='telegram', chat_id='disposable-chat', delivery_mode='notify+wake')
+        kb.recompute_ready(conn)
+        run_id = None if origin == 'operator' else kb.claim_task(conn, tid).current_run_id
+        if origin == 'reviewer':
+            assert kb.request_review(conn, tid, summary='Developer handoff', expected_run_id=run_id)
+            run_id = kb.claim_review_task(conn, tid).current_run_id
+        summary = 'ORIGINAL_EVENT_HANDOFF'
+        if payload == 'summary':
+            summary = 'Original output MEDIA: ' + str(original)
+        metadata = {'artifacts': [str(original)]} if payload == 'artifacts' else None
+        if kind == 'completed':
+            assert kb.complete_task(conn, tid, summary=summary, metadata=metadata, expected_run_id=run_id)
+        else:
+            assert kb.request_review(conn, tid, summary=summary, metadata=metadata, expected_run_id=run_id)
+        row = conn.execute('SELECT * FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC LIMIT 1', (tid, kind)).fetchone()
+        event_id, old_run = row['id'], row['run_id']
+        frozen_payload = json.loads(row['payload'])
+        if payload == 'empty':
+            # Represent a historical row whose payload predates summaries.
+            summary = None
+            frozen_payload['summary'] = None
+            with kb.write_txn(conn):
+                conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(frozen_payload), event_id))
+        if later == 'new_run':
+            from plugins.kanban.dashboard.plugin_api import _set_status_direct
+            assert _set_status_direct(conn, tid, 'ready')
+            successor = kb.claim_task(conn, tid)
+            assert successor.current_run_id != old_run
+            assert kb.complete_task(conn, tid, result=str(future), expected_run_id=successor.current_run_id)
+        else:
+            with kb.write_txn(conn):
+                conn.execute('UPDATE tasks SET result=? WHERE id=?', (str(future), tid))
+        with kb.write_txn(conn):
+            if mutation == 'no_event_run':
+                conn.execute('UPDATE task_events SET run_id=NULL WHERE id=?', (event_id,))
+            elif mutation == 'missing_run':
+                conn.execute('DELETE FROM task_runs WHERE id=?', (old_run,))
+            elif mutation == 'wrong_task':
+                other = kb.create_task(conn, title='Different task', assignee='default')
+                conn.execute('UPDATE task_runs SET task_id=? WHERE id=?', (other, old_run))
+            elif mutation == 'wrong_run':
+                conn.execute('UPDATE task_events SET run_id=? WHERE id=?', (old_run + 10000, event_id))
+            elif mutation in {'wrong_outcome', 'wrong_status', 'missing_end', 'invalid_run_time', 'operator_worker', 'operator_lock', 'operator_duration'}:
+                columns = {'wrong_outcome': ('outcome', 'blocked'), 'wrong_status': ('status', 'running'),
+                           'missing_end': ('ended_at', None), 'invalid_run_time': ('ended_at', 'unknown'),
+                           'operator_worker': ('worker_pid', 424242),
+                           'operator_lock': ('claim_lock', 'unproved'), 'operator_duration': ('started_at', 1)}
+                column, value = columns[mutation]
+                conn.execute(f'UPDATE task_runs SET {column}=? WHERE id=?', (value, old_run))
+            elif mutation:
+                claim = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'", (tid, old_run)).fetchone()
+                source = json.loads(claim['payload'])
+                if mutation == 'duplicate_claim':
+                    kb._append_event(conn, tid, 'claimed', source, run_id=old_run)
+                elif mutation == 'missing_claim':
+                    conn.execute('DELETE FROM task_events WHERE id=?', (claim['id'],))
+                elif mutation == 'invalid_claim_time':
+                    conn.execute('UPDATE task_events SET created_at=? WHERE id=?', ('unknown', claim['id']))
+                else:
+                    values = {'review_claim': ('source_status', 'review'), 'unknown_claim': ('source_status', 'unknown'),
+                              'null_source_status': ('source_status', None), 'wrong_claim_lock': ('lock', 'other'),
+                              'wrong_claim_run': ('run_id', old_run + 1), 'invalid_expiry': ('expires', 0)}
+                    if mutation not in {'malformed_claim', 'duplicate_keys', 'deep_claim'}:
+                        key, value = values[mutation]
+                        source[key] = value
+                    raw = '{invalid' if mutation == 'malformed_claim' else json.dumps(source)
+                    if mutation == 'duplicate_keys':
+                        raw = raw.replace('"run_id":', '"run_id": 0, "run_id":')
+                    if mutation == 'deep_claim':
+                        raw = '[' * 1500 + '0' + ']' * 1500
+                    conn.execute('UPDATE task_events SET payload=? WHERE id=?', (raw, claim['id']))
+        assert kb.get_task(conn, tid).result == str(future)
+        assert json.loads(conn.execute('SELECT payload FROM task_events WHERE id=?', (event_id,)).fetchone()[0]) == frozen_payload
+    adapter = SimpleNamespace(extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_document=AsyncMock(), send_multiple_images=AsyncMock(), send_video=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = SimpleNamespace(adapters={Platform.TELEGRAM: adapter}, _profile_adapters={}, _owns_kanban_dispatcher_lock=lambda: True)
+    runner._deliver_kanban_artifacts = MethodType(GatewayKanbanWatchersMixin._deliver_kanban_artifacts, runner)
+    monkeypatch.setattr(notifier, '_adapter_for_subscription', lambda *a: adapter)
+    collector = notifier._Collector(runner, kb, notifier_profile=None, gc_due=False, gc_retention_days=30)
+    with closing(connect(board='f7-history')) as conn:
+        delivery = collector._claim_for_sub(conn, 'f7-history', kbn.list_notify_subs(conn)[0])
+    event = next(ev for ev in delivery['events'] if ev.id == event_id)
+    assert delivery['cursor'] >= event_id and delivery['task'].result == str(future)
+    # Deliver this historical event, not the successor's independently valid event.
+    delivery['events'] = [event]
+    notice = notifier._KanbanNotification(runner, delivery, platform_cls=Platform, sub_fail_counts={})
+    notice.adapter = adapter
+    paths = frozen_payload.get('artifacts', []) if payload == 'artifacts' else [str(original)] if payload == 'summary' else []
+    return notice, adapter, event, paths, summary, future
+
+
+def _assert_f7_event_delivery(notice, adapter, event, paths, summary, future):
+    import asyncio
+    from agent.i18n import t
+
+    handoff = summary[:200] if summary else ''
+    message = notice.format_event(event)
+    expected = t('gateway.kanban.ping.' + event.kind, head=notice.head, title=notice.title,
+                 handoff='\n' + handoff if handoff else '')
+    assert message == expected
+    notice.build_wake_text()
+    wake = t('gateway.kanban.wake.message', task_id=notice.task_id,
+             status=t('gateway.kanban.wake.' + event.kind), title=notice.title,
+             assignee=notice.task.assignee, board=notice.board_slug)
+    if handoff:
+        wake += '\n' + t('gateway.kanban.wake.handoff', summary=handoff)
+    assert notice.synth == wake + '\n\n' + t('gateway.kanban.wake.guidance')
+    assert str(future) not in message + notice.synth
+    assert asyncio.run(notice._send_event(event, message)) is True
+    adapter.send.assert_awaited_once_with('disposable-chat', expected, metadata={})
+    assert adapter.send_document.await_count == len(paths)
+    assert [call.kwargs for call in adapter.send_document.await_args_list] == [
+        {'chat_id': 'disposable-chat', 'file_path': path, 'metadata': {}} for path in paths]
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    assert future.read_text() == 'LATER_FILE_CONTENT'
+
+
+@pytest.mark.parametrize('kind', ['completed', 'review_requested'])
+@pytest.mark.parametrize('later', ['manual', 'new_run'])
+@pytest.mark.parametrize('missing_run', [False, True])
+def test_f7_historical_event_never_borrows_later_task_result(tmp_path, monkeypatch, kind, later, missing_run):
+    args = _f7_historical_delivery(tmp_path, monkeypatch, kind=kind, payload='empty', later=later,
+                                  mutation='no_event_run' if missing_run else None)
+    _assert_f7_event_delivery(*args)
+
+
+@pytest.mark.parametrize('mutation', ['no_event_run', 'missing_run', 'wrong_task', 'wrong_run',
+    'wrong_outcome', 'wrong_status', 'missing_end', 'duplicate_claim', 'malformed_claim', 'missing_claim',
+    'review_claim', 'unknown_claim', 'null_source_status', 'wrong_claim_lock', 'wrong_claim_run', 'invalid_expiry',
+    'duplicate_keys', 'deep_claim', 'invalid_claim_time', 'invalid_run_time'])
+@pytest.mark.parametrize('kind', ['completed', 'review_requested'])
+def test_f7_unproved_event_cannot_upload_even_immutable_artifacts(tmp_path, monkeypatch, mutation, kind):
+    notice, adapter, event, _paths, summary, future = _f7_historical_delivery(tmp_path, monkeypatch, kind=kind, mutation=mutation)
+    assert event.id not in notice.d['artifact_events']
+    _assert_f7_event_delivery(notice, adapter, event, [], summary, future)
+
+
+@pytest.mark.parametrize('origin', ['developer', 'operator'])
+@pytest.mark.parametrize('kind', ['completed', 'review_requested'])
+@pytest.mark.parametrize('payload', ['artifacts', 'summary'])
+def test_f7_proven_event_uploads_only_its_immutable_payload(tmp_path, monkeypatch, origin, kind, payload):
+    args = _f7_historical_delivery(tmp_path, monkeypatch, kind=kind, origin=origin, payload=payload)
+    notice, _adapter, event, paths, _summary, _future = args
+    assert event.id in notice.d['artifact_events'] and len(paths) == 1
+    _assert_f7_event_delivery(*args)
+
+
+@pytest.mark.parametrize('mutation', ['operator_worker', 'operator_lock', 'operator_duration'])
+def test_f7_invalid_synthesized_operator_run_is_not_authority(tmp_path, monkeypatch, mutation):
+    notice, adapter, event, _paths, summary, future = _f7_historical_delivery(
+        tmp_path, monkeypatch, kind='completed', origin='operator', mutation=mutation)
+    assert event.id not in notice.d['artifact_events']
+    _assert_f7_event_delivery(notice, adapter, event, [], summary, future)
+
+
+def test_f7_original_reviewer_run_cannot_upload_historical_payload(tmp_path, monkeypatch):
+    notice, adapter, event, _paths, summary, future = _f7_historical_delivery(
+        tmp_path, monkeypatch, kind='completed', origin='reviewer')
+    assert event.id not in notice.d['artifact_events']
+    _assert_f7_event_delivery(notice, adapter, event, [], summary, future)

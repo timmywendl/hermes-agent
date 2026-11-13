@@ -76,6 +76,47 @@ def diagnostic_event(ev) -> bool:
 # unattended gate where a false drop means silent work pileup.
 MAX_SEND_FAILURES = 12
 
+
+def _developer_event_claim(claim, run, event) -> bool:
+    def unique_fields(pairs):
+        value = dict(pairs)
+        if len(value) != len(pairs):
+            raise ValueError('Duplicate claim field')
+        return value
+
+    try:
+        source = json.loads(claim['payload'], object_pairs_hook=unique_fields)
+    except (TypeError, ValueError, RecursionError):
+        return False
+    # claim_task emits exactly these fields; Review adds source_status.
+    if not isinstance(source, dict) or set(source) != {'lock', 'expires', 'run_id'}:
+        return False
+    return (type(source['run_id']) is int and source['run_id'] == run['id']
+            and isinstance(source['lock'], str) and bool(source['lock'].strip())
+            and source['lock'] == run['claim_lock']
+            and type(source['expires']) is int and type(claim['created_at']) is int
+            and source['expires'] > claim['created_at']
+            and claim['created_at'] == run['started_at'] and claim['id'] < event.id)
+
+
+def _artifact_event_is_proven(conn, event) -> bool:
+    expected_status = {'completed': 'done', 'review_requested': 'review'}.get(event.kind)
+    if expected_status is None or type(event.run_id) is not int:
+        return False
+    run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
+                       (event.run_id, event.task_id)).fetchone()
+    if (run is None or run['outcome'] != event.kind or type(run['ended_at']) is not int
+            or type(run['started_at']) is not int or run['ended_at'] < run['started_at']):
+        return False
+    claims = conn.execute("SELECT id,payload,created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
+                          (event.task_id, event.run_id)).fetchall()
+    if not claims:
+        # Only the original zero-duration, unclaimed operator Run is eligible.
+        return (run['claim_lock'] is None and run['worker_pid'] is None
+                and run['status'] == event.kind and run['started_at'] == run['ended_at'])
+    return (len(claims) == 1 and run['status'] == expected_status
+            and _developer_event_claim(claims[0], run, event))
+
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
@@ -320,36 +361,8 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
-        artifact_events = set()
-        for event in events:
-            if event.kind not in ('completed', 'review_requested'):
-                continue
-            # Only an exact, unique original Developer claim can authorize the
-            # legacy artifact path. Missing/conflicting historical provenance is
-            # not a reason to borrow the current assignee or a newer Run.
-            if event.run_id is None:
-                # Preserve never-claimed operator/legacy completion behavior.
-                artifact_events.add(event.id)
-                continue
-            claimed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
-                                   (event.task_id, event.run_id)).fetchall()
-            if not claimed:
-                run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
-                                   (event.run_id, event.task_id)).fetchone()
-                # The original operator path synthesizes a zero-duration closed
-                # Run without a claim. It is distinct from a closed worker Run
-                # (which retains its lock and status=done/review).
-                if (run and run['claim_lock'] is None and run['worker_pid'] is None
-                        and run['status'] == event.kind and run['outcome'] == event.kind
-                        and run['started_at'] is not None and run['started_at'] == run['ended_at']):
-                    artifact_events.add(event.id)
-            if len(claimed) == 1:
-                try:
-                    source = json.loads(claimed[0]['payload'])
-                except (TypeError, ValueError):
-                    continue
-                if isinstance(source, dict) and source.get('source_status') is None and source.get('run_id') == event.run_id and source.get('lock'):
-                    artifact_events.add(event.id)
+        artifact_events = {event.id for event in events
+                           if event.task_id == sub['task_id'] and _artifact_event_is_proven(conn, event)}
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
         return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug, "artifact_events": frozenset(artifact_events)}
@@ -422,13 +435,11 @@ def _first_line(text: str, limit: int) -> str:
 
 
 def _fmt_completed(ev, n) -> tuple:
-    # Prefer the run summary from the event payload; fall back to task.result for legacy rows.
+    # A delayed event must never acquire the current Task's later result.
     wake_handoff = None
     payload_summary = _payload(ev, "summary")
     if payload_summary:
         wake_handoff = _first_line(str(payload_summary), 200)
-    elif n.task and n.task.result:
-        wake_handoff = _first_line(n.task.result, 160)
     handoff = f"\n{wake_handoff}" if wake_handoff is not None else ""
     return t("gateway.kanban.ping.completed", head=n.head, title=n.title, handoff=handoff), wake_handoff, None
 
@@ -725,7 +736,7 @@ class _KanbanNotification:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
-        # Upload artifact paths from the handoff payload / legacy result as
+        # Upload only immutable event-bound artifact paths and summary as
         # native files. Both handoff kinds stage files for exactly this: a
         # review-bound card's files exist precisely so the human sees them at
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
@@ -734,7 +745,7 @@ class _KanbanNotification:
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,
-                    event_payload=getattr(ev, "payload", None), task=self.task,
+                    event_payload=getattr(ev, "payload", None), task=None,
                 )
             except Exception as art_exc:
                 logger.debug("kanban notifier: artifact delivery for %s failed: %s", self.task_id, art_exc)

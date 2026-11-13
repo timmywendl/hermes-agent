@@ -177,6 +177,8 @@ def reviewer_binding(*, board, task_id, run_id, claim_lock, db, profile, home, s
         claimed_id, claimed, is_review, claimed_at = claimed_lane(conn, task_id, run_id)
         if not is_review:
             return None
+        if not isinstance(home, str) or not home.strip():
+            raise ValueError('Reviewer Owner home unavailable')
         task = kb.get_task(conn, task_id)
         run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
         now = int(time.time())

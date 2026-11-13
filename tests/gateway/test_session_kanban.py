@@ -316,6 +316,8 @@ def test_reviewer_missing_locators_do_not_become_legacy_developer(reviewer_env, 
                    claim_lock=reviewer_env.claim_lock, db=reviewer_env.kanban_db,
                    profile=reviewer_env.profile, owner_home=reviewer_env.home)
     del context[missing]
+    # Empty paths must not acquire authority from a coincidentally matching cwd.
+    monkeypatch.chdir(reviewer_env.home)
     model = Mock(side_effect=AssertionError('Reviewer must not fall back'))
     monkeypatch.setattr(worker, '_run_task_turns', model)
     monkeypatch.setattr(worker, '_record_worker_result', lambda *args: None)

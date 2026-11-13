@@ -91,7 +91,8 @@ def _developer_event_claim(claim, run, event) -> bool:
     # claim_task emits exactly these fields; Review adds source_status.
     if not isinstance(source, dict) or set(source) != {'lock', 'expires', 'run_id'}:
         return False
-    return (type(source['run_id']) is int and source['run_id'] == run['id']
+    return (claim['task_id'] == event.task_id
+            and type(source['run_id']) is int and source['run_id'] == run['id']
             and isinstance(source['lock'], str) and bool(source['lock'].strip())
             and source['lock'] == run['claim_lock']
             and type(source['expires']) is int and type(claim['created_at']) is int
@@ -108,8 +109,10 @@ def _artifact_event_is_proven(conn, event) -> bool:
     if (run is None or run['outcome'] != event.kind or type(run['ended_at']) is not int
             or type(run['started_at']) is not int or run['ended_at'] < run['started_at']):
         return False
-    claims = conn.execute("SELECT id,payload,created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
-                          (event.task_id, event.run_id)).fetchall()
+    # Run IDs are unique across tasks; a foreign or duplicate claim is a
+    # conflict, never proof that this was an unclaimed operator Run.
+    claims = conn.execute("SELECT id,task_id,payload,created_at FROM task_events WHERE run_id=? AND kind='claimed'",
+                          (event.run_id,)).fetchall()
     if not claims:
         # Only the original zero-duration, unclaimed operator Run is eligible.
         return (run['claim_lock'] is None and run['worker_pid'] is None

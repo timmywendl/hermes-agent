@@ -465,6 +465,10 @@ def _f7_historical_delivery(tmp_path, monkeypatch, *, kind, origin='developer', 
                            'operator_lock': ('claim_lock', 'unproved'), 'operator_duration': ('started_at', 1)}
                 column, value = columns[mutation]
                 conn.execute(f'UPDATE task_runs SET {column}=? WHERE id=?', (value, old_run))
+            elif mutation == 'foreign_operator_claim':
+                other = kb.create_task(conn, title='Foreign claim', assignee='default')
+                kb._append_event(conn, other, 'claimed', {'lock': 'foreign', 'expires': 9999999999,
+                    'run_id': old_run}, run_id=old_run)
             elif mutation:
                 claim = conn.execute("SELECT * FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'", (tid, old_run)).fetchone()
                 source = json.loads(claim['payload'])
@@ -565,7 +569,7 @@ def test_f7_proven_event_uploads_only_its_immutable_payload(tmp_path, monkeypatc
     _assert_f7_event_delivery(*args)
 
 
-@pytest.mark.parametrize('mutation', ['operator_worker', 'operator_lock', 'operator_duration'])
+@pytest.mark.parametrize('mutation', ['operator_worker', 'operator_lock', 'operator_duration', 'foreign_operator_claim'])
 def test_f7_invalid_synthesized_operator_run_is_not_authority(tmp_path, monkeypatch, mutation):
     notice, adapter, event, _paths, summary, future = _f7_historical_delivery(
         tmp_path, monkeypatch, kind='completed', origin='operator', mutation=mutation)

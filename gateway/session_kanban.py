@@ -257,8 +257,8 @@ def _run_worker_turns(agent, frame, history):
     code, last_output = 1, ''
     try:
         from tools.kanban_tools import reviewer_binding, reviewer_tool_scope
-        binding = reviewer_binding(board=context['board'], task_id=context['task_id'], run_id=context['run_id'],
-            claim_lock=context['claim_lock'], db=context['db'], profile=context['profile'],
+        binding = reviewer_binding(board=context.get('board', ''), task_id=context['task_id'], run_id=context['run_id'],
+            claim_lock=context['claim_lock'], db=context['db'], profile=context.get('profile', ''),
             home=context.get('owner_home', ''), session_id=agent.session_id)
         if binding:
             from hermes_cli import kanban_db as kb

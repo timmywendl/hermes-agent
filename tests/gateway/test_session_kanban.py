@@ -307,6 +307,24 @@ def test_reviewer_worker_rebuilds_current_context_instead_of_cached_policy(revie
     assert 'LEGACY_CROSS_TASK_CONTEXT' not in seen[0]
 
 
+@pytest.mark.parametrize('missing', ['board', 'profile', 'owner_home'])
+def test_reviewer_missing_locators_do_not_become_legacy_developer(reviewer_env, monkeypatch, missing):
+    from unittest.mock import Mock
+    from gateway import session_kanban as worker
+
+    context = dict(board=reviewer_env.board, task_id=reviewer_env.task_id, run_id=reviewer_env.run_id,
+                   claim_lock=reviewer_env.claim_lock, db=reviewer_env.kanban_db,
+                   profile=reviewer_env.profile, owner_home=reviewer_env.home)
+    del context[missing]
+    model = Mock(side_effect=AssertionError('Reviewer must not fall back'))
+    monkeypatch.setattr(worker, '_run_task_turns', model)
+    monkeypatch.setattr(worker, '_record_worker_result', lambda *args: None)
+    agent = SimpleNamespace(session_id=reviewer_env.session_id)
+    with pytest.raises(ValueError):
+        worker._run_worker_turns(agent, {'policy': {'kanban_json': json.dumps(context)}}, [])
+    model.assert_not_called()
+
+
 @pytest.mark.parametrize('mode', ['chat_completions', 'codex_responses', None])
 def test_reviewer_cannot_use_unqualified_runtime(reviewer_env, monkeypatch, mode):
     from unittest.mock import Mock

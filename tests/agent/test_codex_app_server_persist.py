@@ -46,8 +46,10 @@ def _make_turn():
 
 def _make_agent(session_db=None, session_id="sess-codex"):
     agent = MagicMock()
+    agent._kanban_reviewer_binding = None
     # Pre-seed the session so run_codex_app_server_turn skips the spawn block.
     agent._codex_session = MagicMock()
+    agent._codex_session._reviewer_binding = None
     agent._codex_session.run_turn.return_value = _make_turn()
     agent._codex_session_prompt = None  # seeded session: no recorded composition to compare
     agent.tool_progress_callback = None
@@ -62,6 +64,8 @@ def _make_agent(session_db=None, session_id="sess-codex"):
 def test_codex_success_flushes_and_reports_persisted():
     """Codex success turn must self-persist and return agent_persisted=True."""
     agent = _make_agent(session_db=None)  # no DB -> flush is a no-op, still True
+    assert agent._kanban_reviewer_binding is None
+    assert agent._codex_session._reviewer_binding is None
     result = run_codex_app_server_turn(
         agent,
         user_message="hello",
@@ -125,6 +129,9 @@ def test_codex_turn_persists_each_message_exactly_once():
         )
         agent._session_db_created = True
         agent._codex_session = MagicMock()
+        agent._codex_session._reviewer_binding = None
+        assert getattr(agent, "_kanban_reviewer_binding", None) is None
+        assert agent._codex_session._reviewer_binding is None
         agent._codex_session.run_turn.return_value = _make_turn()
         agent.tool_progress_callback = None
 

@@ -605,6 +605,10 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     turn's transcript (current user row last); a thread started from scratch is seeded with the prior turns."""
     developer_instructions = _codex_developer_instructions(agent)
     model_provider = _codex_model_provider(agent)
+    reviewer_binding = getattr(agent, '_kanban_reviewer_binding', None)
+    existing = getattr(agent, '_codex_session', None)
+    if existing is not None and getattr(existing, '_reviewer_binding', None) != reviewer_binding:
+        raise ValueError('Cannot reuse a Codex Session with different Reviewer authority')
     if getattr(agent, "_codex_session", None) is not None:
         # Only a session whose recorded composition differs is stale; one attached without a record is kept.
         # The provider is fixed per thread (turn/start can switch the model, not the provider), so an
@@ -660,6 +664,7 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
         developer_instructions=developer_instructions or None,
         model=_codex_wire_model(agent, model_provider), model_provider=model_provider,
         resume_thread_id=resume_thread_id, history_seed=history_seed,
+        reviewer_binding=reviewer_binding,
     )
 
 

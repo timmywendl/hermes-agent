@@ -146,3 +146,140 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('later_change', ['operator_backfill', 'new_developer_run'])
+def test_delayed_reviewer_notification_cannot_use_later_task_result(tmp_path, monkeypatch, later_change):
+    """A safe Review event must not acquire a later result at notification time."""
+    import asyncio
+    from contextlib import closing
+    from unittest.mock import AsyncMock
+
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from gateway.platforms.base import BasePlatformAdapter
+    from gateway import kanban_watchers_notifier as notifier
+    from gateway.config import Platform
+    from hermes_cli import kanban_db as kb, kanban_db_notify as kbn
+    from hermes_cli.kanban_db_connect import connect
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    monkeypatch.delenv('HERMES_DELEGATED_CHILD', raising=False)
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    board = 'delayed-review'
+    kb.create_board(board)
+    later_file = tmp_path / 'later-developer.txt'
+    later_file.write_text('synthetic disposable content')
+    with closing(connect(board=board)) as conn:
+        tid = kb.create_task(conn, title='Review one work item', assignee='default')
+        kbn.add_notify_sub(conn, task_id=tid, platform='telegram', chat_id='disposable-chat')
+        kb.recompute_ready(conn)
+        developer = kb.claim_task(conn, tid)
+        assert kb.request_review(conn, tid, summary='Ready for review',
+                                 expected_run_id=developer.current_run_id)
+        reviewer = kb.claim_review_task(conn, tid)
+        # The proposed allowed tools can ensure exactly this safe completion.
+        assert kb.complete_task(conn, tid, summary='Review passed', result=None,
+                                expected_run_id=reviewer.current_run_id)
+        event = conn.execute("SELECT id, run_id, payload FROM task_events WHERE task_id=? "
+                             "AND kind='completed' ORDER BY id DESC LIMIT 1", (tid,)).fetchone()
+        assert event['run_id'] == reviewer.current_run_id
+        old_payload = json.loads(event['payload'])
+        assert not old_payload.get('artifacts')
+        assert kb.get_task(conn, tid).result is None
+        if later_change == 'operator_backfill':
+            assert kb.edit_task(conn, tid, result=str(later_file))
+        else:
+            from plugins.kanban.dashboard.plugin_api import _set_status_direct
+            assert _set_status_direct(conn, tid, 'ready')
+            next_run = kb.claim_task(conn, tid)
+            assert next_run.current_run_id != reviewer.current_run_id
+            assert kb.complete_task(conn, tid, result=str(later_file),
+                                    expected_run_id=next_run.current_run_id)
+        # Both supported independent mutations can outlive the old Review event.
+        current_task = kb.get_task(conn, tid)
+        assert current_task.result == str(later_file)
+
+    adapter = SimpleNamespace(
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_document=AsyncMock(), send_multiple_images=AsyncMock(), send_video=AsyncMock(),
+    )
+    # Keep the real local-delivery filter; fixtures must meet its actual policy.
+    assert str(later_file) in BasePlatformAdapter.filter_local_delivery_paths([str(later_file)])
+    adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+    runner = SimpleNamespace(adapters={Platform.TELEGRAM: adapter}, _profile_adapters={},
+                             _owns_kanban_dispatcher_lock=lambda: True)
+    from types import MethodType
+    runner._deliver_kanban_artifacts = MethodType(GatewayKanbanWatchersMixin._deliver_kanban_artifacts, runner)
+    monkeypatch.setattr(notifier, '_adapter_for_subscription', lambda *a: adapter)
+    collector = notifier._Collector(runner, kb, notifier_profile=None, gc_due=False, gc_retention_days=30)
+    with closing(connect(board=board)) as conn:
+        sub = kbn.list_notify_subs(conn)[0]
+        delivery = collector._claim_for_sub(conn, board, sub)
+    assert delivery['task'].result == current_task.result
+    review_event = next(ev for ev in delivery['events'] if ev.id == event['id'])
+    assert review_event.run_id == reviewer.current_run_id
+    notification = notifier._KanbanNotification(runner, delivery, platform_cls=Platform, sub_fail_counts={})
+    notification.adapter = adapter
+    assert asyncio.run(notification._send_event(review_event, 'Review passed')) is True
+    adapter.send.assert_awaited_once()
+    # No network call is made: these are adapter spies around the real consumer.
+    adapter.send_document.assert_not_awaited()
+    adapter.send_multiple_images.assert_not_awaited()
+    adapter.send_video.assert_not_awaited()
+    assert later_file.read_text() == 'synthetic disposable content'
+
+
+def test_developer_notification_keeps_legitimate_file_delivery(tmp_path):
+    """A repair must preserve the existing Developer artifact delivery path."""
+    import asyncio
+    from unittest.mock import AsyncMock
+
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from gateway.platforms.base import BasePlatformAdapter
+
+    deliverable = tmp_path / 'developer.txt'
+    deliverable.write_text('disposable developer deliverable')
+    adapter = SimpleNamespace(
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_document=AsyncMock(), send_multiple_images=AsyncMock(), send_video=AsyncMock(),
+    )
+    asyncio.run(GatewayKanbanWatchersMixin._deliver_kanban_artifacts(
+        SimpleNamespace(), adapter=adapter, chat_id='disposable-chat', metadata={},
+        event_payload={'summary': 'Developer output'}, task=SimpleNamespace(result=str(deliverable)),
+    ))
+    adapter.send_document.assert_awaited_once_with(
+        chat_id='disposable-chat', file_path=str(deliverable), metadata={},
+    )
+    assert deliverable.read_text() == 'disposable developer deliverable'
+
+
+from tests.tools.test_kanban_tools import reviewer_env as _reviewer_fixture
+reviewer_env = _reviewer_fixture
+
+
+def test_gateway_review_policy_keeps_only_current_task_context(reviewer_env):
+    from contextlib import closing
+    from gateway.session_contract import Principal
+    from gateway.session_kanban import build_kanban_policy
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+
+    with closing(connect(board='owned')) as conn:
+        other = kb.create_task(conn, title='FOREIGN_ROLE_HISTORY_SECRET', assignee='default')
+        assert kb.complete_task(conn, other, summary='FOREIGN_HANDOFF_SECRET')
+    actor = Principal('owner', reviewer_env.home, frozenset({'session:create'}), 'transport')
+    connection = SimpleNamespace(native_owner=True, actor=actor,
+                                 authority=SimpleNamespace(profile_id=reviewer_env.home))
+    policy, _ = build_kanban_policy(connection, {
+        'board': reviewer_env.board, 'task_id': reviewer_env.task_id,
+        'run_id': reviewer_env.run_id, 'claim_lock': reviewer_env.claim_lock,
+    }, {'model': {'default': 'synthetic', 'provider': 'custom'},
+        'platform_toolsets': {'cli': ['terminal', 'file', 'web']}})
+    context = json.loads(policy.kanban_json)
+    assert context['reviewer'] is True and context['owner_home'] == reviewer_env.home
+    assert 'abc123' in context['context']
+    assert 'FOREIGN_ROLE_HISTORY_SECRET' not in context['context']
+    assert 'FOREIGN_HANDOFF_SECRET' not in context['context']
+    assert policy.toolsets == ('kanban',)

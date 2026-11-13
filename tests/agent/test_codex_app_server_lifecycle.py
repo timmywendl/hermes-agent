@@ -96,3 +96,54 @@ def test_release_clients_releases_codex_app_server_session():
 
     assert codex_session.close_calls == 1
     assert agent._codex_session is None
+
+
+import pytest
+from tests.tools.test_kanban_tools import reviewer_env as _reviewer_fixture
+reviewer_env = _reviewer_fixture
+
+
+def test_loaded_developer_session_cannot_become_reviewer(reviewer_env, monkeypatch):
+    from types import SimpleNamespace
+    from agent import codex_runtime as runtime
+    old = SimpleNamespace(_reviewer_binding=None)
+    agent = SimpleNamespace(_codex_session=old, _kanban_reviewer_binding=reviewer_env)
+    monkeypatch.setattr(runtime, '_codex_developer_instructions', lambda a: 'fixed prompt')
+    monkeypatch.setattr(runtime, '_codex_model_provider', lambda a: None)
+    with pytest.raises(ValueError, match='different Reviewer authority'):
+        runtime._ensure_codex_session(agent)
+    assert agent._codex_session is old
+
+
+def test_original_developer_session_reuse_is_unchanged(monkeypatch):
+    from types import SimpleNamespace
+    from agent import codex_runtime as runtime
+    old = SimpleNamespace(_reviewer_binding=None)
+    agent = SimpleNamespace(_codex_session=old)
+    monkeypatch.setattr(runtime, '_codex_developer_instructions', lambda a: 'fixed prompt')
+    monkeypatch.setattr(runtime, '_codex_model_provider', lambda a: None)
+    runtime._ensure_codex_session(agent)
+    assert agent._codex_session is old
+
+
+def test_private_gateway_binding_reaches_original_session(reviewer_env, monkeypatch):
+    from types import SimpleNamespace
+    from agent import codex_runtime as runtime
+    from agent.transports import codex_app_server_session as transport
+    agent = SimpleNamespace(_codex_session=None, _kanban_reviewer_binding=reviewer_env,
+                             session_cwd=reviewer_env.home)
+    monkeypatch.setattr(runtime, '_codex_developer_instructions', lambda a: 'fixed prompt')
+    monkeypatch.setattr(runtime, '_codex_model_provider', lambda a: None)
+    monkeypatch.setattr(runtime, '_stored_codex_thread_id', lambda a: None)
+    monkeypatch.setattr(runtime, '_codex_wire_model', lambda a, p: 'synthetic-model')
+    monkeypatch.setattr(runtime, 'make_codex_app_server_event_bridge', lambda a: None)
+    monkeypatch.setattr('hermes_cli.config.load_config', dict)
+    monkeypatch.setattr('hermes_cli.codex_runtime_switch.get_configured_codex_binary', lambda c: 'codex')
+    captured = {}
+    def session(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(_reviewer_binding=kwargs['reviewer_binding'])
+    monkeypatch.setattr(transport, 'CodexAppServerSession', session)
+    runtime._ensure_codex_session(agent)
+    assert captured['reviewer_binding'] is reviewer_env
+    assert captured['model'] == 'synthetic-model'

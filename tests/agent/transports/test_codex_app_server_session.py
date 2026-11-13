@@ -1228,3 +1228,207 @@ def test_only_current_turn_progress_reaches_hermes_activity_clock():
     assert result.error is None and not result.interrupted
     assert agent._turn_liveness_activity_generation == generation + 1
     assert agent._last_activity_desc == "codex app-server: item/agentMessage/delta"
+
+
+from tests.tools.test_kanban_tools import reviewer_env as _reviewer_fixture
+reviewer_env = _reviewer_fixture  # shared real Store/Owner fixture
+
+
+@pytest.fixture
+def reviewer_session(reviewer_env, monkeypatch):
+    import json
+    import sys
+    from pathlib import Path
+    from dataclasses import asdict
+    from tools.kanban_tools import REVIEWER_TOOLS
+
+    client = FakeClient()
+    status = {'name': 'hermes-tools', 'runtimeStatus': 'connected',
+              'serverCapabilities': {'tools': {}, 'prompts': {}, 'resources': {}},
+              'toolsError': None, 'tools': {name: {'name': name, 'inputSchema': {'type': 'object'}} for name in REVIEWER_TOOLS},
+              'resources': [], 'resourceTemplates': []}
+    wire = {'status': status, 'identity': asdict(reviewer_env), 'error': False}
+    server = {'command': sys.executable, 'args': ['-m', 'agent.transports.hermes_tools_mcp_server'],
+              'cwd': str(Path(session_mod.__file__).resolve().parents[2])}
+
+    def handler(method, params):
+        if method == 'config/read':
+            return {'config': {'mcp_servers': {'hermes-tools': server}}, 'layers': [], 'origins': {}}
+        if method in ('thread/start', 'thread/resume'):
+            return {'thread': {'id': params.get('threadId', 'review-thread')},
+                    'sandbox': {'type': 'readOnly', 'networkAccess': False}}
+        if method == 'mcpServerStatus/list':
+            return {'data': [dict(wire['status'])], 'nextCursor': None}
+        if method == 'mcpServer/tool/call':
+            return {'content': [{'type': 'text', 'text': json.dumps({'ok': True, 'reviewer_identity': wire['identity']})}],
+                    'isError': wire['error']}
+        if method == 'turn/start':
+            client.queue_notification('turn/completed', threadId='review-thread', turn={'id': 'review-turn', 'status': 'completed'})
+            return {'turn': {'id': 'review-turn'}}
+        return {}
+
+    client._request_handler = handler
+    session = CodexAppServerSession(client_factory=lambda **kw: client, reviewer_binding=reviewer_env, codex_home=str(Path(reviewer_env.home) / 'codex'))
+    # Pure RPC regression level; actual subprocess cleanup has a separate test.
+    monkeypatch.setattr(session, '_reviewer_children', dict)
+    return session, client, wire
+
+
+def test_reviewer_every_turn_host_preflight_then_current_connection(reviewer_session):
+    session, client, _wire = reviewer_session
+    first = session.run_turn('Review current task', turn_timeout=2)
+    second = session.run_turn('Continue same review', turn_timeout=2)
+    assert first.error is None and second.error is None
+    methods = [m for m, _ in client.requests]
+    assert methods.count('turn/start') == methods.count('mcpServer/tool/call') == 2
+    for index, method in enumerate(methods):
+        if method == 'turn/start':
+            assert methods[index-3:index] == ['mcpServerStatus/list', 'mcpServer/tool/call', 'mcpServerStatus/list']
+            assert client.requests[index-1][1]['serverName'] == 'hermes-tools'
+            assert 'serverName' not in client.requests[index-3][1]
+            params = client.requests[index][1]
+            assert params['sandboxPolicy'] == {'type': 'readOnly', 'networkAccess': False}
+            assert 'reviewer_identity' not in str(params)
+    start = next(p for m, p in client.requests if m == 'thread/start')
+    assert start['sandbox'] == 'read-only' and start['config']['features.apps'] is False
+    assert start['config']['mcp_servers.hermes-tools.env.HERMES_SESSION_ID'] == session._reviewer_binding.session_id
+
+
+@pytest.mark.parametrize('state', [None, 'notStarted', 'starting', 'authenticationRequired', 'failed', 'cancelled', 'disabled', 'Connected', 'unknown'])
+def test_reviewer_rejects_nonconnected_current_state_before_model(reviewer_session, state):
+    session, client, wire = reviewer_session
+    wire['status']['runtimeStatus'] = state
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.should_retire and result.error
+    assert not any(m == 'turn/start' for m, _ in client.requests)
+    assert client._closed
+
+
+@pytest.mark.parametrize(('target', 'key', 'value', 'drop'), [
+    ('identity', 'session_id', 'foreign', False), ('wire', 'error', True, False),
+    ('status', 'toolsError', None, True), ('status', 'tools', {'kanban_show': {}}, False),
+    ('status', 'serverCapabilities', {}, False), ('status', 'name', 'unexpected', False),
+])
+def test_reviewer_preflight_or_catalog_failure_is_zero_model_calls(reviewer_session, target, key, value, drop):
+    session, client, wire = reviewer_session
+    state = {'identity': wire['identity'], 'wire': wire, 'status': wire['status']}[target]
+    if drop:
+        state.pop(key)
+    else:
+        state[key] = value
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and result.should_retire
+    assert not any(m == 'turn/start' for m, _ in client.requests)
+
+
+def test_reviewer_does_not_bypass_direct_rpc_subagent_denial(reviewer_session):
+    session, client, _wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        if method == 'mcpServer/tool/call':
+            raise session_mod.CodexAppServerError(code=-32600, message='direct input forbidden for multi-agent child')
+        return original(method, params)
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and result.should_retire
+    assert not any(m == 'turn/start' for m, _ in client.requests)
+
+
+def test_reviewer_second_turn_observes_drift(reviewer_session):
+    session, client, wire = reviewer_session
+    assert session.run_turn('Review', turn_timeout=2).error is None
+    wire['status']['tools'] = {'kanban_show': {}}
+    assert session.run_turn('Continue', turn_timeout=2).error
+    assert sum(m == 'turn/start' for m, _ in client.requests) == 1
+
+
+def test_reviewer_startup_notice_without_turn_id_invalidates(reviewer_session):
+    session, client, _wire = reviewer_session
+    session.ensure_started()
+    original = client._request_handler
+    def handler(method, params):
+        response = original(method, params)
+        if method == 'mcpServer/tool/call':
+            client.queue_notification('mcpServer/startupStatus/updated', status='connected')
+        return response
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and not any(m == 'turn/start' for m, _ in client.requests)
+
+
+def test_reviewer_global_snapshot_never_starts_unknown_config(reviewer_session):
+    session, client, _wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        if method == 'config/read':
+            return {'config': {'mcp_servers': {'unsafe': {'command': 'must-not-run'}}}}
+        return original(method, params)
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error
+    assert not any(m in {'thread/start', 'mcpServerStatus/list', 'turn/start'} for m, _ in client.requests)
+
+
+def test_reviewer_cleanup_unproven_stops_further_gates(reviewer_session, monkeypatch):
+    session, client, _wire = reviewer_session
+    def refuse(_before):
+        raise ValueError('cleanup not proven')
+    monkeypatch.setattr(session, '_reviewer_wait_cleanup', refuse)
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and result.should_retire and client._closed
+    assert not any(m == 'mcpServer/tool/call' for m, _ in client.requests)
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_reviewer_actual_codex_host_direct_rpc_and_eager_cleanup(reviewer_env, tmp_path):
+    """Real app-server/stdio/Store, zero turn/start and no real Provider request."""
+    import json
+    import shutil
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    binary = shutil.which('codex')
+    if binary is None:
+        pytest.skip('qualification requires an installed Codex binary')
+    version = subprocess.check_output([binary, '--version'], text=True).strip()
+    assert version == 'codex-cli 0.154.0', version
+    codex_home = Path(reviewer_env.home) / 'codex'
+    codex_home.mkdir()
+    repo = Path(session_mod.__file__).resolve().parents[2]
+    config = '\n'.join([
+        'model = "offline-qualification"', 'model_provider = "offline"',
+        '[model_providers.offline]', 'name = "Disposable offline fixture"',
+        'base_url = "http://127.0.0.1:1/v1"', 'wire_api = "responses"', 'requires_openai_auth = false',
+        '[features]', 'apps = false', '[mcp_servers.hermes-tools]',
+        'command = ' + json.dumps(sys.executable),
+        'args = ["-m", "agent.transports.hermes_tools_mcp_server"]',
+        'cwd = ' + json.dumps(str(repo)),
+    ])
+    (codex_home / 'config.toml').write_text(config)
+    session = CodexAppServerSession(codex_bin=binary, codex_home=str(codex_home), cwd=str(tmp_path),
+                                    model='offline-qualification', model_provider='offline', reviewer_binding=reviewer_env)
+    try:
+        thread = session.ensure_started()
+        assert thread
+        # The first call proves this root Thread supports direct RPC. Both gates
+        # also exercise independent Eager discovery and bounded child cleanup.
+        observed_status = []
+        original_status = session._reviewer_status
+        def capture_status(**kwargs):
+            response = original_status(**kwargs)
+            observed_status.append(response)
+            return response
+        session._reviewer_status = capture_status
+        try:
+            session._reviewer_preflight()
+        except ValueError as exc:
+            pytest.fail(str(exc) + '\n' + json.dumps(observed_status, sort_keys=True))
+        first = session._reviewer_children()
+        session._reviewer_preflight()
+        second = session._reviewer_children()
+        assert set(first) == set(second), (first, second)
+        assert not session._active_turn_id
+    finally:
+        session.close()
+    assert session._client is None

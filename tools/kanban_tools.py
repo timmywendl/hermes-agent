@@ -12,7 +12,14 @@ import json
 import logging
 import os
 import time
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass
+from pathlib import Path, PurePosixPath
+import re
+import sqlite3
+import unicodedata
+from urllib.parse import unquote
 from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
@@ -120,6 +127,174 @@ class _Reject(Exception):
         super().__init__(tool_error(message))
 
 
+REVIEWER_TOOLS = ("kanban_heartbeat", "kanban_complete", "kanban_request_changes", "kanban_block")
+_REVIEWER = ContextVar("kanban_reviewer", default=None)
+_REVIEWER_PREFLIGHT = ContextVar("kanban_reviewer_preflight", default=False)
+
+
+@dataclass(frozen=True)
+class ReviewerBinding:
+    """Original claim and Owner references, carried only by the private worker path."""
+
+    board: str
+    task_id: str
+    run_id: int
+    claim_lock: str
+    kanban_db: str
+    profile: str
+    home: str
+    session_id: str
+    owner_db: str
+    request_id: str
+    claimed_event_id: int
+    admission_event_id: int
+    claim_ttl_seconds: int
+
+
+def claimed_lane(conn, task_id, run_id):
+    rows = conn.execute("SELECT id,payload,created_at FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
+                        (task_id, run_id)).fetchall()
+    if len(rows) != 1:
+        raise ValueError("Reviewer claim provenance unavailable")
+    data = json.loads(rows[0]['payload'])
+    if data.get('run_id') != run_id or not data.get('lock'):
+        raise ValueError("Reviewer claim provenance invalid")
+    # claim_task emits no source_status; claim_review_task explicitly emits review.
+    if data.get('source_status') not in (None, 'review'):
+        raise ValueError("Unknown claim source")
+    return rows[0]['id'], data, data.get('source_status') == 'review', rows[0]['created_at']
+
+
+def reviewer_binding(*, board, task_id, run_id, claim_lock, db, profile, home, session_id):
+    """Read original state; locators never establish authority by themselves."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.profiles import resolve_profile_env
+    from hermes_state import _default_db_path
+
+    db = Path(db).resolve(strict=True)
+    with closing(sqlite3.connect(db.as_uri() + '?mode=ro', uri=True)) as conn:
+        conn.row_factory = sqlite3.Row
+        claimed_id, claimed, is_review, claimed_at = claimed_lane(conn, task_id, run_id)
+        if not is_review:
+            return None
+        task = kb.get_task(conn, task_id)
+        run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?', (run_id, task_id)).fetchone()
+        now = int(time.time())
+        if (not task or not run or task.status != 'running' or run['status'] != 'running'
+                or task.current_run_id != run_id or not claim_lock or task.claim_lock != claim_lock
+                or run['claim_lock'] != claim_lock or claimed['lock'] != claim_lock
+                or not task.claim_expires or task.claim_expires <= now
+                or not run['claim_expires'] or run['claim_expires'] <= now):
+            raise ValueError('Reviewer claim is not live')
+        home = str(Path(home).resolve(strict=True))
+        names = (profile, task.assignee, run['profile'])
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError('Reviewer Profile unavailable')
+        if any(str(Path(resolve_profile_env(name)).resolve(strict=True)) != home for name in names):
+            raise ValueError('Reviewer Profile mismatch')
+        owner_db = str(_default_db_path().resolve())
+        if owner_db != str(Path(home) / 'state.db'):
+            raise ValueError('Reviewer custom Owner DB is not qualified')
+        rows = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted'",
+                            (task_id, run_id)).fetchall()
+        if len(rows) != 1:
+            raise ValueError('Reviewer Owner admission unavailable')
+        owner = json.loads(rows[0]['payload'])
+        request = 'kanban:' + json.dumps([board, task_id, run_id], separators=(',', ':'))
+        if (not session_id or owner.get('session_id') != session_id or owner.get('request_id') != request
+                or owner.get('db') != owner_db):
+            raise ValueError('Reviewer Owner admission mismatch')
+        ttl = claimed.get('expires', 0) - int(claimed_at)
+        if ttl <= 0:
+            raise ValueError('Reviewer original claim TTL unavailable')
+        return ReviewerBinding(board, task_id, run_id, claim_lock, str(db), profile, home,
+                               session_id, owner_db, request, claimed_id, rows[0]['id'], ttl)
+
+
+def reviewer_binding_from_env():
+    tid = os.environ.get('HERMES_KANBAN_TASK')
+    if not tid:
+        return None
+    from hermes_cli import kanban_db as kb
+    return reviewer_binding(board=os.environ.get('HERMES_KANBAN_BOARD', ''), task_id=tid,
+        run_id=int(os.environ.get('HERMES_KANBAN_RUN_ID', '0')),
+        claim_lock=os.environ.get('HERMES_KANBAN_CLAIM_LOCK', ''),
+        db=str(kb.kanban_db_path()), profile=os.environ.get('HERMES_PROFILE', ''),
+        home=os.environ.get('HERMES_HOME', ''), session_id=os.environ.get('HERMES_SESSION_ID', ''))
+
+
+@contextmanager
+def reviewer_tool_scope(binding, *, preflight=False):
+    token = _REVIEWER.set(binding)
+    proof = _REVIEWER_PREFLIGHT.set(preflight)
+    try:
+        yield
+    finally:
+        _REVIEWER_PREFLIGHT.reset(proof)
+        _REVIEWER.reset(token)
+
+
+def _review_text(value):
+    if value is None:
+        return
+    _check(isinstance(value, str) and len(value) <= 16000, 'Reviewer text must be bounded')
+    text = ''.join(c for c in unicodedata.normalize('NFKC', unquote(value))
+                   if unicodedata.category(c) != 'Cf')
+    text = re.sub(r'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/[0-9]+(?:/files)?(?:#[A-Za-z0-9_.-]+)?(?=$|[\s<>"`])', '', text)
+    _check(not re.search(r'(?i)(?:MEDIA\s*:|file\s*:|(?:^|[^\w])~[/\\]|[a-z]:[/\\]|(?<![\w:])/\S|\[(?:document|audio|image|video)\])', text),
+           'Reviewer file delivery is not permitted')
+
+
+def reviewer_arguments(args):
+    """Reject shape and egress before any Store access under an established binding."""
+    if 'created_cards' in args:
+        _check(type(args['created_cards']) is list and not args['created_cards'], 'Reviewer created_cards must be omitted or empty')
+    if 'artifacts' in args:
+        _check(type(args['artifacts']) is list and not args['artifacts'], 'Reviewer artifacts must be omitted or empty')
+    for name in ('summary', 'result', 'reason', 'note'):
+        _review_text(args.get(name))
+    meta = args.get('metadata')
+    _check(meta is None or type(meta) is dict, 'Reviewer metadata must be an object')
+    if meta is None:
+        return
+    _check(set(meta) <= {'verdict', 'reviewed_head', 'author_run_id', 'reviewer_run_id', 'findings'}, 'Unsupported Reviewer metadata')
+    for key in ('verdict', 'reviewed_head'):
+        if key in meta:
+            _review_text(meta[key])
+            _check(isinstance(meta[key], str) and 0 < len(meta[key]) <= 128, 'Invalid Reviewer receipt')
+    for key in ('author_run_id', 'reviewer_run_id'):
+        if key in meta:
+            _check(type(meta[key]) is int and meta[key] > 0, 'Invalid Reviewer Run reference')
+    if 'findings' not in meta:
+        return
+    findings = meta['findings']
+    _check(type(findings) is list and len(findings) <= 100, 'Invalid Reviewer findings')
+    for finding in findings:
+        _check(type(finding) is dict and set(finding) <= {'code', 'severity', 'message', 'file', 'line'}, 'Invalid Reviewer finding')
+        for key in ('code', 'severity', 'message'):
+            if key in finding:
+                _check(isinstance(finding[key], str), 'Invalid Reviewer finding text')
+                _review_text(finding[key])
+        if 'file' in finding:
+            file = finding['file']
+            if isinstance(file, str):
+                file = unicodedata.normalize('NFKC', unquote(file))
+            _check(isinstance(file, str) and 0 < len(file) <= 512 and not file.startswith(('~', '/'))
+                   and not any(c in file for c in ('\\', ':')) and '..' not in PurePosixPath(file).parts,
+                   'Reviewer finding must use a repository-relative file')
+        if 'line' in finding:
+            _check(type(finding['line']) is int and 1 <= finding['line'] <= 10000000, 'Invalid finding line')
+
+
+def validate_reviewer_binding(binding):
+    fields = asdict(binding)
+    candidate = reviewer_binding(board=binding.board, task_id=binding.task_id, run_id=binding.run_id,
+        claim_lock=binding.claim_lock, db=binding.kanban_db, profile=binding.profile,
+        home=binding.home, session_id=binding.session_id)
+    if candidate is None or asdict(candidate) != fields:
+        raise ValueError('Reviewer binding changed')
+
+
 def _check(cond: Any, message: str) -> None:
     """Reject (as a tool error) unless ``cond`` is truthy."""
     if not cond:
@@ -158,6 +333,9 @@ def _kanban_handler(tool_name: str) -> Callable:
         @functools.wraps(fn)
         def wrapper(args: dict, **kw) -> str:
             try:
+                if _REVIEWER.get() is not None:
+                    _check(tool_name in REVIEWER_TOOLS, 'Reviewer tool not permitted')
+                    reviewer_arguments(args)
                 # Reject typos before a handoff can succeed without its artifacts.
                 properties = registry.get_schema(tool_name)["parameters"]["properties"]
                 allowed = set(properties) | _UNDECLARED_ARGS.get(tool_name, frozenset())
@@ -279,6 +457,20 @@ def _worker_guard(tool_name: str, args: dict) -> str:
     worker tools (heartbeat / attach / attach_url) do not terminate a run and are
     not gated here.
     """
+    binding = _REVIEWER.get()
+    if binding is not None:
+        _check(tool_name in REVIEWER_TOOLS, 'Reviewer tool not permitted')
+        reviewer_arguments(args)
+        _check(args.get('task_id', binding.task_id) == binding.task_id
+               and args.get('board', binding.board) == binding.board, 'Reviewer scope mismatch')
+        _check(os.environ.get('HERMES_KANBAN_DB') == binding.kanban_db
+               and os.environ.get('HERMES_KANBAN_TASK') == binding.task_id
+               and os.environ.get('HERMES_KANBAN_CLAIM_LOCK') == binding.claim_lock
+               and os.environ.get('HERMES_KANBAN_RUN_ID') == str(binding.run_id), 'Reviewer environment drift')
+        try:
+            validate_reviewer_binding(binding)
+        except (ValueError, OSError) as exc:
+            raise _Reject('Reviewer identity unavailable') from exc
     _reject_delegated_child_mutation(tool_name)
     tid = _require_task_id(args)
     _enforce_worker_task_ownership(tid)
@@ -939,11 +1131,16 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     with _board(args.get("board")) as (kb, conn):
         # The dispatcher pins HERMES_KANBAN_CLAIM_LOCK at spawn; the default
         # claimer covers locally-driven workers that bypassed the dispatcher.
-        kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
+        binding = _REVIEWER.get()
+        renewed = kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+                                     **({'ttl_seconds': binding.claim_ttl_seconds} if binding else {}))
+        if _REVIEWER.get() is not None:
+            _check(renewed, 'Reviewer claim renewal failed')
         ok = kbd.heartbeat_worker(
             conn, tid, note=args.get("note"), expected_run_id=_worker_run_id(tid))
         _check(ok, f"could not heartbeat {tid} (unknown id or not running)")
-        return _ok(task_id=tid)
+        identity = asdict(_REVIEWER.get()) if _REVIEWER.get() and _REVIEWER_PREFLIGHT.get() else None
+        return _ok(task_id=tid, **({'reviewer_identity': identity} if identity else {}))
 
 
 @_kanban_handler("kanban_comment")

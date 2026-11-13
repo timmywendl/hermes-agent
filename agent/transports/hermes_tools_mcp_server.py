@@ -89,10 +89,45 @@ def _build_server() -> Any:
         ),
     )
 
+    from tools.kanban_tools import (
+        REVIEWER_TOOLS, reviewer_binding_from_env, reviewer_tool_scope,
+        reviewer_arguments, validate_reviewer_binding,
+    )
+    binding = reviewer_binding_from_env()
+    if binding is not None:
+        from mcp.shared.exceptions import MCPError
+
+        denied = frozenset({'prompts/list', 'prompts/get', 'resources/list', 'resources/templates/list',
+                            'resources/read', 'subscriptions/listen', 'resources/subscribe', 'resources/unsubscribe'})
+
+        async def reviewer_boundary(ctx, call_next):
+            # Refuse before SDK parameter validation, lookup, providers or subscription ACK.
+            if ctx.method in denied:
+                raise MCPError(-32600, 'Reviewer protocol method denied')
+            params = ctx.params or {}
+            if ctx.method == 'tools/call':
+                if params.get('name') not in REVIEWER_TOOLS:
+                    raise MCPError(-32600, 'Reviewer tool denied')
+                try:
+                    reviewer_arguments(params.get('arguments') or {})
+                except Exception as exc:
+                    raise MCPError(-32602, 'Reviewer arguments denied') from exc
+            try:
+                validate_reviewer_binding(binding)
+            except (ValueError, OSError) as exc:
+                raise MCPError(-32600, 'Reviewer identity unavailable') from exc
+            meta = params.get('_meta') or {}
+            # This marker selects a host-only evidence response; it grants no authority.
+            preflight = isinstance(meta, dict) and meta.get('hermes/reviewerPreflight') is True
+            with reviewer_tool_scope(binding, preflight=preflight):
+                return await call_next(ctx)
+
+        mcp.middleware.append(reviewer_boundary)
+
     # Authoritative Hermes schemas so MCP clients see the same parameter docs the model does.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (get_tool_definitions(quiet_mode=True, **({'enabled_toolsets': ['kanban'], 'skip_tool_search_assembly': True} if binding else {})) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 
@@ -115,7 +150,7 @@ def _build_server() -> Any:
         return _dispatch
 
     exposed_count = 0
-    for name in EXPOSED_TOOLS:
+    for name in (REVIEWER_TOOLS if binding is not None else EXPOSED_TOOLS):
         spec = all_defs.get(name)
         if spec is None:
             logger.debug("skipping %s — not registered in this Hermes process", name)

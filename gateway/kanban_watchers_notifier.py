@@ -7,6 +7,8 @@ per-subscription delivery (``_KanbanNotification``) live here.
 
 from __future__ import annotations
 
+import json
+
 import asyncio
 import contextlib
 import re
@@ -318,9 +320,29 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        artifact_events = set()
+        for event in events:
+            if event.kind not in ('completed', 'review_requested'):
+                continue
+            # Only an exact, unique original Developer claim can authorize the
+            # legacy artifact path. Missing/conflicting historical provenance is
+            # not a reason to borrow the current assignee or a newer Run.
+            if event.run_id is None:
+                # Preserve never-claimed operator/legacy completion behavior.
+                artifact_events.add(event.id)
+                continue
+            claimed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
+                                   (event.task_id, event.run_id)).fetchall()
+            if len(claimed) == 1:
+                try:
+                    source = json.loads(claimed[0]['payload'])
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(source, dict) and source.get('source_status') is None and source.get('run_id') == event.run_id and source.get('lock'):
+                    artifact_events.add(event.id)
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug, "artifact_events": frozenset(artifact_events)}
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -698,7 +720,7 @@ class _KanbanNotification:
         # review-bound card's files exist precisely so the human sees them at
         # handoff time. Retry exposure matches ``completed`` (the sub cursor is
         # rewound only when a send failed).
-        if ev.kind in ("completed", "review_requested"):
+        if ev.kind in ("completed", "review_requested") and ev.id in self.d.get("artifact_events", ()):
             try:
                 await self.runner._deliver_kanban_artifacts(
                     adapter=adapter, chat_id=sub["chat_id"], metadata=metadata,

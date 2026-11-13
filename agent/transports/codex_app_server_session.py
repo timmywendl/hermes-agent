@@ -11,10 +11,13 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import json
+import sys
+from pathlib import Path
 import os
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Optional
 
 from agent.codex_responses_adapter import _format_responses_error
@@ -217,11 +220,16 @@ class CodexAppServerSession:
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         model: Optional[str] = None, model_provider: Optional[str] = None,
         developer_instructions: Optional[str] = None, resume_thread_id: Optional[str] = None,
-        history_seed: Optional[str] = None,
+        history_seed: Optional[str] = None, reviewer_binding=None,
     ) -> None:
+        self._reviewer_binding = reviewer_binding
+        self._reviewer_generation = 0
+        self._reviewer_connected = False
+        self._reviewer_config_snapshot = None
+        self._reviewer_gate_lock = threading.Lock()
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
-        self._codex_home = codex_home
+        self._codex_home = (codex_home or os.environ.get('CODEX_HOME')) if reviewer_binding else codex_home
         # A codex thread id persisted by an earlier process for this Hermes session: the first
         # ``ensure_started`` issues ``thread/resume`` for it instead of ``thread/start``.
         self._resume_thread_id = resume_thread_id
@@ -262,16 +270,26 @@ class CodexAppServerSession:
         """Spawn, handshake, and ``thread/start`` (or ``thread/resume`` for a stored id); idempotent, returns
         the codex thread id. A failed resume raises :class:`CodexThreadResumeError` once; the next call
         starts a fresh thread on the same handshaken client."""
+        if self._reviewer_binding and self._closed:
+            raise ValueError('Reviewer Session is retired')
         if self._thread_id is not None:
             return self._thread_id
+        if self._reviewer_binding:
+            if not self._codex_home or not Path(self._codex_home).resolve().is_relative_to(Path(self._reviewer_binding.home).resolve()):
+                raise ValueError('Reviewer requires an explicit Owner-scoped Codex home')
         if self._client is None:
             self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
-            self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version())
+            self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version(),
+                                    **({'capabilities': {'experimentalApi': True}} if self._reviewer_binding else {}))
+        if self._reviewer_binding:
+            self._reviewer_check_launch_config()
         # Permissions are NOT sent on thread/start: codex gates ``thread/start.permissions``
         # behind experimentalApi + a matching ``[permissions]`` table in ~/.codex/config.toml.
         # Hermes supplies the agent identity through its own system prompt; ``personality: "none"`` strips
         # codex's built-in "# Personality" section from the base instructions so it cannot compete (#72104).
         params: dict[str, Any] = {"cwd": self._cwd, "personality": "none"}
+        if self._reviewer_binding:
+            params.update(sandbox='read-only', approvalPolicy='never', config=self._reviewer_thread_config())
         if self._developer_instructions and self._developer_instructions.strip():
             params["developerInstructions"] = self._developer_instructions
         if self._model_provider:
@@ -295,6 +313,8 @@ class CodexAppServerSession:
                 raise CodexAppServerError(
                     code=-32603, message=f"codex thread/start returned no thread id (payload keys: {sorted(result.keys())})",
                 )
+            if self._reviewer_binding:
+                self._reviewer_check_sandbox(result)
             self._service_tier_sent = None  # a new thread runs codex's own configured tier
             logger.info("codex app-server thread started: id=%s profile=%s cwd=%s", thread_id[:8], self._permission_profile, self._cwd)
         self._thread_id = thread_id
@@ -311,7 +331,215 @@ class CodexAppServerSession:
         thread_id = _extract_thread_id(result)
         if thread_id != wanted:
             raise CodexThreadResumeError(wanted, f"app-server answered with thread {str(thread_id)[:8]!r}")
+        if self._reviewer_binding:
+            self._reviewer_check_sandbox(result)
         return wanted
+
+    @staticmethod
+    def _reviewer_check_sandbox(response):
+        sandbox = response.get('sandbox')
+        if not isinstance(sandbox, dict) or sandbox.get('type') != 'readOnly' or sandbox.get('networkAccess') is not False:
+            raise ValueError('Reviewer read-only/network isolation was not applied')
+
+    def _reviewer_thread_config(self):
+        from tools.kanban_tools import REVIEWER_TOOLS
+        binding = self._reviewer_binding
+        env = {'HERMES_PROFILE': binding.profile, 'HERMES_HOME': binding.home,
+               'HERMES_SESSION_ID': binding.session_id, 'HERMES_KANBAN_TASK': binding.task_id,
+               'HERMES_KANBAN_RUN_ID': str(binding.run_id), 'HERMES_KANBAN_CLAIM_LOCK': binding.claim_lock,
+               'HERMES_KANBAN_DB': binding.kanban_db, 'HERMES_KANBAN_BOARD': binding.board}
+        return {'features.apps': False,
+                'mcp_servers.hermes-tools.enabled_tools': list(REVIEWER_TOOLS),
+                **{'mcp_servers.hermes-tools.env.' + k: v for k, v in env.items()}}
+
+    @staticmethod
+    def _reviewer_thread_config_key_names():
+        from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+        return (*KANBAN_ENV_KEYS, 'HERMES_PROFILE', 'HERMES_HOME', 'HERMES_SESSION_ID',
+                'HERMES_KANBAN_DB', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_WORKSPACE',
+                'HERMES_KANBAN_WORKSPACES_ROOT', 'HERMES_QUIET', 'HERMES_REDACT_SECRETS',
+                DELEGATED_CHILD_ENV_MARKER)
+
+    def _reviewer_check_launch_config(self):
+        """Read config without starting discovery; never launch an unknown roster."""
+        response = self._client.request('config/read', {'cwd': self._cwd, 'includeLayers': True}, timeout=10)
+        config = response.get('config') if isinstance(response, dict) else None
+        if not isinstance(config, dict) or config.get('plugins') or config.get('extensions'):
+            raise ValueError('Reviewer effective launch configuration unavailable')
+        servers = config.get('mcp_servers')
+        if not isinstance(servers, dict) or set(servers) != {'hermes-tools'}:
+            raise ValueError('Reviewer unsafe effective server roster')
+        server = servers['hermes-tools']
+        if (not isinstance(server, dict) or server.get('url') or server.get('enabled') is False
+                or not isinstance(server.get('command'), str)
+                or Path(server['command']).resolve() != Path(sys.executable).resolve()
+                or server.get('args') != ['-m', 'agent.transports.hermes_tools_mcp_server']
+                or not isinstance(server.get('cwd'), str)
+                or Path(server['cwd']).resolve() != Path(__file__).resolve().parents[2]):
+            raise ValueError('Reviewer MCP executable is not the bounded Hermes endpoint')
+        env = server.get('env') or {}
+        allowed_env = set(self._reviewer_thread_config_key_names())
+        if not isinstance(env, dict) or set(env) - allowed_env or server.get('env_vars'):
+            raise ValueError('Reviewer unqualified MCP environment')
+        # Recheck the effective configuration every gate; no secret-bearing data is logged.
+        snapshot = json.dumps(servers, sort_keys=True, separators=(',', ':'))
+        if self._reviewer_config_snapshot is not None and snapshot != self._reviewer_config_snapshot:
+            raise ValueError('Reviewer effective launch configuration drift')
+        self._reviewer_config_snapshot = snapshot
+
+    def _reviewer_children(self):
+        import psutil
+        proc = getattr(self._client, '_proc', None)
+        if proc is None:
+            raise ValueError('Reviewer child ownership cannot be observed')
+        try:
+            parent = psutil.Process(proc.pid)
+            return {(p.pid, p.create_time()): p for p in parent.children(recursive=True)}
+        except psutil.Error as exc:
+            raise ValueError('Reviewer process cleanup identity unavailable') from exc
+
+    def _reviewer_wait_cleanup(self, before):
+        # A returned status/cancel token is not evidence that children were reaped.
+        observed = self._reviewer_children()
+        extras = {key: child for key, child in observed.items() if key not in before}
+        deadline = time.monotonic() + 3.0
+        while True:
+            current = self._reviewer_children()
+            extras.update({key: child for key, child in current.items() if key not in before})
+            live = [child for child in extras.values() if child.is_running()]
+            if not live:
+                return
+            if time.monotonic() >= deadline or self._interrupt_event.is_set():
+                raise ValueError('Reviewer Eager discovery cleanup not proven')
+            self._interrupt_event.wait(0.02)
+
+    def _reviewer_changed(self, note):
+        method = note.get('method', '')
+        changed = (method == 'mcpServer/startupStatus/updated' or method.startswith('config/')
+                   or method == 'thread/configurationUpdated')
+        if changed and self._reviewer_binding:
+            self._reviewer_generation += 1
+            self._reviewer_connected = False
+            return True
+        return False
+
+    def _reviewer_drain_changes(self, *, establish=False):
+        # Startup/control notifications are not model history; do not synthesize transcript entries.
+        buffered = []
+        for _ in range(128):
+            note = self._client.take_notification(timeout=0)
+            if note is None:
+                return buffered
+            if not isinstance(note, dict) or not isinstance(note.get('method'), str):
+                raise ValueError('Reviewer control notification malformed')
+            if self._reviewer_changed(note) and not establish:
+                raise ValueError('Reviewer connection publication changed')
+            buffered.append(note)
+        # Notifications produced before a model turn are startup/control evidence,
+        # never a prior model result to be replayed as current input.
+        raise ValueError('Reviewer control backlog exceeds admission budget')
+
+    def _reviewer_status(self, *, selected, cursor=None):
+        params = {'threadId': self._thread_id, 'detail': 'full' if selected else 'toolsAndAuthOnly'}
+        if selected:
+            params['serverName'] = 'hermes-tools'
+        if cursor is not None:
+            params['cursor'] = cursor
+        response = self._client.request('mcpServerStatus/list', params, timeout=10)
+        if not isinstance(response, dict) or type(response.get('data')) is not list or 'nextCursor' not in response:
+            raise ValueError('Reviewer MCP status incomplete')
+        return response
+
+    def _reviewer_roster(self):
+        before = self._reviewer_children()
+        names, cursors = [], set()
+        cursor = None
+        for _ in range(2):
+            page = self._reviewer_status(selected=False, cursor=cursor)
+            self._reviewer_wait_cleanup(before)
+            for server in page['data']:
+                if not isinstance(server, dict) or server.get('name') != 'hermes-tools':
+                    raise ValueError('Reviewer extra/unknown server')
+                names.append(server['name'])
+            cursor = page['nextCursor']
+            if cursor is None:
+                if names != ['hermes-tools']:
+                    raise ValueError('Reviewer roster is not exact')
+                return
+            if not isinstance(cursor, str) or not cursor or cursor in cursors:
+                raise ValueError('Reviewer pagination invalid')
+            cursors.add(cursor)
+        raise ValueError('Reviewer pagination budget exceeded')
+
+    def _reviewer_identity_preflight(self):
+        binding = self._reviewer_binding
+        response = self._client.request('mcpServer/tool/call', {
+            'threadId': self._thread_id, 'server': 'hermes-tools', 'tool': 'kanban_heartbeat',
+            'arguments': {'task_id': binding.task_id, 'board': binding.board, 'note': 'Reviewer host preflight'},
+            '_meta': {'hermes/reviewerPreflight': True}}, timeout=10)
+        if not isinstance(response, dict) or response.get('isError', False) is not False:
+            raise ValueError('Reviewer direct RPC refused')
+        content = response.get('content')
+        if (not isinstance(content, list) or len(content) != 1 or not isinstance(content[0], dict)
+                or content[0].get('type') != 'text' or not isinstance(content[0].get('text'), str)):
+            raise ValueError('Reviewer direct RPC evidence missing')
+        payload = json.loads(content[0]['text'])
+        structured = response.get('structuredContent')
+        # SDK 2.0 wraps a string-returning tool in its declared result schema.
+        if isinstance(structured, dict) and set(structured) == {'result'} and isinstance(structured['result'], str):
+            structured = json.loads(structured['result'])
+        if structured is not None and structured != payload:
+            raise ValueError('Reviewer conflicting evidence')
+        if (not isinstance(payload, dict) or payload.get('ok') is not True
+                or payload.get('reviewer_identity') != asdict(binding)):
+            raise ValueError('Reviewer actual connection identity mismatch')
+
+    def _reviewer_current_status(self):
+        from tools.kanban_tools import REVIEWER_TOOLS
+        page = self._reviewer_status(selected=True)
+        if page['nextCursor'] is not None or len(page['data']) != 1:
+            raise ValueError('Reviewer selected status is not exact')
+        server = page['data'][0]
+        if not isinstance(server, dict):
+            raise ValueError('Reviewer current status malformed')
+        if (server.get('name') != 'hermes-tools' or server.get('runtimeStatus') != 'connected'
+                or not isinstance(server.get('serverCapabilities'), dict) or not server['serverCapabilities']
+                or 'toolsError' not in server or server['toolsError'] is not None
+                or not isinstance(server.get('tools'), dict) or set(server['tools']) != set(REVIEWER_TOOLS)):
+            raise ValueError('Reviewer current connection not qualified')
+        from mcp_types import ServerCapabilities, Tool
+        capabilities = ServerCapabilities.model_validate(server['serverCapabilities'])
+        if capabilities.tools is None:
+            raise ValueError('Reviewer tools capability unavailable')
+        for name, value in server['tools'].items():
+            tool = Tool.model_validate(value)
+            if tool.name != name:
+                raise ValueError('Reviewer tool identity malformed')
+        # Denied resources/prompts inventories are not positive empty inventories.
+
+    def _reviewer_preflight(self):
+        from tools.kanban_tools import validate_reviewer_binding
+        if not self._reviewer_gate_lock.acquire(blocking=False):
+            raise ValueError('Reviewer admission is already in progress')
+        try:
+            validate_reviewer_binding(self._reviewer_binding)
+            self._reviewer_check_launch_config()
+            self._reviewer_drain_changes(establish=True)
+            if not self._reviewer_connected:
+                # Finish the admitted current connection before measuring extra
+                # Eager children; a delayed normal startup is not a leaked child.
+                self._reviewer_current_status()
+                self._reviewer_drain_changes(establish=True)
+                self._reviewer_connected = True
+            generation = self._reviewer_generation
+            self._reviewer_roster()
+            self._reviewer_identity_preflight()
+            self._reviewer_current_status()
+            self._reviewer_drain_changes()
+            if generation != self._reviewer_generation or self._interrupt_event.is_set():
+                raise ValueError('Reviewer admission evidence invalidated')
+        finally:
+            self._reviewer_gate_lock.release()
 
     def close(self) -> None:
         if self._closed:
@@ -384,8 +612,12 @@ class CodexAppServerSession:
         """ensure_started(); startup failures become a retiring TurnResult.error instead of raw exceptions."""
         try:
             self.ensure_started()
-        except (CodexAppServerError, TimeoutError) as exc:
+        except (CodexAppServerError, TimeoutError, ValueError) as exc:
+            if isinstance(exc, ValueError) and not self._reviewer_binding:
+                raise
             self._retire(result, self._format_error_with_stderr("codex app-server startup failed", exc))
+            if self._reviewer_binding:
+                self.close()
             return False
         assert self._client is not None and self._thread_id is not None
         result.thread_id = self._thread_id
@@ -483,6 +715,15 @@ class CodexAppServerSession:
                     params["effort"] = reasoning_effort
                 if service_tier != self._service_tier_sent:
                     params["serviceTier"] = service_tier
+                if self._reviewer_binding:
+                    params['sandboxPolicy'] = {'type': 'readOnly', 'networkAccess': False}
+                    params['approvalPolicy'] = 'never'
+                    try:
+                        self._reviewer_preflight()
+                    except (ValueError, OSError, CodexAppServerError, TimeoutError):
+                        self._retire(result, 'Reviewer permission qualification failed; no model turn sent')
+                        self.close()
+                        return result
                 ts = self._request_for(result, "turn/start", params, "turn/start")
                 if ts is not None:
                     self._service_tier_sent = service_tier
@@ -599,6 +840,11 @@ class CodexAppServerSession:
             if note is None:
                 continue
             method = note.get("method", "")
+            if self._reviewer_changed(note):
+                self._retire(result, 'Reviewer MCP/configuration changed during turn')
+                self._issue_interrupt(result.turn_id)
+                self.close()
+                break
             if pre_scope_filter is not None and not pre_scope_filter(note, method):
                 continue
             if not _notification_belongs_to_turn(note, thread_id=self._thread_id, turn_id=result.turn_id):

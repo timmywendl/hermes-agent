@@ -6,6 +6,7 @@ import threading
 import json
 from pathlib import Path
 import sqlite3
+import time
 
 from hermes_state_runtime import RuntimeStoreError
 
@@ -40,9 +41,15 @@ def build_kanban_policy(connection, params, config):
                                  (task.id, task.current_run_id)).fetchone()
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise RuntimeStoreError('stale_kanban_claim')
-            context = kb.build_worker_context(conn, task.id)
+            from tools.kanban_tools import claimed_lane
+            _event_id, _claimed, reviewer, _claimed_at = claimed_lane(conn, task.id, task.current_run_id)
+            if reviewer and (not task.claim_expires or task.claim_expires <= int(time.time())
+                             or not run['claim_expires'] or run['claim_expires'] <= int(time.time())
+                             or Path(resolve_profile_env(run['profile'])).resolve() != Path(authority.profile_id).resolve()):
+                raise RuntimeStoreError('stale_kanban_claim')
+            context = _reviewer_context(kb, conn, task) if reviewer else kb.build_worker_context(conn, task.id)
             skills = list(task.skills or ())
-            if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
+            if reviewer:
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
                 skills = list(dict.fromkeys([*skills, 'sdlc-review']))
     except (ValueError, OSError, sqlite3.Error) as exc:
@@ -63,10 +70,23 @@ def build_kanban_policy(connection, params, config):
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
     context['db'] = str(path)
+    context['owner_home'] = str(Path(authority.profile_id).resolve())
+    context['reviewer'] = reviewer
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
-    return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
+    return replace(policy, source='kanban', platform='cli', toolsets=('kanban',) if reviewer else tuple(sorted(set(policy.toolsets) | {'kanban'})),
                    request_json=json.dumps(request, sort_keys=True), kanban_json=json.dumps(context)), private
+
+
+def _reviewer_context(kb, conn, task):
+    from hermes_cli.kanban_db_context import _ctx_header, _ctx_attachments, _ctx_prior_attempts, _ctx_comments
+    lines = []
+    now = int(time.time())
+    _ctx_header(lines, task)
+    _ctx_attachments(lines, kb.list_attachments(conn, task.id))
+    _ctx_prior_attempts(lines, conn, task.id, now)
+    _ctx_comments(lines, kb.list_comments(conn, task.id), now)
+    return '\n'.join(lines).rstrip() + '\n'
 
 
 async def run_task(connection, params):
@@ -236,7 +256,13 @@ def _run_worker_turns(agent, frame, history):
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
     code, last_output = 1, ''
     try:
-        result = _run_task_turns(agent, frame, history, context)
+        from tools.kanban_tools import reviewer_binding, reviewer_tool_scope
+        binding = reviewer_binding(board=context['board'], task_id=context['task_id'], run_id=context['run_id'],
+            claim_lock=context['claim_lock'], db=context['db'], profile=context['profile'],
+            home=context.get('owner_home', ''), session_id=agent.session_id)
+        agent._kanban_reviewer_binding = binding
+        with reviewer_tool_scope(binding):
+            result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)
         last_output = str(result.get('final_response') or '')[-500:] if isinstance(result, dict) else ''
         return result

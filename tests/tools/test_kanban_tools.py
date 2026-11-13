@@ -1483,3 +1483,173 @@ class TestDefaultTaskId:
         assert kt._default_task_id("") == worker_env
         assert kt._default_task_id("   ") == worker_env
         assert kt._default_task_id(None) == worker_env
+
+
+@pytest.fixture
+def reviewer_env(tmp_path, monkeypatch):
+    """Real disposable claim/Owner references; no SessionDB or provider is opened."""
+    from contextlib import closing
+    from pathlib import Path
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from tools.kanban_tools import reviewer_binding_from_env
+
+    home = tmp_path / 'owner-home'
+    home.mkdir()
+    workspace = tmp_path / 'review-tree'
+    workspace.mkdir()
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    for key, value in {'HERMES_HOME': str(home), 'HERMES_KANBAN_HOME': str(home),
+                       'HERMES_PROFILE': 'default', 'HERMES_SESSION_ID': 'owner-session',
+                       'HERMES_KANBAN_BOARD': 'owned'}.items():
+        monkeypatch.setenv(key, value)
+    for key in ('HERMES_KANBAN_DB', 'HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_DELEGATED_CHILD_CONTEXT'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr('hermes_state.DEFAULT_DB_PATH', home / 'state.db')
+    kb.create_board('owned')
+    with closing(connect(board='owned')) as conn:
+        tid = kb.create_task(conn, title='Review exact HEAD abc123', assignee='default',
+                             workspace_kind='dir', workspace_path=str(workspace))
+        kb.recompute_ready(conn)
+        dev = kb.claim_task(conn, tid, claimer='developer-claim')
+        assert kb.request_review(conn, tid, summary='Changes at abc123', expected_run_id=dev.current_run_id)
+        task = kb.claim_review_task(conn, tid, claimer='reviewer-claim', ttl_seconds=600)
+        request = 'kanban:' + json.dumps(['owned', tid, task.current_run_id], separators=(',', ':'))
+        with kb.write_txn(conn):
+            kb._append_event(conn, tid, 'owner_admitted', {'request_id': request, 'session_id': 'owner-session',
+                'db': str(home / 'state.db')}, run_id=task.current_run_id)
+    for key, value in {'HERMES_KANBAN_TASK': tid, 'HERMES_KANBAN_RUN_ID': str(task.current_run_id),
+                       'HERMES_KANBAN_CLAIM_LOCK': task.claim_lock,
+                       'HERMES_KANBAN_DB': str(kb.kanban_db_path(board='owned').resolve())}.items():
+        monkeypatch.setenv(key, value)
+    binding = reviewer_binding_from_env()
+    assert binding is not None
+    return binding
+
+
+@pytest.mark.parametrize('value', [['foreign'], ['missing'], ['same-id-other-board'], None,
+                                  'task', {}, 1, True, [['nested']]])
+def test_reviewer_created_cards_rejected_before_store(reviewer_env, monkeypatch, value):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    from unittest.mock import Mock
+
+    store = Mock(side_effect=AssertionError('must not query Store'))
+    monkeypatch.setattr(kb, 'get_task', store)
+    with kt.reviewer_tool_scope(reviewer_env):
+        result = json.loads(kt._handle_complete({'summary': 'Review passed', 'created_cards': value}))
+    assert 'error' in result
+    store.assert_not_called()
+
+
+@pytest.mark.parametrize('args', [
+    {'artifacts': ['any.txt']}, {'artifacts': 'any.txt'},
+    {'metadata': {'artifacts': []}}, {'metadata': {'findings': [{'file': '../other'}]}},
+    {'metadata': {'findings': [{'file': '%2e%2e/other'}]}},
+    {'summary': 'MEDIA: any.txt'}, {'summary': '`/uncreated/secret.txt`'},
+    {'summary': 'file://host/a'}, {'summary': 'C:\\private\\secret'},
+    {'summary': '\u200bMＥＤＩＡ: x'}, {'metadata': {'unknown': {'path': '/x'}}},
+])
+def test_reviewer_egress_shape_denied_without_mutation(reviewer_env, monkeypatch, args):
+    from unittest.mock import Mock
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    query = Mock(side_effect=AssertionError('must reject before Store'))
+    monkeypatch.setattr(kb, 'get_task', query)
+    with kt.reviewer_tool_scope(reviewer_env):
+        result = json.loads(kt._handle_complete({'summary': 'Review passed', **args}))
+    assert 'error' in result
+    query.assert_not_called()
+
+
+def test_reviewer_heartbeat_exact_deltas_and_host_only_identity(reviewer_env):
+    from contextlib import closing
+    from dataclasses import asdict
+    from hermes_cli.kanban_db_connect import connect
+    from tools import kanban_tools as kt
+
+    def snapshot():
+        with closing(connect(board='owned')) as conn:
+            task = dict(conn.execute('SELECT * FROM tasks WHERE id=?', (reviewer_env.task_id,)).fetchone())
+            run = dict(conn.execute('SELECT * FROM task_runs WHERE id=?', (reviewer_env.run_id,)).fetchone())
+            events = [dict(r) for r in conn.execute('SELECT * FROM task_events WHERE task_id=? ORDER BY id', (reviewer_env.task_id,))]
+            return task, run, events
+    import time
+    before = snapshot()
+    started_at = int(time.time())
+    with kt.reviewer_tool_scope(reviewer_env, preflight=True):
+        response = json.loads(kt._handle_heartbeat({'note': 'Reviewer host preflight'}))
+    assert response['ok'] is True and response['reviewer_identity'] == asdict(reviewer_env)
+    after = snapshot()
+    for i in (0, 1):
+        allowed = {'claim_expires', 'last_heartbeat_at'}
+        assert {k: v for k, v in before[i].items() if k not in allowed} == {k: v for k, v in after[i].items() if k not in allowed}
+        assert started_at + reviewer_env.claim_ttl_seconds <= after[i]['claim_expires'] <= int(time.time()) + reviewer_env.claim_ttl_seconds
+        assert started_at <= after[i]['last_heartbeat_at'] <= int(time.time())
+    assert after[2][:-1] == before[2]
+    assert after[2][-1]['kind'] == 'heartbeat' and after[2][-1]['run_id'] == reviewer_env.run_id
+    with kt.reviewer_tool_scope(reviewer_env):
+        model_response = json.loads(kt._handle_heartbeat({}))
+    assert model_response['ok'] is True and 'reviewer_identity' not in model_response
+
+
+def test_reviewer_heartbeat_partial_failure_keeps_honest_claim_extension(reviewer_env, monkeypatch):
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb, kanban_db_dispatch as dispatch
+    from hermes_cli.kanban_db_connect import connect
+    from tools import kanban_tools as kt
+
+    with closing(connect(board='owned')) as conn, kb.write_txn(conn):
+        conn.execute('UPDATE tasks SET claim_expires=claim_expires-100 WHERE id=?', (reviewer_env.task_id,))
+        conn.execute('UPDATE task_runs SET claim_expires=claim_expires-100 WHERE id=?', (reviewer_env.run_id,))
+        before = conn.execute('SELECT claim_expires FROM tasks WHERE id=?', (reviewer_env.task_id,)).fetchone()[0]
+        count = conn.execute('SELECT count(*) FROM task_events').fetchone()[0]
+    monkeypatch.setattr(dispatch, 'heartbeat_worker', lambda *a, **k: False)
+    with kt.reviewer_tool_scope(reviewer_env, preflight=True):
+        response = json.loads(kt._handle_heartbeat({}))
+    assert 'error' in response and 'reviewer_identity' not in response
+    with closing(connect(board='owned')) as conn:
+        assert conn.execute('SELECT claim_expires FROM tasks WHERE id=?', (reviewer_env.task_id,)).fetchone()[0] > before
+        assert conn.execute('SELECT count(*) FROM task_events').fetchone()[0] == count
+        assert kb.get_task(conn, reviewer_env.task_id).status == 'running'
+
+
+def test_reviewer_summary_complete_clears_legacy_result(reviewer_env):
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from tools import kanban_tools as kt
+
+    with closing(connect(board='owned')) as conn, kb.write_txn(conn):
+        conn.execute('UPDATE tasks SET result=? WHERE id=?', ('/old/developer.txt', reviewer_env.task_id))
+    with kt.reviewer_tool_scope(reviewer_env):
+        response = json.loads(kt._handle_complete({'summary': 'Review passed', 'created_cards': []}))
+    assert response['ok'] is True
+    with closing(connect(board='owned')) as conn:
+        task = kb.get_task(conn, reviewer_env.task_id)
+        assert task.status == 'done' and task.result is None
+
+
+@pytest.mark.parametrize('mutation', ['expired', 'duplicate_claimed', 'duplicate_owner', 'wrong_session', 'wrong_profile'])
+def test_reviewer_original_identity_is_revalidated(reviewer_env, mutation):
+    from contextlib import closing
+    from dataclasses import replace
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from tools import kanban_tools as kt
+
+    binding = reviewer_env
+    if mutation in ('wrong_session', 'wrong_profile'):
+        binding = replace(binding, **({'session_id': 'foreign'} if mutation == 'wrong_session' else {'profile': 'foreign'}))
+    else:
+        with closing(connect(board='owned')) as conn, kb.write_txn(conn):
+            if mutation == 'expired':
+                conn.execute('UPDATE tasks SET claim_expires=1 WHERE id=?', (binding.task_id,))
+            else:
+                kind = 'claimed' if mutation == 'duplicate_claimed' else 'owner_admitted'
+                row = conn.execute('SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind=?',
+                                   (binding.task_id, binding.run_id, kind)).fetchone()
+                kb._append_event(conn, binding.task_id, kind, json.loads(row[0]), run_id=binding.run_id)
+    with pytest.raises((ValueError, OSError)):
+        kt.validate_reviewer_binding(binding)

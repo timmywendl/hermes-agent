@@ -333,6 +333,16 @@ class _Collector:
                 continue
             claimed = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='claimed'",
                                    (event.task_id, event.run_id)).fetchall()
+            if not claimed:
+                run = conn.execute('SELECT * FROM task_runs WHERE id=? AND task_id=?',
+                                   (event.run_id, event.task_id)).fetchone()
+                # The original operator path synthesizes a zero-duration closed
+                # Run without a claim. It is distinct from a closed worker Run
+                # (which retains its lock and status=done/review).
+                if (run and run['claim_lock'] is None and run['worker_pid'] is None
+                        and run['status'] == event.kind and run['outcome'] == event.kind
+                        and run['started_at'] is not None and run['started_at'] == run['ended_at']):
+                    artifact_events.add(event.id)
             if len(claimed) == 1:
                 try:
                     source = json.loads(claimed[0]['payload'])

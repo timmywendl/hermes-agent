@@ -60,6 +60,7 @@ class TurnResult:
     compacted: bool = False
     # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
     should_retire: bool = False
+    model_turn_sent: bool = False
 
 
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
@@ -724,6 +725,7 @@ class CodexAppServerSession:
                         self._retire(result, 'Reviewer permission qualification failed; no model turn sent')
                         self.close()
                         return result
+                result.model_turn_sent = True
                 ts = self._request_for(result, "turn/start", params, "turn/start")
                 if ts is not None:
                     self._service_tier_sent = service_tier

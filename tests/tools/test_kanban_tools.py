@@ -1653,3 +1653,51 @@ def test_reviewer_original_identity_is_revalidated(reviewer_env, mutation):
                 kb._append_event(conn, binding.task_id, kind, json.loads(row[0]), run_id=binding.run_id)
     with pytest.raises((ValueError, OSError)):
         kt.validate_reviewer_binding(binding)
+
+
+@pytest.mark.parametrize('interleaving', ['same_lock_successor', 'lease_expires', 'writer_wait_expires'])
+def test_reviewer_first_heartbeat_write_fences_original_live_run(reviewer_env, monkeypatch, interleaving):
+    from contextlib import closing, contextmanager
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from tools import kanban_tools as kt
+
+    original_board = kt._board
+    after_interleaving = []
+    def snapshot():
+        with closing(connect(board='owned')) as conn:
+            return [[tuple(row) for row in conn.execute('SELECT * FROM ' + table + ' ORDER BY id')]
+                    for table in ('tasks', 'task_runs', 'task_events')]
+    @contextmanager
+    def board(*args, **kwargs):
+        # _worker_guard has already validated the old Run. Interleave before
+        # the first write, using the very same dispatcher lock string.
+        if interleaving == 'same_lock_successor':
+            with closing(connect(board='owned')) as conn:
+                assert kb.reclaim_task(conn, reviewer_env.task_id, signal_fn=lambda *a: None)
+                successor = kb.claim_review_task(conn, reviewer_env.task_id,
+                    claimer=reviewer_env.claim_lock, ttl_seconds=1200)
+                assert successor.current_run_id != reviewer_env.run_id
+                assert successor.claim_lock == reviewer_env.claim_lock
+        elif interleaving == 'lease_expires':
+            with closing(connect(board='owned')) as conn:
+                expiry = kb.get_task(conn, reviewer_env.task_id).claim_expires
+            monkeypatch.setattr(kt.time, 'time', lambda: expiry + 1)
+        after_interleaving.append(snapshot())
+        with original_board(*args, **kwargs) as value:
+            yield value
+    monkeypatch.setattr(kt, '_board', board)
+    if interleaving == 'writer_wait_expires':
+        original_txn = kb.write_txn
+        @contextmanager
+        def delayed_txn(conn):
+            with original_txn(conn):
+                expiry = kb.get_task(conn, reviewer_env.task_id).claim_expires
+                monkeypatch.setattr(kt.time, 'time', lambda: expiry + 1)
+                yield
+        monkeypatch.setattr(kb, 'write_txn', delayed_txn)
+    with kt.reviewer_tool_scope(reviewer_env, preflight=True):
+        response = json.loads(kt._handle_heartbeat({}))
+    assert 'error' in response and 'reviewer_identity' not in response
+    assert len(after_interleaving) == 1
+    assert snapshot() == after_interleaving[0]

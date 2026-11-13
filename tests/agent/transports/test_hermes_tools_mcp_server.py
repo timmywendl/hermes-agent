@@ -290,7 +290,8 @@ def test_actual_codex_core_resource_tools_refuse_registered_and_guessed_uris(rev
     binary = shutil.which('codex')
     if binary is None:
         pytest.skip('actual Core qualification requires Codex')
-    calls = [('list_mcp_resources', {}), ('list_mcp_resource_templates', {}),
+    calls = [('list_mcp_resources', {'server': 'hermes-tools'}),
+             ('list_mcp_resource_templates', {'server': 'hermes-tools'}),
              ('read_mcp_resource', {'server': 'hermes-tools', 'uri': 'fixture://known'}),
              ('read_mcp_resource', {'server': 'hermes-tools', 'uri': 'fixture://guessed'})]
     requests = []
@@ -372,6 +373,11 @@ server.run()
         started = client.request('thread/start', {'cwd': str(tmp_path), 'sandbox': 'read-only',
             'model': 'offline-model', 'modelProvider': 'offline', 'config': {'features.apps': False}})
         tid = started['thread']['id']
+        # Lazy startup must finish before testing Core resource handlers. An
+        # empty unfiltered roster while startup is pending proves no refusal.
+        proof = client.request('mcpServer/tool/call', {'threadId': tid, 'server': 'hermes-tools',
+            'tool': 'kanban_heartbeat', 'arguments': {'note': 'offline Core boundary fixture'}})
+        assert proof.get('isError') is not True
         turn = client.request('turn/start', {'threadId': tid, 'input': [{'type': 'text', 'text': 'Run the offline boundary fixture'}],
                                            'sandboxPolicy': {'type': 'readOnly', 'networkAccess': False}})
         import time

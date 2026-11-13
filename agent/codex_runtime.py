@@ -12,6 +12,7 @@ import os
 import threading
 import time
 from contextlib import suppress
+from dataclasses import asdict
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
@@ -504,6 +505,7 @@ def _codex_developer_instructions(agent) -> str:
 # API-server restart (or the per-request agents of /api/sessions/{id}/chat) resumes the model-side thread
 # instead of starting an empty one while Hermes' own transcript continues (#100531).
 _CODEX_THREAD_ID_KEY = "codex_thread_id"
+_CODEX_REVIEWER_LINEAGE_KEY = "codex_reviewer_lineage"
 _CODEX_THREAD_RESUME_NOTICE = "Codex thread could not be resumed; starting a new one."
 
 
@@ -512,6 +514,10 @@ def _stored_codex_thread_id(agent) -> str | None:
     if db is None or not session_id:
         return None
     thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
+    if isinstance(thread_id, str) and thread_id and getattr(agent, '_kanban_reviewer_binding', None):
+        lineage = db.get_session_model_config_value(session_id, _CODEX_REVIEWER_LINEAGE_KEY)
+        if lineage != asdict(agent._kanban_reviewer_binding):
+            raise ValueError('Reviewer thread lineage unavailable or changed')
     return thread_id if isinstance(thread_id, str) and thread_id else None
 
 
@@ -520,8 +526,11 @@ def _store_codex_thread_id(agent, thread_id: str | None) -> None:
     db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
     if db is None or not session_id:
         return
+    binding = getattr(agent, '_kanban_reviewer_binding', None)
+    patch = {_CODEX_THREAD_ID_KEY: thread_id,
+             _CODEX_REVIEWER_LINEAGE_KEY: asdict(binding) if binding and thread_id else None}
     _call_guarded(db.patch_session_model_config, "codex thread id could not be stored on the session row",
-                  args=(session_id, {_CODEX_THREAD_ID_KEY: thread_id}))
+                  args=(session_id, patch))
 
 
 def _start_codex_thread(agent) -> str:
@@ -532,6 +541,8 @@ def _start_codex_thread(agent) -> str:
     try:
         return agent._codex_session.ensure_started()
     except CodexThreadResumeError as exc:
+        if getattr(agent, '_kanban_reviewer_binding', None):
+            raise
         logger.warning("%s; starting a new codex thread (session=%s)", exc.message, getattr(agent, "session_id", None))
         _store_codex_thread_id(agent, None)
         agent._emit_diagnostic_status(_CODEX_THREAD_RESUME_NOTICE)
@@ -653,7 +664,9 @@ def _ensure_codex_session(agent, messages: list[dict[str, Any]] | None = None) -
     agent._codex_session_prompt = developer_instructions
     agent._codex_session_model_provider = model_provider
     from agent.codex_runtime_history_seed import render_history_seed
-    history_seed = render_history_seed(messages) or None
+    # Reviewer context is rebuilt from the current Task. Never seed a new
+    # Reviewer thread with an older Developer or unrelated transcript.
+    history_seed = None if reviewer_binding else render_history_seed(messages) or None
     # The model always rides along: codex's home is shared, while the Hermes model is per profile/session,
     # so omitting it ran codex's own default instead of the selection.
     agent._codex_session = CodexAppServerSession(
@@ -705,10 +718,16 @@ def _persist_projected_messages(agent, turn, messages: list[dict[str, Any]]) -> 
 def _finish_codex_turn(agent, turn, messages: list[dict[str, Any]], *, original_user_message: Any,
                        should_review_memory: bool) -> dict[str, Any]:
     """Post-turn bookkeeping mirroring the chat_completions loop; returns usage fields."""
+    reviewer = getattr(agent, '_kanban_reviewer_binding', None)
+    if reviewer and not turn.model_turn_sent:
+        return {}
     # run_conversation() already bumped _turns_since_memory / _user_turn_count; only _iters_since_skill is ours.
     agent._iters_since_skill = getattr(agent, "_iters_since_skill", 0) + turn.tool_iterations
     _record_codex_app_server_compaction(agent, turn)
     usage_result = _record_codex_app_server_usage(agent, turn, messages=messages)
+    if reviewer:
+        # No auxiliary model/memory/skill work beyond the four-tool contract.
+        return usage_result
     # Skill nudge check AFTER iters were incremented (same as chat_completions).
     should_review_skills = (0 < agent._skill_nudge_interval <= agent._iters_since_skill
                             and "skill_manage" in agent.valid_tool_names)
@@ -731,14 +750,19 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               effective_task_id: str, should_review_memory: bool = False) -> dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    if getattr(agent, '_kanban_reviewer_binding', None):
+        # The original conversation-loop recovery consults this agent-local
+        # cursor after our result. A Reviewer must never escape via its generic
+        # Provider fallback, even on billing/rate-limit errors.
+        agent._fallback_index = len(getattr(agent, '_fallback_chain', None) or [])
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
         from agent.conversation_compression import _checkpoint_blocked
         raise _checkpoint_blocked("codex_app_server owns the authoritative thread and compacts it "
                                   "without a truthful pre-compaction transcript boundary")
-    _ensure_codex_session(agent, messages)
     try:
+        _ensure_codex_session(agent, messages)
         _start_codex_thread(agent)
         wire_model = _codex_wire_model(agent, getattr(agent, "_codex_session_model_provider", None))
         turn = agent._codex_session.run_turn(
@@ -748,9 +772,11 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)
+        recovery = ('' if getattr(agent, '_kanban_reviewer_binding', None) else
+                    ' Fall back to default runtime with `/codex-runtime auto`.')
         return _turn_result(
             _consume_user_interrupt(agent), messages, api_calls=0, completed=False, error=str(exc),
-            final_response=f"Codex app-server turn failed: {exc}. Fall back to default runtime with `/codex-runtime auto`.",
+            final_response=f"Codex app-server turn failed: {exc}.{recovery}",
         )
     interrupt = _consume_user_interrupt(agent, turn.interrupted)
     # Wedged client (turn deadline blown, OAuth refresh died, subprocess exited): retire it. Post-tool
@@ -765,8 +791,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     usage_result = _finish_codex_turn(
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
+    api_calls = int(turn.model_turn_sent) if getattr(agent, '_kanban_reviewer_binding', None) else 1
     return _turn_result(
-        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        interrupt, messages, api_calls=api_calls, completed=not turn.interrupted and turn.error is None, error=turn.error,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,

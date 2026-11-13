@@ -269,6 +269,8 @@ def test_gateway_review_policy_keeps_only_current_task_context(reviewer_env):
     with closing(connect(board='owned')) as conn:
         other = kb.create_task(conn, title='FOREIGN_ROLE_HISTORY_SECRET', assignee='default')
         assert kb.complete_task(conn, other, summary='FOREIGN_HANDOFF_SECRET')
+        with kb.write_txn(conn):
+            conn.execute('UPDATE tasks SET model_override=? WHERE id=?', ('synthetic-model', reviewer_env.task_id))
     actor = Principal('owner', reviewer_env.home, frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(native_owner=True, actor=actor,
                                  authority=SimpleNamespace(profile_id=reviewer_env.home))
@@ -283,3 +285,88 @@ def test_gateway_review_policy_keeps_only_current_task_context(reviewer_env):
     assert 'FOREIGN_ROLE_HISTORY_SECRET' not in context['context']
     assert 'FOREIGN_HANDOFF_SECRET' not in context['context']
     assert policy.toolsets == ('kanban',)
+
+
+def test_reviewer_worker_rebuilds_current_context_instead_of_cached_policy(reviewer_env, monkeypatch):
+    from gateway import session_kanban as worker
+
+    context = dict(board=reviewer_env.board, task_id=reviewer_env.task_id, run_id=reviewer_env.run_id,
+                   claim_lock=reviewer_env.claim_lock, db=reviewer_env.kanban_db,
+                   profile=reviewer_env.profile, owner_home=reviewer_env.home,
+                   context='LEGACY_CROSS_TASK_CONTEXT')
+    agent = SimpleNamespace(session_id=reviewer_env.session_id)
+    seen = []
+    def run(agent, frame, history, current):
+        seen.append(current['context'])
+        return {'completed': True, 'final_response': 'offline review'}
+    monkeypatch.setattr(worker, '_run_task_turns', run)
+    monkeypatch.setattr(worker, '_record_worker_result', lambda *args: None)
+    result = worker._run_worker_turns(agent, {'policy': {'kanban_json': json.dumps(context)}}, [])
+    assert result['completed'] and agent._kanban_reviewer_binding == reviewer_env
+    assert len(seen) == 1 and 'abc123' in seen[0]
+    assert 'LEGACY_CROSS_TASK_CONTEXT' not in seen[0]
+
+
+@pytest.mark.parametrize('mode', ['chat_completions', 'codex_responses', None])
+def test_reviewer_cannot_use_unqualified_runtime(reviewer_env, monkeypatch, mode):
+    from unittest.mock import Mock
+    from gateway import session_kanban as worker
+
+    monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt', lambda *a, **kw: ('', [], []))
+    model = Mock(side_effect=AssertionError('no model may run'))
+    agent = SimpleNamespace(session_id=reviewer_env.session_id, _kanban_reviewer_binding=reviewer_env,
+                            api_mode=mode, run_conversation=model)
+    with pytest.raises(ValueError, match='qualified Codex app-server'):
+        worker._run_task_turns(agent, {'text': 'Review'}, [], {'skills': [], 'context': 'Current Task'})
+    model.assert_not_called()
+
+
+@pytest.mark.parametrize('origin', ['claimed_developer', 'operator_complete', 'operator_review_requested'])
+def test_notifier_preserves_exact_developer_and_synthesized_operator_delivery(tmp_path, monkeypatch, origin):
+    import asyncio
+    from contextlib import closing
+    from types import MethodType
+    from unittest.mock import AsyncMock
+    from gateway import kanban_watchers_notifier as notifier
+    from gateway.config import Platform
+    from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+    from gateway.platforms.base import BasePlatformAdapter
+    from hermes_cli import kanban_db as kb, kanban_db_notify as kbn
+    from hermes_cli.kanban_db_connect import connect
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    for key in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_DB', 'HERMES_DELEGATED_CHILD_CONTEXT'):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    kb.create_board('operator-parity')
+    document = tmp_path / 'permitted-developer.txt'
+    document.write_text('permitted disposable output')
+    with closing(connect(board='operator-parity')) as conn:
+        tid = kb.create_task(conn, title='Deliver legitimate work', assignee='default')
+        kbn.add_notify_sub(conn, task_id=tid, platform='telegram', chat_id='disposable-chat')
+        kb.recompute_ready(conn)
+        run_id = None
+        if origin == 'claimed_developer':
+            run_id = kb.claim_task(conn, tid).current_run_id
+        if origin == 'operator_review_requested':
+            assert kb.request_review(conn, tid, summary='Review this delivery', metadata={'artifacts': [str(document)]})
+        else:
+            assert kb.complete_task(conn, tid, result=str(document), expected_run_id=run_id)
+    adapter = SimpleNamespace(extract_local_files=BasePlatformAdapter.extract_local_files,
+        send_document=AsyncMock(), send_multiple_images=AsyncMock(), send_video=AsyncMock(),
+        send=AsyncMock(return_value=SimpleNamespace(success=True)))
+    runner = SimpleNamespace(adapters={Platform.TELEGRAM: adapter}, _profile_adapters={},
+                             _owns_kanban_dispatcher_lock=lambda: True)
+    runner._deliver_kanban_artifacts = MethodType(GatewayKanbanWatchersMixin._deliver_kanban_artifacts, runner)
+    monkeypatch.setattr(notifier, '_adapter_for_subscription', lambda *a: adapter)
+    collector = notifier._Collector(runner, kb, notifier_profile=None, gc_due=False, gc_retention_days=30)
+    with closing(connect(board='operator-parity')) as conn:
+        delivery = collector._claim_for_sub(conn, 'operator-parity', kbn.list_notify_subs(conn)[0])
+    event = next(ev for ev in delivery['events'] if ev.kind in ('completed', 'review_requested'))
+    assert event.run_id is not None
+    notification = notifier._KanbanNotification(runner, delivery, platform_cls=Platform, sub_fail_counts={})
+    notification.adapter = adapter
+    assert asyncio.run(notification._send_event(event, 'Work delivered')) is True
+    adapter.send_document.assert_awaited_once()
+    assert Path(adapter.send_document.await_args.kwargs['file_path']).read_text() == 'permitted disposable output'

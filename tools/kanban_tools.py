@@ -1121,6 +1121,33 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return _ok_landed(kb, conn, tid, "ready", implementer=detail)
 
 
+def _renew_reviewer_claim(kb, conn, binding):
+    """Replace unscoped renewal with the original Store transaction and Run fence.
+
+    Claim-lock strings are reused by a dispatcher. The first write must bind
+    both the original Run and live lease; a readonly preflight alone cannot.
+    """
+    with kb.write_txn(conn):
+        # BEGIN IMMEDIATE may wait for another writer past the old expiry.
+        now = int(time.time())
+        expires = now + binding.claim_ttl_seconds
+        changed = conn.execute(
+            "UPDATE tasks SET claim_expires=? WHERE id=? AND status='running' "
+            "AND current_run_id=? AND claim_lock=? AND claim_expires>? "
+            "AND EXISTS(SELECT 1 FROM task_runs WHERE id=? AND task_id=? "
+            "AND status='running' AND claim_lock=? AND claim_expires>?)",
+            (expires, binding.task_id, binding.run_id, binding.claim_lock, now,
+             binding.run_id, binding.task_id, binding.claim_lock, now),
+        ).rowcount
+        if changed != 1:
+            return False
+        # Reuse the existing mirror under the same writer lock. No other Run
+        # can become current before this transaction is committed.
+        if kb._extend_run_claim(conn, binding.task_id, expires) != binding.run_id:
+            raise ValueError('Reviewer claim mirror changed')
+    return True
+
+
 @_kanban_handler("kanban_heartbeat")
 def _handle_heartbeat(args: dict, **kw) -> str:
     """Signal liveness: extend the claim TTL AND record a heartbeat event.
@@ -1132,8 +1159,8 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         # The dispatcher pins HERMES_KANBAN_CLAIM_LOCK at spawn; the default
         # claimer covers locally-driven workers that bypassed the dispatcher.
         binding = _REVIEWER.get()
-        renewed = kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
-                                     **({'ttl_seconds': binding.claim_ttl_seconds} if binding else {}))
+        renewed = (_renew_reviewer_claim(kb, conn, binding) if binding else
+                   kb.heartbeat_claim(conn, tid, claimer=os.environ.get("HERMES_KANBAN_CLAIM_LOCK")))
         if _REVIEWER.get() is not None:
             _check(renewed, 'Reviewer claim renewal failed')
         ok = kbd.heartbeat_worker(

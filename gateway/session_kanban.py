@@ -260,6 +260,11 @@ def _run_worker_turns(agent, frame, history):
         binding = reviewer_binding(board=context['board'], task_id=context['task_id'], run_id=context['run_id'],
             claim_lock=context['claim_lock'], db=context['db'], profile=context['profile'],
             home=context.get('owner_home', ''), session_id=agent.session_id)
+        if binding:
+            from hermes_cli import kanban_db as kb
+            with closing(sqlite3.connect(Path(binding.kanban_db).as_uri() + '?mode=ro', uri=True)) as conn:
+                conn.row_factory = sqlite3.Row
+                context['context'] = _reviewer_context(kb, conn, kb.get_task(conn, binding.task_id))
         agent._kanban_reviewer_binding = binding
         with reviewer_tool_scope(binding):
             result = _run_task_turns(agent, frame, history, context)
@@ -334,18 +339,22 @@ def worker_exit_code(path, params):
 
 
 def _run_task_turns(agent, frame, history, context):
+    def invoke(text, prior):
+        if getattr(agent, '_kanban_reviewer_binding', None) and getattr(agent, 'api_mode', None) != 'codex_app_server':
+            raise ValueError('Reviewer requires the qualified Codex app-server path')
+        return agent.run_conversation(text, conversation_history=prior)
+
     from agent.skill_commands import build_preloaded_skills_prompt
     skills, loaded, missing = build_preloaded_skills_prompt(context['skills'], task_id=agent.session_id)
     if missing and not loaded:
         raise ValueError('kanban_skills_unavailable')
     prompt = '\n\n'.join(p for p in (skills, context['context'], frame['text']) if p)
-    result = agent.run_conversation(prompt, conversation_history=history)
+    result = invoke(prompt, history)
 
     def recover(nudge):
         nonlocal result
         prior = result.get('messages') if isinstance(result, dict) else None
-        result = agent.run_conversation(nudge, conversation_history=prior or
-                                        agent._session_db.get_messages_as_conversation(agent.session_id))
+        result = invoke(nudge, prior or agent._session_db.get_messages_as_conversation(agent.session_id))
     # Same in-place retry as the one-shot CLI worker (agent/kanban_turn_recovery.py), but the
     # carrier is this frame's bound claim, never the owner process's environment.
     from agent.kanban_turn_recovery import recover_failed_kanban_turns
@@ -367,7 +376,7 @@ def _run_task_turns(agent, frame, history, context):
             kb.block_task(conn, context['task_id'], reason=reason, expected_run_id=context['run_id'])
     def turn(prompt):
         nonlocal result
-        result = agent.run_conversation(prompt, conversation_history=agent._session_db.get_messages_as_conversation(agent.session_id))
+        result = invoke(prompt, agent._session_db.get_messages_as_conversation(agent.session_id))
         return result.get('final_response', '')
     run_kanban_goal_loop(task_id=context['task_id'], goal_text=context['goal_text'], run_turn=turn,
         task_status_fn=status, block_fn=block, max_turns=context['goal_max_turns'] or DEFAULT_MAX_TURNS,

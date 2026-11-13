@@ -147,3 +147,89 @@ def test_private_gateway_binding_reaches_original_session(reviewer_env, monkeypa
     runtime._ensure_codex_session(agent)
     assert captured['reviewer_binding'] is reviewer_env
     assert captured['model'] == 'synthetic-model'
+    assert captured['history_seed'] is None
+
+
+def test_reviewer_thread_lineage_is_persisted_and_required_on_cold_resume(reviewer_env, tmp_path):
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from agent import codex_runtime as runtime
+    from hermes_state import SessionDB
+
+    db = SessionDB(tmp_path / 'owner-session.db')
+    db.create_session(reviewer_env.session_id, source='cli', model='synthetic-model')
+    agent = SimpleNamespace(_session_db=db, session_id=reviewer_env.session_id,
+                            _kanban_reviewer_binding=reviewer_env)
+    try:
+        db.patch_session_model_config(agent.session_id, {runtime._CODEX_THREAD_ID_KEY: 'old-developer'})
+        with pytest.raises(ValueError, match='lineage'):
+            runtime._stored_codex_thread_id(agent)
+        runtime._store_codex_thread_id(agent, 'qualified-review')
+        assert runtime._stored_codex_thread_id(agent) == 'qualified-review'
+        # A new Python object with the same original authority may resume.
+        agent._kanban_reviewer_binding = replace(reviewer_env)
+        assert runtime._stored_codex_thread_id(agent) == 'qualified-review'
+        agent._kanban_reviewer_binding = replace(reviewer_env, run_id=reviewer_env.run_id + 1)
+        with pytest.raises(ValueError, match='lineage'):
+            runtime._stored_codex_thread_id(agent)
+    finally:
+        db.close()
+
+
+def test_reviewer_failed_resume_has_no_fresh_thread_fallback(reviewer_env):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent import codex_runtime as runtime
+    from agent.transports.codex_app_server_session import CodexThreadResumeError
+
+    session = SimpleNamespace(ensure_started=Mock(side_effect=CodexThreadResumeError('old', 'unavailable')))
+    agent = SimpleNamespace(_codex_session=session, _kanban_reviewer_binding=reviewer_env)
+    with pytest.raises(CodexThreadResumeError):
+        runtime._start_codex_thread(agent)
+    assert session.ensure_started.call_count == 1
+
+
+def test_reviewer_denied_turn_has_zero_usage_and_no_auxiliary_calls(reviewer_env, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent import codex_runtime as runtime
+    from agent.transports.codex_app_server_session import TurnResult
+
+    turn = TurnResult(error='Reviewer permission qualification failed', should_retire=True)
+    session = SimpleNamespace(ensure_started=lambda: 'review-thread', run_turn=lambda **kw: turn, close=Mock())
+    agent = SimpleNamespace(_codex_session=session, _kanban_reviewer_binding=reviewer_env,
+                            session_api_calls=0, _session_db=SimpleNamespace(queue_token_counts=Mock()),
+                            _sync_external_memory_for_turn=Mock(), _spawn_background_review=Mock())
+    monkeypatch.setattr(runtime, '_ensure_codex_session', lambda *a: None)
+    monkeypatch.setattr(runtime, '_codex_wire_model', lambda *a: 'synthetic-model')
+    monkeypatch.setattr(runtime, '_codex_turn_effort', lambda *a: None)
+    monkeypatch.setattr(runtime, '_codex_turn_service_tier', lambda *a: None)
+    result = runtime.run_codex_app_server_turn(agent, user_message='review', original_user_message='review',
+                                               messages=[], effective_task_id='review')
+    assert result['api_calls'] == agent.session_api_calls == 0
+    assert not result['completed'] and result['error']
+    agent._session_db.queue_token_counts.assert_not_called()
+    agent._sync_external_memory_for_turn.assert_not_called()
+    agent._spawn_background_review.assert_not_called()
+    session.close.assert_called_once()
+
+
+def test_reviewer_error_cannot_activate_original_provider_fallback(reviewer_env, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from agent import codex_runtime as runtime
+    from agent.turn_recovery import activate_codex_app_server_fallback
+
+    agent = SimpleNamespace(_kanban_reviewer_binding=reviewer_env, _codex_session=None,
+                            _fallback_chain=[{'provider': 'must-not-run', 'model': 'forbidden'}],
+                            _fallback_index=0, _try_activate_fallback=Mock())
+    agent._has_pending_fallback = lambda: AIAgent._has_pending_fallback(agent)
+    def unavailable(*args):
+        raise ValueError('429 rate_limit exceeded')
+    monkeypatch.setattr(runtime, '_ensure_codex_session', unavailable)
+    result = runtime.run_codex_app_server_turn(agent, user_message='review', original_user_message='review',
+                                               messages=[], effective_task_id='review')
+    assert result['error'] and result['api_calls'] == 0
+    assert not activate_codex_app_server_fallback(agent, result)
+    assert '/codex-runtime auto' not in result['final_response']
+    agent._try_activate_fallback.assert_not_called()

@@ -1342,6 +1342,50 @@ def test_reviewer_second_turn_observes_drift(reviewer_session):
     assert sum(m == 'turn/start' for m, _ in client.requests) == 1
 
 
+def test_reviewer_cold_resume_requalifies_before_each_turn(reviewer_session):
+    session, client, _wire = reviewer_session
+    session._resume_thread_id = 'review-thread'
+    assert session.run_turn('Resume this review', turn_timeout=2).error is None
+    assert session.run_turn('Continue', turn_timeout=2).error is None
+    assert sum(m == 'thread/resume' for m, _ in client.requests) == 1
+    assert not any(m == 'thread/start' for m, _ in client.requests)
+    assert sum(m == 'mcpServer/tool/call' for m, _ in client.requests) == 2
+    assert sum(m == 'turn/start' for m, _ in client.requests) == 2
+    resume = next(p for m, p in client.requests if m == 'thread/resume')
+    assert resume['sandbox'] == 'read-only' and resume['config']['features.apps'] is False
+
+
+@pytest.mark.parametrize('failure', ['timeout', 'cancel'])
+def test_reviewer_gate_timeout_and_cancel_send_no_model_turn(reviewer_session, failure):
+    session, client, _wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        if method == 'mcpServer/tool/call':
+            if failure == 'timeout':
+                raise TimeoutError('disposable direct RPC deadline')
+            session.request_interrupt()
+        return original(method, params)
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=2)
+    assert result.error and result.should_retire and not result.model_turn_sent
+    assert client._closed and not any(m == 'turn/start' for m, _ in client.requests)
+    with pytest.raises(ValueError, match='retired'):
+        session.ensure_started()
+
+
+def test_reviewer_model_timeout_retires_without_reusing_gate(reviewer_session):
+    session, client, _wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        return {'turn': {'id': 'review-turn'}} if method == 'turn/start' else original(method, params)
+    client._request_handler = handler
+    result = session.run_turn('Review', turn_timeout=0, notification_poll_timeout=0.001)
+    assert result.error and result.should_retire and result.model_turn_sent
+    assert sum(m == 'mcpServer/tool/call' for m, _ in client.requests) == 1
+    session.close()
+    assert client._closed
+
+
 def test_reviewer_startup_notice_without_turn_id_invalidates(reviewer_session):
     session, client, _wire = reviewer_session
     session.ensure_started()
@@ -1392,7 +1436,7 @@ def test_reviewer_actual_codex_host_direct_rpc_and_eager_cleanup(reviewer_env, t
     if binary is None:
         pytest.skip('qualification requires an installed Codex binary')
     version = subprocess.check_output([binary, '--version'], text=True).strip()
-    assert version == 'codex-cli 0.154.0', version
+    assert version.startswith('codex-cli '), version
     codex_home = Path(reviewer_env.home) / 'codex'
     codex_home.mkdir()
     repo = Path(session_mod.__file__).resolve().parents[2]

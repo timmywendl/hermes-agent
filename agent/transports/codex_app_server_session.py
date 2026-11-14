@@ -279,7 +279,9 @@ class CodexAppServerSession:
             if not self._codex_home or not Path(self._codex_home).resolve().is_relative_to(Path(self._reviewer_binding.home).resolve()):
                 raise ValueError('Reviewer requires an explicit Owner-scoped Codex home')
         if self._client is None:
-            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home)
+            self._client = self._client_factory(codex_bin=self._codex_bin, codex_home=self._codex_home,
+                **({'extra_args': ['-c', 'features.plugins=false', '-c', 'features.apps=false']}
+                   if self._reviewer_binding else {}))
             self._client.initialize(client_name="hermes", client_title="Hermes Agent", client_version=_get_hermes_version(),
                                     **({'capabilities': {'experimentalApi': True}} if self._reviewer_binding else {}))
         if self._reviewer_binding:
@@ -367,6 +369,10 @@ class CodexAppServerSession:
         config = response.get('config') if isinstance(response, dict) else None
         if not isinstance(config, dict) or config.get('plugins') or config.get('extensions'):
             raise ValueError('Reviewer effective launch configuration unavailable')
+        features = config.get('features')
+        if (not isinstance(features, dict) or features.get('plugins') is not False
+                or features.get('apps') is not False):
+            raise ValueError('Reviewer process Plugins and Apps isolation not proven')
         servers = config.get('mcp_servers')
         if not isinstance(servers, dict) or set(servers) != {'hermes-tools'}:
             raise ValueError('Reviewer unsafe effective server roster')

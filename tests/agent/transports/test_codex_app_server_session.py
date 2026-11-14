@@ -1247,13 +1247,15 @@ def reviewer_session(reviewer_env, monkeypatch):
               'serverCapabilities': {'tools': {}, 'prompts': {}, 'resources': {}},
               'toolsError': None, 'tools': {name: {'name': name, 'inputSchema': {'type': 'object'}} for name in REVIEWER_TOOLS},
               'resources': [], 'resourceTemplates': []}
-    wire = {'status': status, 'identity': asdict(reviewer_env), 'error': False}
+    wire = {'status': status, 'identity': asdict(reviewer_env), 'error': False,
+            'features': {'plugins': False, 'apps': False}, 'launches': []}
     server = {'command': sys.executable, 'args': ['-m', 'agent.transports.hermes_tools_mcp_server'],
               'cwd': str(Path(session_mod.__file__).resolve().parents[2])}
 
     def handler(method, params):
         if method == 'config/read':
-            return {'config': {'mcp_servers': {'hermes-tools': server}}, 'layers': [], 'origins': {}}
+            return {'config': {'mcp_servers': {'hermes-tools': server}, 'features': wire['features']},
+                    'layers': [], 'origins': {}}
         if method in ('thread/start', 'thread/resume'):
             return {'thread': {'id': params.get('threadId', 'review-thread')},
                     'sandbox': {'type': 'readOnly', 'networkAccess': False}}
@@ -1268,7 +1270,10 @@ def reviewer_session(reviewer_env, monkeypatch):
         return {}
 
     client._request_handler = handler
-    session = CodexAppServerSession(client_factory=lambda **kw: client, reviewer_binding=reviewer_env, codex_home=str(Path(reviewer_env.home) / 'codex'))
+    def factory(**kwargs):
+        wire['launches'].append(kwargs)
+        return client
+    session = CodexAppServerSession(client_factory=factory, reviewer_binding=reviewer_env, codex_home=str(Path(reviewer_env.home) / 'codex'))
     # Pure RPC regression level; actual subprocess cleanup has a separate test.
     monkeypatch.setattr(session, '_reviewer_children', dict)
     return session, client, wire
@@ -1446,56 +1451,289 @@ def test_reviewer_cleanup_unproven_stops_further_gates(reviewer_session, monkeyp
     assert not any(m == 'mcpServer/tool/call' for m, _ in client.requests)
 
 
-@pytest.mark.platforms('macos', 'linux')
-def test_reviewer_actual_codex_host_direct_rpc_and_eager_cleanup(reviewer_env, tmp_path):
-    """Real app-server/stdio/Store, zero turn/start and no real Provider request."""
+def test_reviewer_process_overrides_leave_developer_launch_unchanged(reviewer_session):
+    session, _client, wire = reviewer_session
+    session.ensure_started()
+    assert wire['launches'] == [{'codex_bin': 'codex', 'codex_home': session._codex_home,
+                                'extra_args': ['-c', 'features.plugins=false', '-c', 'features.apps=false']}]
+    launches = []
+    developer_client = FakeClient()
+    def factory(**kwargs):
+        launches.append(kwargs)
+        return developer_client
+    developer = CodexAppServerSession(cwd='/tmp', codex_home='/tmp/developer', client_factory=factory)
+    developer.ensure_started()
+    assert launches == [{'codex_bin': 'codex', 'codex_home': '/tmp/developer'}]
+    assert developer_client.requests == [('thread/start', {'cwd': '/tmp', 'personality': 'none'})]
+
+
+@pytest.mark.parametrize('features', [None, {}, [], False,
+    {'plugins': False}, {'apps': False}, {'plugins': True, 'apps': False},
+    {'plugins': False, 'apps': True}, {'plugins': 0, 'apps': False},
+    {'plugins': False, 'apps': 0}, {'plugins': 'false', 'apps': False}])
+@pytest.mark.parametrize('reload', [False, True])
+def test_reviewer_rejects_unproven_process_features(reviewer_session, features, reload):
+    session, client, wire = reviewer_session
+    if reload:
+        assert session.run_turn('Initial fixture turn', turn_timeout=2).error is None
+    wire['features'] = features
+    result = session.run_turn('Must refuse', turn_timeout=2)
+    assert result.error and result.should_retire and not result.model_turn_sent and client._closed
+    assert sum(m == 'turn/start' for m, _ in client.requests) == int(reload)
+    assert sum(m == 'thread/start' for m, _ in client.requests) == int(reload)
+
+
+@pytest.mark.parametrize('reload', [False, True])
+def test_reviewer_process_readback_failure_is_closed(reviewer_session, reload):
+    session, client, _wire = reviewer_session
+    if reload:
+        assert session.run_turn('Initial fixture turn', turn_timeout=2).error is None
+    original = client._request_handler
+    def handler(method, params):
+        if method == 'config/read':
+            raise TimeoutError('process config unavailable')
+        return original(method, params)
+    client._request_handler = handler
+    result = session.run_turn('Must refuse', turn_timeout=2)
+    assert result.error and not result.model_turn_sent and client._closed
+    assert sum(m == 'turn/start' for m, _ in client.requests) == int(reload)
+
+
+@pytest.mark.parametrize('notice', ['mcpServer/startupStatus/updated', 'config/updated', 'thread/configurationUpdated'])
+def test_reviewer_process_change_during_gate_denies_turn(reviewer_session, notice):
+    session, client, _wire = reviewer_session
+    original = client._request_handler
+    def handler(method, params):
+        response = original(method, params)
+        if method == 'mcpServer/tool/call':
+            client.queue_notification(notice)
+        return response
+    client._request_handler = handler
+    result = session.run_turn('Must refuse drift', turn_timeout=2)
+    assert result.error and not result.model_turn_sent and client._closed
+    assert not any(m == 'turn/start' for m, _ in client.requests)
+
+
+def _codex_process_snapshot(root_pid, known):
+    """Record every observed identity, including reparented/unknown processes; no argv/env."""
+    import psutil
+    from pathlib import Path
+
+    root = psutil.Process(root_pid)
+    current = {(p.pid, p.create_time()): p for p in root.children(recursive=True)}
+    known.update(current)
+    known[(root.pid, root.create_time())] = root
+    records = []
+    for (pid, birth), child in known.items():
+        row = {'pid': pid, 'create_time': birth, 'descendant': (pid, birth) in current}
+        try:
+            row.update(ppid=child.ppid(), status=child.status(), executable=child.exe())
+            args = child.cmdline()  # Inspect only; arguments are never retained in evidence.
+            if pid == root_pid:
+                row['process_overrides'] = {feature: any(args[i:i+2] == ['-c', f'features.{feature}=false']
+                    for i in range(len(args)-1)) for feature in ('plugins', 'apps')}
+            row['hermes_endpoint'] = any(args[i:i+2] == ['-m', 'agent.transports.hermes_tools_mcp_server']
+                                         for i in range(len(args)-1))
+            row['git'] = Path(row['executable']).name in {'git', 'git-remote-http', 'git-remote-https'}
+            row['state'] = 'ZOMBIE' if row['status'] == psutil.STATUS_ZOMBIE else 'LIVE'
+        except psutil.ZombieProcess:
+            row['state'] = 'ZOMBIE'
+        except psutil.NoSuchProcess:
+            row['state'] = 'EXITED_REAPED'
+        except psutil.Error as exc:
+            row.update(state='UNOBSERVABLE', error_type=type(exc).__name__)
+        records.append(row)
+    return records
+
+
+@pytest.fixture
+def actual_codex_process(reviewer_env, tmp_path):
+    """Exact fixed binary, hostile on-disk feature defaults, offline provider and disposable Store."""
+    import hashlib
     import json
     import shutil
     import subprocess
     import sys
+    import psutil
     from pathlib import Path
+    from agent.transports.codex_app_server import CodexAppServerClient
 
     binary = shutil.which('codex')
     if binary is None:
-        pytest.skip('qualification requires an installed Codex binary')
+        pytest.skip('qualification requires the exact fixed Codex build')
     version = subprocess.check_output([binary, '--version'], text=True).strip()
-    assert version.startswith('codex-cli '), version
-    codex_home = Path(reviewer_env.home) / 'codex'
-    codex_home.mkdir()
-    repo = Path(session_mod.__file__).resolve().parents[2]
+    digest = hashlib.sha256(Path(binary).read_bytes()).hexdigest()
+    assert version == 'codex-cli 0.0.0', version
+    assert digest == '65d14e441315f225f5c725ff8bb7bdf77183ffc4b50bff192a86074697c5ddd8', digest
+    home = Path(reviewer_env.home) / 'codex'
+    home.mkdir()
     config = '\n'.join([
         'model = "offline-qualification"', 'model_provider = "offline"',
         '[model_providers.offline]', 'name = "Disposable offline fixture"',
         'base_url = "http://127.0.0.1:1/v1"', 'wire_api = "responses"', 'requires_openai_auth = false',
-        '[features]', 'apps = false', '[mcp_servers.hermes-tools]',
+        '[features]', 'apps = true', 'plugins = true', '[mcp_servers.hermes-tools]',
         'command = ' + json.dumps(sys.executable),
         'args = ["-m", "agent.transports.hermes_tools_mcp_server"]',
-        'cwd = ' + json.dumps(str(repo)),
+        'cwd = ' + json.dumps(str(Path(session_mod.__file__).resolve().parents[2])),
     ])
-    (codex_home / 'config.toml').write_text(config)
-    session = CodexAppServerSession(codex_bin=binary, codex_home=str(codex_home), cwd=str(tmp_path),
-                                    model='offline-qualification', model_provider='offline', reviewer_binding=reviewer_env)
-    try:
-        thread = session.ensure_started()
-        assert thread
-        # The first call proves this root Thread supports direct RPC. Both gates
-        # also exercise independent Eager discovery and bounded child cleanup.
-        observed_status = []
-        original_status = session._reviewer_status
-        def capture_status(**kwargs):
-            response = original_status(**kwargs)
-            observed_status.append(response)
-            return response
-        session._reviewer_status = capture_status
-        try:
-            session._reviewer_preflight()
-        except ValueError as exc:
-            pytest.fail(str(exc) + '\n' + json.dumps(observed_status, sort_keys=True))
-        first = session._reviewer_children()
+    (home / 'config.toml').write_text(config)
+    sessions = []
+    evidence = {'version': version, 'sha256': digest, 'profile': str(home), 'runs': []}
+    def create(*, reviewer=True, honor_overrides=True):
+        record = {'reviewer': reviewer, 'honor_overrides': honor_overrides, 'rpc': [], 'snapshots': []}
+        known = {}
+        def factory(**kwargs):
+            if not honor_overrides:
+                kwargs.pop('extra_args', None)  # Adversarial ignored-override control, never a Runtime path.
+            client = CodexAppServerClient(**kwargs)
+            record['pid'] = client._proc.pid
+            original = client.request
+            def request(method, params=None, **options):
+                entry = {'method': method, 'selected': (params or {}).get('serverName')}
+                if method == 'mcpServerStatus/list' and not entry['selected']:
+                    record['baseline'] = _codex_process_snapshot(client._proc.pid, known)
+                response = original(method, params, **options)
+                if method == 'config/read':
+                    entry['features'] = {k: response['config'].get('features', {}).get(k) for k in ('apps', 'plugins')}
+                if method in {'thread/start', 'thread/resume'}:
+                    entry['sandbox'] = response.get('sandbox')
+                record['rpc'].append(entry)
+                if method == 'mcpServerStatus/list' and not entry['selected']:
+                    record['returned_at'] = time.monotonic()
+                    record['snapshots'].append({'elapsed': 0, 'processes': _codex_process_snapshot(client._proc.pid, known)})
+                return response
+            client.request = request
+            return client
+        session = CodexAppServerSession(codex_bin=binary, codex_home=str(home), cwd=str(tmp_path),
+            model='offline-qualification', model_provider='offline', client_factory=factory,
+            reviewer_binding=reviewer_env if reviewer else None)
+        sessions.append((session, record, known))
+        evidence['runs'].append(record)
+        return session, record, known
+    yield create
+    for session, record, known in sessions:
+        client = session._client
+        if client:
+            if client._proc.poll() is None:
+                record['before_close'] = _codex_process_snapshot(client._proc.pid, known)
+            root = client._proc
+            session.close()
+            record['root_returncode'] = root.returncode
+            # Existing Client teardown is separate from natural in-life Eager cleanup.
+            record['after_close'] = []
+            for (pid, birth), process in known.items():
+                try:
+                    record['after_close'].append({'pid': pid, 'create_time': birth,
+                        'state': 'STILL_OBSERVABLE' if process.is_running() else 'EXITED_REAPED'})
+                except psutil.Error as exc:
+                    record['after_close'].append({'pid': pid, 'create_time': birth, 'state': type(exc).__name__})
+    print('F12_PROCESS_EVIDENCE=' + json.dumps(evidence, sort_keys=True))
+
+
+def _observe_codex_window(record, known):
+    """Observe through 3s without altering the original gate or excluding any descendants."""
+    import threading
+    milestones = iter([0.5, 1.0, 2.0, 3.0])
+    target = next(milestones)
+    while True:
+        processes = _codex_process_snapshot(record['pid'], known)
+        elapsed = time.monotonic() - record['returned_at']
+        if elapsed >= target:
+            record['snapshots'].append({'elapsed': elapsed, 'processes': processes})
+            target = next(milestones, None)
+            if target is None:
+                return processes
+        threading.Event().wait(min(0.02, max(0, target-elapsed)))
+
+
+@pytest.mark.platforms('macos', 'linux')
+@pytest.mark.parametrize('fresh_process', range(3))
+def test_reviewer_actual_codex_host_direct_rpc_and_eager_cleanup(actual_codex_process, fresh_process):
+    """Three fresh processes, each with three original full gates; zero real model turns."""
+    session, record, known = actual_codex_process()
+    assert session.ensure_started()
+    for iteration in range(3):
         session._reviewer_preflight()
-        second = session._reviewer_children()
-        assert set(first) == set(second), (first, second)
-        assert not session._active_turn_id
-    finally:
-        session.close()
-    assert session._client is None
+        final = _observe_codex_window(record, known)
+        baseline = {(p['pid'], p['create_time']) for p in record['baseline']}
+        assert not any(p.get('git') for p in record['baseline'] + final)
+        assert all(p['state'] == 'EXITED_REAPED' for p in final
+                   if (p['pid'], p['create_time']) not in baseline)
+        record.setdefault('iterations', []).append({'index': iteration, 'baseline': record['baseline'],
+                                                    'final': final})
+        methods = [x['method'] for x in record['rpc']]
+        assert methods[-3:] == ['mcpServerStatus/list', 'mcpServer/tool/call', 'mcpServerStatus/list']
+        assert record['rpc'][-3]['selected'] is None and record['rpc'][-1]['selected'] == 'hermes-tools'
+    configs = [x['features'] for x in record['rpc'] if x['method'] == 'config/read']
+    assert configs and all(x == {'apps': False, 'plugins': False} for x in configs)
+    methods = [x['method'] for x in record['rpc']]
+    assert methods.index('config/read') < methods.index('thread/start')
+    assert all(p['process_overrides'] == {'plugins': True, 'apps': True} for p in final
+               if p['pid'] == record['pid'])
+    assert not any(x['method'] == 'turn/start' for x in record['rpc'])
+    assert not session._active_turn_id
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_actual_ignored_process_overrides_refuse_reviewer(actual_codex_process):
+    session, record, _known = actual_codex_process(honor_overrides=False)
+    with pytest.raises(ValueError, match='Plugins and Apps isolation'):
+        session.ensure_started()
+    assert record['rpc'][-1]['features'] == {'apps': True, 'plugins': True}
+    assert not any(x['method'] in {'thread/start', 'mcpServerStatus/list', 'turn/start'} for x in record['rpc'])
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_actual_developer_process_keeps_enabled_features(actual_codex_process):
+    session, record, known = actual_codex_process(reviewer=False)
+    assert session.ensure_started()
+    config = session._client.request('config/read', {'cwd': session._cwd, 'includeLayers': True})
+    assert config['config']['features']['apps'] is True
+    assert config['config']['features']['plugins'] is True
+    assert not any(x['method'] in {'mcpServerStatus/list', 'turn/start'} for x in record['rpc'])
+    record['returned_at'] = time.monotonic()
+    final = _observe_codex_window(record, known)
+    assert all(p['process_overrides'] == {'plugins': False, 'apps': False} for p in final
+               if p['pid'] == record['pid'])
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_actual_reviewer_unknown_server_is_refused_before_thread(actual_codex_process):
+    from pathlib import Path
+    session, record, _known = actual_codex_process()
+    config = Path(session._codex_home) / 'config.toml'
+    config.write_text(config.read_text() + '\n[mcp_servers.unknown]\ncommand = "must-not-run"\n')
+    with pytest.raises(ValueError, match='unsafe effective server roster'):
+        session.ensure_started()
+    assert not any(x['method'] in {'thread/start', 'mcpServerStatus/list', 'turn/start'} for x in record['rpc'])
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_actual_reviewer_config_drift_refuses_next_gate(actual_codex_process):
+    from pathlib import Path
+    session, record, _known = actual_codex_process()
+    session.ensure_started()
+    session._reviewer_preflight()
+    calls = len(record['rpc'])
+    config = Path(session._codex_home) / 'config.toml'
+    config.write_text(config.read_text() + '\n[mcp_servers.unknown]\ncommand = "must-not-run"\n')
+    with pytest.raises(ValueError, match='unsafe effective server roster'):
+        session._reviewer_preflight()
+    assert [x['method'] for x in record['rpc'][calls:]] == ['config/read']
+    assert record['rpc'][-1]['features'] == {'apps': False, 'plugins': False}
+    assert not any(x['method'] == 'turn/start' for x in record['rpc'])
+
+
+@pytest.mark.platforms('macos', 'linux')
+def test_actual_reviewer_closed_connection_never_restarts(actual_codex_process):
+    session, record, _known = actual_codex_process()
+    session.ensure_started()
+    session._reviewer_preflight()
+    client = session._client
+    client.close()
+    with pytest.raises(CodexAppServerTransportError):
+        session._reviewer_preflight()
+    assert client._proc.returncode == 0
+    assert session._client is client
+    assert sum(x['method'] == 'thread/start' for x in record['rpc']) == 1
+    assert not any(x['method'] == 'turn/start' for x in record['rpc'])

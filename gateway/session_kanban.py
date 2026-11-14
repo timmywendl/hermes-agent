@@ -163,7 +163,30 @@ async def run_task(connection, params):
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
 
 
-def bind_worker_context(frame):
+def reviewer_binding_for_worker(frame, session_id):
+    """Read original claim/Owner provenance; the frozen hint is never authority."""
+    context = json.loads(frame['policy'].get('kanban_json') or 'null')
+    if context is None:
+        return None
+    from tools.kanban_tools import reviewer_binding
+    binding = reviewer_binding(board=context.get('board', ''), task_id=context['task_id'], run_id=context['run_id'],
+        claim_lock=context['claim_lock'], db=context['db'], profile=context.get('profile', ''),
+        home=context.get('owner_home', ''), session_id=session_id)
+    if 'reviewer' in context and context['reviewer'] is not (binding is not None):
+        raise ValueError('Reviewer hint conflicts with original claim')
+    if binding is not None and 'scope' in frame:
+        scope = frame['scope']
+        if (frame['policy']['source'] != 'kanban' or scope['session_id'] != binding.session_id
+                or Path(frame['home']).resolve() != Path(binding.home)
+                or Path(scope['profile_id']).resolve() != Path(binding.home)):
+            raise ValueError('Reviewer adopted Worker identity mismatch')
+        from hermes_cli.codex_runtime_switch import get_current_runtime
+        if get_current_runtime(json.loads(frame['policy']['config_json'])) != 'codex_app_server':
+            raise ValueError('Reviewer requires the qualified Codex app-server path')
+    return binding
+
+
+def bind_worker_context(frame, *, reviewer_binding_pin=None):
     """Only the adopted private exec calls this, before tool discovery imports."""
     import os
     context = json.loads(frame['policy'].get('kanban_json') or 'null')
@@ -171,11 +194,15 @@ def bind_worker_context(frame):
         return
     if frame['policy']['source'] != 'kanban':
         raise ValueError('invalid_kanban_policy')
+    if reviewer_binding_for_worker(frame, frame['scope']['session_id']) != reviewer_binding_pin:
+        raise ValueError('Reviewer early binding changed before worker_bound')
     env = {'HERMES_KANBAN_TASK': context['task_id'], 'HERMES_KANBAN_BOARD': context['board'],
         'HERMES_KANBAN_DB': context['db'], 'HERMES_KANBAN_RUN_ID': str(context['run_id']),
         'HERMES_KANBAN_CLAIM_LOCK': context['claim_lock'], 'HERMES_KANBAN_WORKSPACE': context['workspace'],
         'HERMES_KANBAN_WORKSPACES_ROOT': context['workspaces_root'], 'HERMES_PROFILE': context['profile'],
         'HERMES_SESSION_SOURCE': 'kanban'}
+    if reviewer_binding_pin is not None:
+        env['HERMES_SESSION_ID'] = reviewer_binding_pin.session_id
     for key, value in (('HERMES_KANBAN_BRANCH', context['branch']), ('HERMES_TENANT', context['tenant'])):
         if value:
             env[key] = value
@@ -190,6 +217,9 @@ def bind_worker_context(frame):
     from hermes_cli import kanban_db as kb
     with connect_closing(Path(context['db'])) as conn:
         with kb.write_txn(conn):
+            binding = reviewer_binding_for_worker(frame, frame['scope']['session_id'])
+            if binding != reviewer_binding_pin:
+                raise ValueError('Reviewer early binding changed before worker_bound')
             task = kb.get_task(conn, context['task_id'])
             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
                     or task.claim_lock != context['claim_lock']):
@@ -255,17 +285,16 @@ def _run_worker_turns(agent, frame, history):
                                       **({'turn_author': author} if author is not None else {}))
     from hermes_cli.turn_exit import credential_failure_flags, turn_exit_code
     code, last_output = 1, ''
+    binding = reviewer_binding_for_worker(frame, agent.session_id)
+    if binding != vars(agent).get('_kanban_reviewer_binding'):
+        raise ValueError('Reviewer early binding changed before public entry')
     try:
-        from tools.kanban_tools import reviewer_binding, reviewer_tool_scope
-        binding = reviewer_binding(board=context.get('board', ''), task_id=context['task_id'], run_id=context['run_id'],
-            claim_lock=context['claim_lock'], db=context['db'], profile=context.get('profile', ''),
-            home=context.get('owner_home', ''), session_id=agent.session_id)
+        from tools.kanban_tools import reviewer_tool_scope
         if binding:
             from hermes_cli import kanban_db as kb
             with closing(sqlite3.connect(Path(binding.kanban_db).as_uri() + '?mode=ro', uri=True)) as conn:
                 conn.row_factory = sqlite3.Row
                 context['context'] = _reviewer_context(kb, conn, kb.get_task(conn, binding.task_id))
-        agent._kanban_reviewer_binding = binding
         with reviewer_tool_scope(binding):
             result = _run_task_turns(agent, frame, history, context)
         code = turn_exit_code(result, kanban_worker=True)

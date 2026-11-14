@@ -632,3 +632,74 @@ def test_reviewer_missing_prompt_cannot_broaden_callbacks(public_reviewer_entry)
         entry.call()
     assert entry.client.requests == []
     _assert_no_reviewer_aux(entry)
+
+
+@pytest.mark.parametrize(('reviewer', 'surface'), [(True, 'cli'), (False, 'cli'), (False, 'tui')])
+def test_constructor_fence_preserves_developer_initialization(reviewer_env, tmp_path, monkeypatch, reviewer, surface):
+    import collections
+    import json
+    import httpx
+    import requests
+    from agent import agent_init
+    from hermes_state import SessionDB
+    from tools.kanban_tools import reviewer_tool_scope
+
+    counts = collections.Counter()
+    marker = tmp_path / 'constructor-external-effect'
+    def sink(name, result=None):
+        def call(*args, **kwargs):
+            counts[name] += 1
+            marker.write_text(name)
+            return result
+        return call
+    def no_http(*args, **kwargs):
+        counts['http_attempt'] += 1
+        raise AssertionError('no host HTTP in Reviewer constructor')
+    monkeypatch.setattr(httpx.Client, 'send', no_http)
+    monkeypatch.setattr(httpx.AsyncClient, 'send', no_http)
+    monkeypatch.setattr(requests.sessions.Session, 'request', no_http)
+    for path, name in (
+        ('hermes_cli.left_core_migration.recover_at_startup', 'startup_migration'),
+        ('hermes_cli.plugins.discover_plugins', 'plugin_discovery'),
+        ('plugins.memory.load_memory_provider', 'memory_plugin'),
+        ('hermes_cli.memory_provider_migration.recover_at_startup', 'memory_migration'),
+        ('plugins.context_engine.load_context_engine', 'context_engine_plugin'),
+        ('hermes_cli.plugins.get_plugin_context_engine', 'context_engine_callback'),
+        ('tools.env_probe.warm_environment_probe_async', 'background_probe'),
+    ):
+        monkeypatch.setattr(path, sink(name))
+    monkeypatch.setattr(AIAgent, '_ensure_lmstudio_runtime_loaded', sink('lmstudio_probe_load'))
+    config = {'model': {'default': 'offline-unknown', 'provider': 'custom'},
+              'memory': {'provider': 'external-negative'}, 'context': {'engine': 'external-negative'}}
+    monkeypatch.setattr('hermes_cli.config.load_config_readonly', lambda: config)
+    if not reviewer:
+        for suffix in ('TASK', 'RUN_ID', 'CLAIM_LOCK', 'DB', 'BOARD'):
+            monkeypatch.delenv('HERMES_KANBAN_' + suffix, raising=False)
+    db = SessionDB(tmp_path / 'constructor-session.db')
+    agent = None
+    try:
+        with reviewer_tool_scope(reviewer_env if reviewer else None):
+            agent = AIAgent(model='offline-unknown', provider='custom', api_mode='codex_app_server',
+                base_url='http://127.0.0.1:1/v1', api_key='offline-only', quiet_mode=True,
+                session_id=reviewer_env.session_id, session_db=db, platform=surface,
+                _reviewer_binding=reviewer_env if reviewer else None,
+                enabled_toolsets=['kanban'], skip_context_files=True)
+        if reviewer:
+            assert agent._kanban_reviewer_binding == reviewer_env
+            assert agent.api_mode == 'codex_app_server' and agent.client is None
+            assert agent._reviewer_context_length_status == 'UNKNOWN'
+            assert agent.context_compressor.name == 'compressor'
+            assert agent.valid_tool_names == {'kanban_heartbeat', 'kanban_complete', 'kanban_request_changes', 'kanban_block'}
+            assert not counts and not marker.exists(), dict(counts)
+            print('EARLY_CONSTRUCTOR_RECEIPT=' + json.dumps({'counts': dict(counts), 'context_status': 'UNKNOWN'}))
+        else:
+            assert agent.client is not None
+            for name in ('startup_migration', 'plugin_discovery', 'memory_plugin', 'context_engine_plugin',
+                         'lmstudio_probe_load', 'background_probe'):
+                assert counts[name] >= 1, (name, dict(counts))
+            assert counts['http_attempt'] >= 1 and marker.exists()
+            print('DEVELOPER_CONSTRUCTOR_RECEIPT=' + json.dumps({'surface': surface, 'counts': dict(counts)}))
+    finally:
+        if agent is not None:
+            agent.close()
+        db.close()

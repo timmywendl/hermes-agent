@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- Main Control 6875071057 confines constructor fencing to this existing phase owner and forbids another module; only Reviewer guards are added
 """Implementation of :meth:`AIAgent.__init__` as ``init_agent(agent, ...)``.
 
 ``init_agent`` is a thin, ordered orchestrator over ``_init_*`` / ``_build_*`` phase
@@ -436,6 +437,8 @@ def _resolve_api_mode(agent, api_mode, provider_name, base_url):
 
 
 def _finalize_routing(agent, api_mode, credential_pool):
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        return
     from hermes_cli.providers import is_actual_route
     # Credential-pool validation runs AFTER provider auto-detection so a pool scoped to
     # "anthropic" isn't rejected for provider=None + anthropic.com URL.
@@ -1027,6 +1030,14 @@ def _init_openai_client(agent, api_key, base_url, fallback_model, _provider_time
 
 
 def _build_client(agent, api_key, base_url, fallback_model):
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        # Codex owns the client. Do not resolve host credentials/providers or
+        # instantiate a host HTTP/process transport for an isolated Reviewer.
+        agent.client, agent._anthropic_client = None, None
+        agent._is_anthropic_oauth = False
+        agent.api_key = api_key or ''
+        agent._client_kwargs = {'api_key': agent.api_key, 'base_url': agent.base_url}
+        return
     # LLM client per wire mode (raw_codex=True: the main agent needs direct
     # responses.stream()). One provider/model timeout up front so every path applies it.
     agent._anthropic_client = None
@@ -1093,6 +1104,14 @@ def _client_kwargs_from_routed(client, timeout) -> dict[str, Any]:
 
 
 def _load_tools(agent, enabled_toolsets, disabled_toolsets):
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        from tools.kanban_tools import REVIEWER_TOOLS
+        from tools.registry import registry
+        agent.tools = [{'type': 'function', 'function': registry.get_schema(name)} for name in REVIEWER_TOOLS]
+        agent.valid_tool_names = set(REVIEWER_TOOLS)
+        agent.disabled_toolsets = disabled_toolsets
+        agent._kanban_worker_guidance = ''
+        return
     # A feature that left core for a catalog plugin (Home Assistant) is installed for a home that
     # used it, once per process, before discovery so its tools are in this agent's snapshot.
     from hermes_cli.left_core_migration import recover_at_startup
@@ -1305,7 +1324,7 @@ def _init_memory(agent, _agent_cfg, skip_memory, platform, memory_manager=None):
     agent._iters_since_skill = 0
     from agent.safe_worker_policy import safe_worker_enabled
 
-    if safe_worker_enabled():
+    if safe_worker_enabled() or vars(agent).get('_kanban_reviewer_binding') is not None:
         agent._memory_manager = None
         return
     # skip_memory skips the external *provider*; enabled_toolsets=["memory"] still gets the
@@ -1426,8 +1445,10 @@ def _apply_agent_section(agent, _agent_cfg):
         "environment_probe", "bot_mode_protocol",
     ):
         setattr(agent, f"_{_key}", bool(_agent_section.get(_key, True)))
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        agent._environment_probe = agent._bot_mode_protocol = False
     # Warm the probe (~0.5s of subprocesses) off-thread so the first prompt build finds it cached.
-    if agent._environment_probe:
+    if agent._environment_probe and vars(agent).get('_kanban_reviewer_binding') is None:
         with suppress(Exception):
             from tools.env_probe import warm_environment_probe_async
             warm_environment_probe_async()
@@ -1825,6 +1846,14 @@ def _warn_invalid_custom_provider_context_length(agent, _custom_providers) -> No
 
 
 def _resolve_context_length(agent, _agent_cfg, base_url):
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        agent._aux_compression_context_length_config = None
+        agent._custom_providers = []
+        agent._config_context_length = None
+        agent._reviewer_context_length_status = 'UNKNOWN'
+        agent._ollama_num_ctx = None
+        # Conservative host accounting only, never a verified model capability.
+        return None, [], MINIMUM_CONTEXT_LENGTH, {}
     # Aux compression model context_length hint (custom endpoints often can't report it).
     try:
         _aux_cfg = cfg_get(_agent_cfg, "auxiliary", "compression", default={})
@@ -1971,7 +2000,8 @@ def _compressor_max_tokens(agent):
 
 
 def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
-    _selected_engine = _select_context_engine(_agent_cfg)
+    reviewer = vars(agent).get('_kanban_reviewer_binding') is not None
+    _selected_engine = None if reviewer else _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
         # External engines own compaction policy — the host threshold (and its Codex
@@ -2012,6 +2042,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
             min_tail_user_messages=cs.min_tail_users, tail_mode=cs.tail_mode,
             custom_providers=_custom_providers,
         )
+    if reviewer:
+        agent.context_compressor.context_length = MINIMUM_CONTEXT_LENGTH
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
         with suppress(Exception):
@@ -2123,6 +2155,8 @@ def _inject_context_engine_tools(agent):
     # `platform_toolsets: telegram: []` would still leak lcm_* tools into the tool surface and incur the
     # same local-model latency penalty.
     agent._context_engine_tool_names: set = set()
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        return
     if (
         agent.context_compressor
         and agent.tools is not None
@@ -2163,6 +2197,10 @@ def _inject_context_engine_tools(agent):
 
 
 def _emit_compression_summary(agent, cs):
+    if vars(agent).get('_kanban_reviewer_binding') is not None:
+        agent._compression_warning = None
+        agent._compression_feasibility_checked = False
+        return
     # Codex autoraise notice: once per profile/config state (persisted marker; the gateway
     # rebuilds the agent per message). The display gate hides the banner, not the autoraise.
     _autoraise = agent._compression_threshold_autoraised or {}
@@ -2316,7 +2354,18 @@ def init_agent(
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None,
     tool_result_metadata_callback: Optional[Callable[..., dict]] = None,
+    _reviewer_binding=None,
 ):
+    if _reviewer_binding is not None:
+        from tools.kanban_tools import _REVIEWER, reviewer_binding_from_env, validate_reviewer_binding
+        validate_reviewer_binding(_reviewer_binding)
+        if (_REVIEWER.get() != _reviewer_binding or reviewer_binding_from_env() != _reviewer_binding
+                or session_id != _reviewer_binding.session_id or api_mode != 'codex_app_server'):
+            raise ValueError('Reviewer constructor authority mismatch')
+        agent._kanban_reviewer_binding = _reviewer_binding
+        skip_memory = skip_background_review = True
+        fallback_model = {}
+        prefill_messages = []
     from agent.safe_worker_policy import safe_worker_enabled
 
     if safe_worker_enabled():
@@ -2344,7 +2393,7 @@ def init_agent(
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
     # Effective base URL for feature detection (prompt caching, reasoning, etc.)
     from hermes_cli.providers import is_actual_route
-    if is_actual_route(provider, base_url):
+    if _reviewer_binding is None and is_actual_route(provider, base_url):
         from hermes_cli.auth import normalize_actual_base_url
         base_url = normalize_actual_base_url(base_url)
     agent.base_url = base_url or ""
@@ -2359,10 +2408,13 @@ def init_agent(
         key: value for key, value in (capabilities or {}).items()
         if isinstance(key, str) and isinstance(value, bool)
     }
-    agent._credential_pool = credential_pool
+    agent._credential_pool = credential_pool if _reviewer_binding is None else None
     agent.acp_command = acp_command or command
     agent.acp_args = list(acp_args or args or [])
-    _resolve_api_mode(agent, api_mode, provider_name, base_url)
+    if _reviewer_binding is None:
+        _resolve_api_mode(agent, api_mode, provider_name, base_url)
+    else:
+        agent.api_mode = 'codex_app_server'
     _finalize_routing(agent, api_mode, credential_pool)
 
     # Platform callbacks are stored under their parameter names verbatim.
@@ -2395,6 +2447,9 @@ def init_agent(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
     )
+    if _reviewer_binding is not None:
+        agent._auto_load_skills_resolved = True
+        agent._auto_load_skills_result = ('', [], [])
 
     # Load config once for memory, skills, and compression sections
     try:
@@ -2411,12 +2466,15 @@ def init_agent(
         agent, _agent_cfg, base_url
     )
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
-    _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
+    if _reviewer_binding is None:
+        _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
-    _warn_nonagentic_hermes_model(agent)
+    if _reviewer_binding is None:
+        _warn_nonagentic_hermes_model(agent)
     _inject_context_engine_tools(agent)
     _init_usage_state(agent)
-    _clamp_compressor_to_ollama_num_ctx(agent)
+    if _reviewer_binding is None:
+        _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
     _snapshot_primary_runtime(agent)
 

@@ -315,17 +315,20 @@ def execute(frame, channel):
     if adopted['owner_epoch'] != scope['epoch']:
         raise RuntimeError('stale_epoch')
     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
-    from gateway.session_kanban import bind_worker_context
-    bind_worker_context(frame)
+    from gateway.session_kanban import bind_worker_context, reviewer_binding_for_worker
+    binding = reviewer_binding_for_worker(frame, scope['session_id'])
+    bind_worker_context(frame, reviewer_binding_pin=binding)
     # Background processes a previous admission of this session started outlive that worker
     # (F24); adopt them so process_manage in this turn can poll and kill them.
     from tools.process_registry import process_registry
-    process_registry.recover_from_checkpoint()
+    if binding is None:
+        process_registry.recover_from_checkpoint()
     # Store construction binds the delegation ledger before tool discovery.
     from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks
     policy = restore_policy(frame['policy'])
-    register_worker_hooks(policy)
-    discover_profile_mcp(policy)
+    if binding is None:
+        register_worker_hooks(policy)
+        discover_profile_mcp(policy)
     from run_agent import AIAgent
     from tools.approval import register_gateway_notify, unregister_gateway_notify
     from tools.approval_context import set_current_session_key
@@ -333,11 +336,14 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
+    if binding is not None:
+        construct.update(_reviewer_binding=binding, api_mode='codex_app_server')
     controls = WorkerControls(channel, frame['route'])
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
-        with policy_scope(policy):
+        from tools.kanban_tools import reviewer_tool_scope
+        with policy_scope(policy), reviewer_tool_scope(binding):
             agent = _construct_agent(frame, AIAgent, model=policy.model, provider=policy.provider, base_url=policy.base_url,
                 api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
                 enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
@@ -405,8 +411,11 @@ def _construct_agent(frame, factory, **kwargs):
     try:
         return factory(**kwargs)
     except Exception as exc:
-        from gateway.session_kanban import record_start_failure
-        record_start_failure(frame, exc)
+        # A failed Reviewer constructor has no admitted result. Leave it to the
+        # original dead-worker reconciliation, including authority failures.
+        if kwargs.get('_reviewer_binding') is None:
+            from gateway.session_kanban import record_start_failure
+            record_start_failure(frame, exc)
         raise
 
 

@@ -44,17 +44,34 @@ def reviewer_turn_binding(agent: Any) -> Any:
     A cached Reviewer must also remain in its original Owner session and route.
     """
     from tools.kanban_tools import (
-        _REVIEWER, reviewer_binding_from_env, validate_reviewer_binding,
+        _REVIEWER, claimed_lane, reviewer_binding_from_env, validate_reviewer_binding,
     )
 
     binding = vars(agent).get("_kanban_reviewer_binding")
     scoped = _REVIEWER.get()
     session_binding = getattr(vars(agent).get("_codex_session"), "__dict__", {}).get("_reviewer_binding")
+    if all(value is None for value in (binding, scoped, session_binding)):
+        import os
+        import sqlite3
+        from contextlib import closing
+        from hermes_cli import kanban_db as kb
+
+        tid = os.environ.get("HERMES_KANBAN_TASK")
+        if not tid:
+            return None
+        # Local Developer callers may omit the env Run locator. Only the
+        # original current claim can distinguish that case from lost Review
+        # scope; never construct Reviewer authority from the locators.
+        path = kb.kanban_db_path().resolve(strict=True)
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as proof:
+            proof.row_factory = sqlite3.Row
+            task = kb.get_task(proof, tid)
+            if task is None or claimed_lane(proof, tid, task.current_run_id)[2]:
+                raise ValueError("Reviewer turn binding missing")
+        return None
     current = reviewer_binding_from_env()
     if binding is None:
-        if current is not None or scoped is not None or session_binding is not None:
-            raise ValueError("Reviewer turn binding missing")
-        return None
+        raise ValueError("Reviewer turn binding missing")
     validate_reviewer_binding(binding)
     if (binding != current or binding != scoped
             or (session_binding is not None and binding != session_binding)

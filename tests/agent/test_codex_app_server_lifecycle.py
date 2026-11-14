@@ -536,7 +536,6 @@ def test_developer_native_liveness_keeps_local_and_worker_paths(public_reviewer_
     from contextlib import closing
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect
-    from tools.kanban_tools import heartbeat_current_worker_from_env, reviewer_tool_scope
 
     entry = public_reviewer_entry
     with closing(connect(board=entry.binding.board)) as conn:
@@ -551,13 +550,8 @@ def test_developer_native_liveness_keeps_local_and_worker_paths(public_reviewer_
     entry.session._reviewer_binding = None
     entry.gate['deny'] = None
     before = _review_store_snapshot(entry.binding)
-    if with_run_id:
-        result = entry.call(reviewer=False)
-        assert not result.get('error')
-    else:
-        # Original local auto-heartbeat caller permits an omitted env Run locator.
-        with reviewer_tool_scope(None):
-            assert heartbeat_current_worker_from_env() is True
+    result = entry.call(reviewer=False)
+    assert not result.get('error')
     after = _review_store_snapshot(entry.binding)
     events = after['task_events'][len(before['task_events']):]
     assert len(events) == 1

@@ -329,80 +329,85 @@ def execute(frame, channel):
     if binding is None:
         register_worker_hooks(policy)
         discover_profile_mcp(policy)
-    from run_agent import AIAgent
-    from tools.approval import register_gateway_notify, unregister_gateway_notify
-    from tools.approval_context import set_current_session_key
-    set_current_session_key(frame['route'])
-    os.environ['HERMES_GATEWAY_SESSION'] = '1'
-    from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
-    construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    if binding is not None:
-        construct.update(_reviewer_binding=binding, api_mode='codex_app_server')
-    controls = WorkerControls(channel, frame['route'])
-    register_gateway_notify(frame['route'], controls.approval)
-    agent = None
-    try:
-        from tools.kanban_tools import reviewer_tool_scope
-        with policy_scope(policy), reviewer_tool_scope(binding):
-            agent = _construct_agent(frame, AIAgent, model=policy.model, provider=policy.provider, base_url=policy.base_url,
-                api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
-                enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
-                # A delegated child needs its own owner-registered execution, which this single-turn
-                # worker cannot reserve; never offer a tool whose only outcome here is a refusal.
-                disabled_toolsets=list(WORKER_DISABLED_TOOLSETS),
-                reasoning_config=policy.reasoning_config,
-                # ``tool`` / ``oneshot`` are storage labels for a CLI-surface agent (session_policy.SURFACES).
-                platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,
-                gateway_session_key=frame['route'], user_id=frame['user_id'], chat_id=frame['chat_id'],
-                skip_context_files=policy.ignore_rules, load_soul_identity=not policy.ignore_rules,
-                skip_memory=policy.ignore_rules, skip_background_review=True, quiet_mode=True,
-                pass_session_id=policy.pass_session_id,
-                **checkpoint_agent_kwargs(policy.config()), **construct,
-                **routing_agent_kwargs(policy.config(), policy.model, policy.provider, policy.base_url),
-                stream_delta_callback=lambda text: channel.send('delta', text=text) if text else None,
-                clarify_callback=controls.clarify,
-                tool_start_callback=lambda call_id, name, args: channel.send('tool.start', **tool_frame(call_id, name, args)),
-                tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
-                                                                                         **tool_frame(call_id, name, args, result)))
-            controls.agent = agent
-            if controls.stopped.is_set():
-                from agent.interrupt_compat import request_hard_interrupt
-                request_hard_interrupt(agent)
-            channel.send('ready', pid=os.getpid())
-            history = store.get_messages_as_conversation(scope['session_id'])
-            from gateway.session_kanban import run_worker_turns
-            if 'attachments_v1' in frame:
-                from gateway.session_ingress_media import restore_attachments
-                from agent.image_routing import build_native_content_parts
-                media = restore_attachments(frame)
-                content, skipped = build_native_content_parts(frame['text'], media['media_urls'])
-                if skipped:
-                    raise ValueError('managed_attachment_unavailable')
-                frame = {**frame, 'text': content}
-            before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
-                      getattr(agent, 'session_completion_tokens', 0) or 0)
-            result = run_worker_turns(agent, frame, history)
-            result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
-            result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
-            retire_agent(agent)
-            agent = None
-            # The auto-title thread bills through this store from a daemon thread; a title landing
-            # after execution.finish is a stale_generation write that fails the close-time flush.
-            from agent.title_generator import wait_for_title_upgrades
-            wait_for_title_upgrades()
-            store.flush_token_counts()
-            if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
-                result['final_response'] = ''
-            channel.send('result', result=result_frame(result))
-            if not controls.finish.wait(30):
-                raise ValueError('managed_finish_timeout')
-            store.finish()
-            channel.send('finished')
-    finally:
-        unregister_gateway_notify(frame['route'])
-        if agent is not None:
-            retire_agent(agent)
-        store.close()
+    from contextlib import nullcontext
+    from hermes_cli.plugins_discovery import suppress_plugin_discovery
+    # Both model_tools' first import and later lazy registry reads can discover
+    # plugins. Keep the existing suppression bound through Reviewer teardown.
+    with suppress_plugin_discovery() if binding is not None else nullcontext():
+        from run_agent import AIAgent
+        from tools.approval import register_gateway_notify, unregister_gateway_notify
+        from tools.approval_context import set_current_session_key
+        set_current_session_key(frame['route'])
+        os.environ['HERMES_GATEWAY_SESSION'] = '1'
+        from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
+        construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
+        if binding is not None:
+            construct.update(_reviewer_binding=binding, api_mode='codex_app_server')
+        controls = WorkerControls(channel, frame['route'])
+        register_gateway_notify(frame['route'], controls.approval)
+        agent = None
+        try:
+            from tools.kanban_tools import reviewer_tool_scope
+            with policy_scope(policy), reviewer_tool_scope(binding):
+                agent = _construct_agent(frame, AIAgent, model=policy.model, provider=policy.provider, base_url=policy.base_url,
+                    api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
+                    enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
+                    # A delegated child needs its own owner-registered execution, which this single-turn
+                    # worker cannot reserve; never offer a tool whose only outcome here is a refusal.
+                    disabled_toolsets=list(WORKER_DISABLED_TOOLSETS),
+                    reasoning_config=policy.reasoning_config,
+                    # ``tool`` / ``oneshot`` are storage labels for a CLI-surface agent (session_policy.SURFACES).
+                    platform=policy.platform if policy.source in ('tool', 'oneshot') else policy.source,
+                    gateway_session_key=frame['route'], user_id=frame['user_id'], chat_id=frame['chat_id'],
+                    skip_context_files=policy.ignore_rules, load_soul_identity=not policy.ignore_rules,
+                    skip_memory=policy.ignore_rules, skip_background_review=True, quiet_mode=True,
+                    pass_session_id=policy.pass_session_id,
+                    **checkpoint_agent_kwargs(policy.config()), **construct,
+                    **routing_agent_kwargs(policy.config(), policy.model, policy.provider, policy.base_url),
+                    stream_delta_callback=lambda text: channel.send('delta', text=text) if text else None,
+                    clarify_callback=controls.clarify,
+                    tool_start_callback=lambda call_id, name, args: channel.send('tool.start', **tool_frame(call_id, name, args)),
+                    tool_complete_callback=lambda call_id, name, args, result: channel.send('tool.complete',
+                                                                                             **tool_frame(call_id, name, args, result)))
+                controls.agent = agent
+                if controls.stopped.is_set():
+                    from agent.interrupt_compat import request_hard_interrupt
+                    request_hard_interrupt(agent)
+                channel.send('ready', pid=os.getpid())
+                history = store.get_messages_as_conversation(scope['session_id'])
+                from gateway.session_kanban import run_worker_turns
+                if 'attachments_v1' in frame:
+                    from gateway.session_ingress_media import restore_attachments
+                    from agent.image_routing import build_native_content_parts
+                    media = restore_attachments(frame)
+                    content, skipped = build_native_content_parts(frame['text'], media['media_urls'])
+                    if skipped:
+                        raise ValueError('managed_attachment_unavailable')
+                    frame = {**frame, 'text': content}
+                before = (getattr(agent, 'session_prompt_tokens', 0) or 0,
+                          getattr(agent, 'session_completion_tokens', 0) or 0)
+                result = run_worker_turns(agent, frame, history)
+                result['_turn_input_tokens'] = max(0, (getattr(agent, 'session_prompt_tokens', 0) or 0) - before[0])
+                result['_turn_output_tokens'] = max(0, (getattr(agent, 'session_completion_tokens', 0) or 0) - before[1])
+                retire_agent(agent)
+                agent = None
+                # The auto-title thread bills through this store from a daemon thread; a title landing
+                # after execution.finish is a stale_generation write that fails the close-time flush.
+                from agent.title_generator import wait_for_title_upgrades
+                wait_for_title_upgrades()
+                store.flush_token_counts()
+                if result.get('final_response') is None and (result.get('interrupted') or result.get('failed')):
+                    result['final_response'] = ''
+                channel.send('result', result=result_frame(result))
+                if not controls.finish.wait(30):
+                    raise ValueError('managed_finish_timeout')
+                store.finish()
+                channel.send('finished')
+        finally:
+            unregister_gateway_notify(frame['route'])
+            if agent is not None:
+                retire_agent(agent)
+            store.close()
 
 
 def _construct_agent(frame, factory, **kwargs):

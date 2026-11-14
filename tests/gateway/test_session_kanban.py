@@ -609,7 +609,7 @@ def _worker_fence_child_probe():
     import sys
     from agent import managed_worker as worker
 
-    receipt = {'phases': [], 'counts': collections.Counter(), 'rpc': [], 'codex': []}
+    receipt = {'phases': [], 'counts': collections.Counter(), 'rpc': [], 'codex': [], 'pid': os.getpid()}
     original_bind = worker.bind_worker_policy
     original_execute = worker.execute
     mode = os.environ['WORKER_FENCE_MODE']
@@ -630,6 +630,20 @@ def _worker_fence_child_probe():
 
     def prepare(frame):
         original_bind(frame)
+        if mode == 'reclaimed':
+            from hermes_cli import kanban_db as kb
+            from hermes_cli.kanban_db_connect import connect_closing
+            from hermes_cli.plugins_discovery import suppress_plugin_discovery
+            context = json.loads(frame['policy']['kanban_json'])
+            receipt['fault_setup_before'] = snapshot(context['db'])
+            # Fault setup uses the real reclaim API after policy freeze; its
+            # operator-side hooks are outside the old Worker's execution trial.
+            with suppress_plugin_discovery(), connect_closing(Path(context['db'])) as conn:
+                assert kb.block_task(conn, context['task_id'], reason='fixture reclaim', expected_run_id=context['run_id'])
+                assert kb.unblock_task(conn, context['task_id'])
+                successor = kb.claim_review_task(conn, context['task_id'], claimer='successor-reviewer')
+                assert successor is not None and successor.current_run_id != context['run_id']
+            receipt['before'] = snapshot(context['db'])
         import httpx
         import requests
         from unittest.mock import patch
@@ -670,15 +684,27 @@ def _worker_fence_child_probe():
                 receipt['counts']['process_start'] += 1
                 raise AssertionError('no external process in offline Worker')
         stack.enter_context(patch.object(subprocess, 'Popen', NoExternalProcess))
+        import threading
+        original_thread_start = threading.Thread.start
+        def thread_start(thread):
+            receipt.setdefault('thread_starts', []).append(thread.name)
+            return original_thread_start(thread)
+        stack.enter_context(patch.object(threading.Thread, 'start', thread_start))
         from agent.runtime_session_store import WorkerRPC
         from gateway import session_kanban
-        from run_agent import AIAgent
+        from hermes_cli import plugins
+        from hermes_cli.plugins_discovery import plugin_discovery_suppressed
+        original_discovery = plugins.discover_plugins
+        def discovery(*args, **kwargs):
+            if not plugin_discovery_suppressed():
+                effect('plugin_discovery')()
+            return original_discovery(*args, **kwargs)
+        stack.enter_context(patch.object(plugins, 'discover_plugins', discovery))
         for path, label in (
             ('gateway.session_policy.register_worker_hooks', 'hook_registration'),
             ('agent.managed_worker.discover_profile_mcp', 'profile_mcp'),
             ('tools.process_registry.process_registry.recover_from_checkpoint', 'process_recovery'),
             ('hermes_cli.left_core_migration.recover_at_startup', 'startup_migration'),
-            ('hermes_cli.plugins.discover_plugins', 'plugin_discovery'),
             ('plugins.memory.load_memory_provider', 'memory_plugin'),
             ('hermes_cli.memory_provider_migration.recover_at_startup', 'memory_migration'),
             ('plugins.context_engine.load_context_engine', 'context_engine_plugin'),
@@ -687,7 +713,6 @@ def _worker_fence_child_probe():
             ('agent.auxiliary_client.call_llm', 'auxiliary_intent'),
         ):
             stack.enter_context(patch(path, effect(label)))
-        stack.enter_context(patch.object(AIAgent, '_ensure_lmstudio_runtime_loaded', effect('lmstudio_probe_load')))
         original_rpc = WorkerRPC.__call__
         def rpc(self, method, **params):
             receipt.setdefault('rpc_attempts', []).append(method)
@@ -718,29 +743,33 @@ def _worker_fence_child_probe():
                     receipt['before'] = snapshot(db)
                     yield conn
             stack.enter_context(patch('hermes_cli.kanban_db_connect.connect_closing', revoke_at_writer))
-        original_constructor = AIAgent.__init__
-        def constructor(self, **kwargs):
-            receipt['phases'].append('constructor')
-            stage()
-            if mode == 'constructor_revoked':
-                db = kwargs['_reviewer_binding'].kanban_db
-                receipt['fault_setup_before'] = snapshot(db)
-                with sqlite3.connect(db) as mutate:
-                    mutate.execute("DELETE FROM task_events WHERE kind='owner_admitted'")
-                receipt['before'] = snapshot(db)
-            try:
-                original_constructor(self, **kwargs)
-            except Exception:
-                import traceback
-                receipt['constructor_error'] = traceback.format_exc()
-                raise
-            receipt['constructor_binding'] = getattr(self, '_kanban_reviewer_binding', None) is not None
-            receipt['context_status'] = getattr(self, '_reviewer_context_length_status', None)
-            stage()
-            if mode == 'late_binding_mismatch':
-                from dataclasses import replace
-                self._kanban_reviewer_binding = replace(self._kanban_reviewer_binding, claim_lock='foreign')
-        stack.enter_context(patch.object(AIAgent, '__init__', constructor))
+        original_construct = worker._construct_agent
+        def construct(current_frame, factory, **kwargs):
+            stack.enter_context(patch.object(factory, '_ensure_lmstudio_runtime_loaded', effect('lmstudio_probe_load')))
+            def constructor(**init_kwargs):
+                receipt['phases'].append('constructor')
+                stage()
+                if mode == 'constructor_revoked':
+                    db = init_kwargs['_reviewer_binding'].kanban_db
+                    receipt['fault_setup_before'] = snapshot(db)
+                    with sqlite3.connect(db) as mutate:
+                        mutate.execute("DELETE FROM task_events WHERE kind='owner_admitted'")
+                    receipt['before'] = snapshot(db)
+                try:
+                    agent = factory(**init_kwargs)
+                except Exception:
+                    import traceback
+                    receipt['constructor_error'] = traceback.format_exc()
+                    raise
+                receipt['constructor_binding'] = vars(agent).get('_kanban_reviewer_binding') is not None
+                receipt['context_status'] = vars(agent).get('_reviewer_context_length_status')
+                stage()
+                if mode == 'late_binding_mismatch':
+                    from dataclasses import replace
+                    agent._kanban_reviewer_binding = replace(agent._kanban_reviewer_binding, claim_lock='foreign')
+                return agent
+            return original_construct(current_frame, constructor, **kwargs)
+        stack.enter_context(patch.object(worker, '_construct_agent', construct))
         from agent import agent_init
         for name in ('_load_tools', '_build_client', '_resolve_context_length', '_build_context_engine'):
             original_phase = getattr(agent_init, name)
@@ -751,7 +780,6 @@ def _worker_fence_child_probe():
         import agent.transports.codex_app_server_session as transport
         from tests.agent.transports.test_codex_app_server_session import FakeClient
         from dataclasses import asdict
-        from tools.kanban_tools import REVIEWER_TOOLS
         original_session = transport.CodexAppServerSession
         def session_factory(**kwargs):
             client = FakeClient()
@@ -786,6 +814,8 @@ def _worker_fence_child_probe():
             session.run_turn = run_turn
             return session
         stack.enter_context(patch.object(transport, 'CodexAppServerSession', session_factory))
+        assert 'run_agent' not in sys.modules and 'model_tools' not in sys.modules
+        receipt['phases'].append('observers-before-first-agent-import')
         # Keep observers live for this one admitted process, then release at exit.
         receipt['_stack'] = stack
 
@@ -825,13 +855,6 @@ def _worker_fence_child_probe():
                 data.update({'source_status': 'unknown'} if mode == 'stale_source' else
                             {'db': str(home / 'foreign.db')} if mode == 'wrong_owner_db' else {'session_id': 'revoked'})
                 conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(data), event[0]))
-        if mode == 'reclaimed':
-            from hermes_cli import kanban_db as kb
-            from hermes_cli.kanban_db_connect import connect_closing
-            with connect_closing(Path(original_db)) as conn:
-                kb.block_task(conn, context['task_id'], reason='fixture reclaim', expected_run_id=context['run_id'])
-                kb.unblock_task(conn, context['task_id'])
-                kb.claim_task(conn, context['task_id'])
         frame['policy']['kanban_json'] = json.dumps(context)
         receipt['before'] = snapshot(original_db)
         try:
@@ -845,6 +868,7 @@ def _worker_fence_child_probe():
             raise
         finally:
             receipt['after'] = snapshot(original_db)
+            receipt['plugin_registered'] = (home / ('plugin-register-' + str(os.getpid()))).exists()
             # Persist before the Owner can reap a child after its terminal error frame.
             (home / 'worker-fence-receipt.json').write_text(json.dumps(
                 {key: value for key, value in receipt.items() if key != '_stack'}, default=dict))
@@ -884,7 +908,15 @@ def test_actual_admitted_worker_constructor_fence(tmp_path, monkeypatch, mode):
         directory = home / 'skills' / name
         directory.mkdir(parents=True)
         (directory / 'SKILL.md').write_text('---\nname: ' + name + '\ndescription: Offline Reviewer skill\n---\nREVIEW_SKILL_SENTINEL\n')
+    plugin = home / 'plugins' / 'worker-fence-marker'
+    plugin.mkdir(parents=True)
+    (plugin / 'plugin.yaml').write_text(json.dumps({'name': 'worker-fence-marker', 'version': '0.1.0',
+                                                  'description': 'Offline import side-effect witness'}))
+    (plugin / '__init__.py').write_text(
+        'def register(ctx):\n    import os\n    from pathlib import Path\n'
+        '    Path(os.environ["HERMES_HOME"]).joinpath("plugin-register-" + str(os.getpid())).write_text("registered")\n')
     config = {'gateway': {'multiplex_profiles': False},
+        'plugins': {'enabled': ['worker-fence-marker']},
         'model': {'provider': 'custom', 'default': 'offline-worker', 'base_url': 'http://127.0.0.1:1/v1',
                   'openai_runtime': 'codex_app_server'},
         'memory': {'provider': 'external-negative'}, 'context': {'engine': 'external-negative'},
@@ -935,6 +967,14 @@ def test_actual_admitted_worker_constructor_fence(tmp_path, monkeypatch, mode):
             raise AssertionError(diagnostics) from exc
         receipt = json.loads(path.read_text())
     print('NATIVE_WORKER_CONSTRUCTOR_RECEIPT=' + json.dumps(receipt))
+    assert 'observers-before-first-agent-import' in receipt['phases'], receipt
+    if mode not in {'stale_adopt', 'wrong_session'}:
+        assert receipt['adopted_epoch_matches'] and 'worker.adopt' in receipt['phases'], receipt
+    else:
+        assert receipt['rpc_attempts'] == ['worker.adopt'] and 'worker.adopt' not in receipt['rpc'], receipt
+    assert receipt['plugin_registered'] is (mode == 'developer'), receipt
+    if mode != 'developer':
+        assert not any(name.startswith('plugin-load:') for name in receipt.get('thread_starts', [])), receipt
     if mode == 'valid':
         assert receipt['exit'] == 0, receipt
         assert receipt['adopted_epoch_matches'] and receipt['constructor_binding']
@@ -942,7 +982,7 @@ def test_actual_admitted_worker_constructor_fence(tmp_path, monkeypatch, mode):
         assert 'REVIEW_TASK_SENTINEL' in receipt['task_skill_input']
         assert 'REVIEW_SKILL_SENTINEL' in receipt['task_skill_input']
         assert 'turn/start' not in receipt['codex'] and 'Session preflight' in receipt['phases']
-        stages = ['worker.adopt', 'prior-to-bind_worker_context', 'worker_bound', 'constructor',
+        stages = ['observers-before-first-agent-import', 'worker.adopt', 'prior-to-bind_worker_context', 'worker_bound', 'constructor',
                   '_build_client', '_load_tools', '_resolve_context_length', '_build_context_engine',
                   'public entry', 'Session preflight']
         assert [receipt['phases'].index(stage) for stage in stages] == sorted(

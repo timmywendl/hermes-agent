@@ -767,8 +767,44 @@ def heartbeat_current_worker_from_env() -> bool:
         # stamping the window so a chatty child cannot starve the worker's own heartbeat.
         return False
     _auto_heartbeat_last_attempt = now
+    renewed = False
     try:
         from hermes_cli import kanban_db_dispatch as kbd
+        binding = _REVIEWER.get()
+        if binding is not None:
+            pins = {'HERMES_KANBAN_TASK': binding.task_id,
+                    'HERMES_KANBAN_RUN_ID': str(binding.run_id),
+                    'HERMES_KANBAN_CLAIM_LOCK': binding.claim_lock,
+                    'HERMES_KANBAN_BOARD': binding.board,
+                    'HERMES_KANBAN_DB': binding.kanban_db,
+                    'HERMES_PROFILE': binding.profile, 'HERMES_HOME': binding.home,
+                    'HERMES_SESSION_ID': binding.session_id}
+            if any(os.environ.get(key) != value for key, value in pins.items()):
+                return False
+            validate_reviewer_binding(binding)
+            with _board(binding.board, quiet_close=True) as (kb, conn):
+                # Connect can wait: re-read authority immediately before the
+                # existing renewal's live-expiry/Run CAS at the writer edge.
+                if reviewer_binding_from_env() != binding:
+                    return False
+                renewed = _renew_reviewer_claim(kb, conn, binding)
+                if not renewed:
+                    return False
+                validate_reviewer_binding(binding)
+                if not kbd.heartbeat_worker(conn, binding.task_id, note=None,
+                                            expected_run_id=binding.run_id):
+                    raise ValueError('Reviewer heartbeat failed after claim renewal')
+                return True
+        # No trusted scope cannot adopt Review authority from env. Read the
+        # original current claimed lane, including locally-driven Developers
+        # whose env omits RUN_ID, before retaining their original bridge.
+        from hermes_cli import kanban_db as kb
+        path = kb.kanban_db_path().resolve(strict=True)
+        with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as proof:
+            proof.row_factory = sqlite3.Row
+            task = kb.get_task(proof, tid)
+            if task is None or claimed_lane(proof, tid, task.current_run_id)[2]:
+                return False
         with _board(None, quiet_close=True) as (kb, conn):
             ops = ((kb.heartbeat_claim, {"claimer": os.environ.get("HERMES_KANBAN_CLAIM_LOCK")}),
                    (kbd.heartbeat_worker, {"note": None, "expected_run_id": _worker_run_id(tid)}))
@@ -796,7 +832,10 @@ def heartbeat_current_worker_from_env() -> bool:
                     succeeded = False
         return succeeded
     except Exception:
-        logger.debug("auto-heartbeat: bridge failed", exc_info=True)
+        if renewed:
+            logger.warning("Reviewer auto-heartbeat partial: claim renewed before heartbeat failure", exc_info=True)
+        else:
+            logger.debug("auto-heartbeat: bridge failed", exc_info=True)
         return False
 
 

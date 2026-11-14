@@ -37,6 +37,33 @@ from agent.turn_author import parse_turn_author
 logger = logging.getLogger(__name__)
 
 
+def reviewer_turn_binding(agent: Any) -> Any:
+    """Recheck the original Worker authority before generic turn callbacks.
+
+    Environment locators can reveal a missing Review binding, never grant one.
+    A cached Reviewer must also remain in its original Owner session and route.
+    """
+    from tools.kanban_tools import (
+        _REVIEWER, reviewer_binding_from_env, validate_reviewer_binding,
+    )
+
+    binding = vars(agent).get("_kanban_reviewer_binding")
+    scoped = _REVIEWER.get()
+    session_binding = getattr(vars(agent).get("_codex_session"), "__dict__", {}).get("_reviewer_binding")
+    current = reviewer_binding_from_env()
+    if binding is None:
+        if current is not None or scoped is not None or session_binding is not None:
+            raise ValueError("Reviewer turn binding missing")
+        return None
+    validate_reviewer_binding(binding)
+    if (binding != current or binding != scoped
+            or (session_binding is not None and binding != session_binding)
+            or binding.session_id != agent.session_id
+            or agent.api_mode != "codex_app_server"):
+        raise ValueError("Reviewer turn binding or runtime changed")
+    return binding
+
+
 def _str_attr(agent: Any, name: str) -> str:
     """``getattr(agent, name, "") or ""`` — route facts read off partial agents/doubles."""
     return getattr(agent, name, "") or ""
@@ -1044,7 +1071,9 @@ def build_turn_context(
     Order matters: the DB session row is created only AFTER the system prompt is built
     (else it persists system_prompt=NULL and costs a cache miss) and BEFORE preflight
     compression."""
-    from agent.turn_context_compaction import run_turn_start_compaction
+    from agent.turn_context_compaction import CompactionOutcome, run_turn_start_compaction
+
+    reviewer = reviewer_turn_binding(agent) is not None
 
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
@@ -1055,7 +1084,7 @@ def build_turn_context(
 
     # Recover a rotated session before binding log/turn ids or copying client history so
     # everything in this turn belongs to the canonical child.
-    recovered_history = recover_rotated_compression_session(agent)
+    recovered_history = None if reviewer else recover_rotated_compression_session(agent)
     if recovered_history is not None:
         conversation_history = recovered_history
 
@@ -1070,9 +1099,11 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
-    agent._restore_primary_runtime()
+    if not reviewer:
+        agent._restore_primary_runtime()
     _publish_runtime_main(agent)
-    _refresh_mcp_tools_between_turns(agent)
+    if not reviewer:
+        _refresh_mcp_tools_between_turns(agent)
 
     if isinstance(user_message, str):
         user_message = sanitize_surrogates(user_message)
@@ -1123,8 +1154,9 @@ def build_turn_context(
 
     # Preserve the original user message (no nudge injection).
     original_user_message = persist_user_message if persist_user_message is not None else user_message
-    should_review_memory = _tick_memory_nudge(agent)
-    _emit_reaction(agent, original_user_message, persist_user_display_kind)
+    should_review_memory = False if reviewer else _tick_memory_nudge(agent)
+    if not reviewer:
+        _emit_reaction(agent, original_user_message, persist_user_display_kind)
 
     if not agent.quiet_mode:
         agent._safe_print(
@@ -1136,13 +1168,16 @@ def build_turn_context(
     if agent._cached_system_prompt is None:
         restore_or_build_system_prompt(agent, system_message, conversation_history)
     active_system_prompt = agent._cached_system_prompt
+    if reviewer and (not isinstance(active_system_prompt, str) or not active_system_prompt.strip()):
+        raise ValueError("Reviewer prompt context unavailable")
 
     # Bot Mode DM tool — injected ONLY into a bot's canonical "Bot Chat" session (same
     # gate as the protocol section); gate is session-stable, so cache-safe.
     try:
         from tools.bot_mode_dm import ensure_message_agent_tool
 
-        ensure_message_agent_tool(agent)
+        if not reviewer:
+            ensure_message_agent_tool(agent)
     except Exception:
         logger.debug("message_agent injection skipped", exc_info=True)
 
@@ -1159,7 +1194,9 @@ def build_turn_context(
     ):
         agent._flush_messages_to_session_db(conversation_history, conversation_history)
 
-    compaction = run_turn_start_compaction(
+    compaction = CompactionOutcome(
+        messages, active_system_prompt, conversation_history, current_turn_user_idx,
+    ) if reviewer else run_turn_start_compaction(
         agent, messages=messages, system_message=system_message,
         active_system_prompt=active_system_prompt, conversation_history=conversation_history,
         current_turn_user_idx=current_turn_user_idx, user_message=user_message,
@@ -1170,7 +1207,7 @@ def build_turn_context(
     conversation_history = compaction.conversation_history
     current_turn_user_idx = compaction.current_turn_user_idx
 
-    plugin_user_context = _collect_pre_llm_call_context(
+    plugin_user_context = "" if reviewer else _collect_pre_llm_call_context(
         agent, effective_task_id=effective_task_id, turn_id=turn_id,
         original_user_message=original_user_message, messages=messages,
         conversation_history=conversation_history,
@@ -1183,12 +1220,13 @@ def build_turn_context(
     )
 
     _bind_interrupt_scope(agent, ra)
-    ext_prefetch_cache = _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
+    ext_prefetch_cache = "" if reviewer else _memory_turn_start_and_prefetch(agent, original_user_message, turn_author)
 
     # Title the session now: titling depends only on the user's ask (before any injected
     # context lands on list content), so it runs concurrently with the turn. Daemon thread,
     # no-op once titled; it ensures the session row itself.
-    _maybe_title_session_at_turn_start(agent, messages, title_user_message)
+    if not reviewer:
+        _maybe_title_session_at_turn_start(agent, messages, title_user_message)
 
     # Sidecar skipped for codex_app_server/MoA; list content carries its context as a part in every mode.
     if 0 <= current_turn_user_idx < len(messages) and messages[current_turn_user_idx].get("role") == "user":

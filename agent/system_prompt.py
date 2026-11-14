@@ -115,6 +115,9 @@ def _frozen_plugin_prompt_sections(agent: Any) -> tuple:
     A restored ``_cached_system_prompt`` is parsed instead of re-running plugin
     code; a render that raises at a rebuild boundary keeps the previous bytes
     (stashed by ``invalidate_system_prompt``) instead of silently vanishing."""
+    from agent.turn_context import reviewer_turn_binding
+    if reviewer_turn_binding(agent) is not None:
+        return ()
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         return agent._plugin_system_prompt_sections_snapshot
     stored_prompt = getattr(agent, "_cached_system_prompt", None)
@@ -517,6 +520,9 @@ def _memory_parts(agent: Any) -> list[str]:
     """Built-in memory/USER.md blocks plus the external provider block (gated on
     the same check ``inject_memory_provider_tools`` uses, so we never advertise
     tools the toolset config gated off)."""
+    from agent.turn_context import reviewer_turn_binding
+    if reviewer_turn_binding(agent) is not None:
+        return []
     parts: list[str] = []
     if agent._memory_store:
         for enabled, kind in ((agent._memory_enabled, "memory"), (agent._user_profile_enabled, "user")):

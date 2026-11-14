@@ -752,6 +752,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     Mutates ``agent._cached_system_prompt`` and persists a freshly-built prompt on first
     build. Row states ``missing``/``null``/``empty``/``present`` are logged and DB
     failures log at WARNING so silent prefix-cache misses show in ``agent.log``."""
+    from agent.turn_context import reviewer_turn_binding
+    reviewer = reviewer_turn_binding(agent) is not None
     stored_prompt = None
     stored_state = "missing"
     session_row = None
@@ -862,7 +864,7 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     note_inert_pinned_tools(agent, built_for_this_surface)
 
     # Persistence-disabled forks share their parent's session ID and are not real sessions.
-    if not getattr(agent, "_persist_disabled", False):
+    if not reviewer and not getattr(agent, "_persist_disabled", False):
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -876,7 +878,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # session open, so this is idempotent (skips when _credits_state exists). Fail-open.
     try:
         from agent.credits_tracker import seed_credits_at_session_start
-        seed_credits_at_session_start(agent)
+        if not reviewer:
+            seed_credits_at_session_start(agent)
     except Exception:
         logger.debug("cold-start credits seed failed (fail-open)", exc_info=True)
 
@@ -1552,6 +1555,34 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _prepare_turn_runtime(agent, user_message, moa_config, persist_user_message, conversation_history):
+    """Keep generic route refresh outside the original, live-bound Reviewer turn."""
+    from agent.turn_context import reviewer_turn_binding
+    reviewer = reviewer_turn_binding(agent) is not None
+    if reviewer and moa_config:
+        raise ValueError("Reviewer cannot use a generic MoA route")
+    if moa_config is None and not reviewer:
+        user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
+            user_message, persist_user_message
+        )
+
+    # The gateway caches agents across turns; compression state is per-turn, or a stale
+    # in-place boundary would make a later uncompressed result look compacted.
+    agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
+    agent._last_compression_attempt_in_place = None
+    begin_fast_mode_turn(agent, conversation_history)
+
+    # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
+    # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
+    try:
+        if not reviewer:
+            agent._try_refresh_env_client_credentials()
+    except Exception:
+        logger.debug("per-turn env credential refresh failed", exc_info=True)
+
+    return user_message, moa_config, persist_user_message, reviewer
+
+
 def _run_conversation_turn(
     agent,
     user_message: Any,
@@ -1579,23 +1610,9 @@ def _run_conversation_turn(
     ``persist_user_display_*``:
     display-only event rendering; the model still receives the message unchanged.
     ``prelude``: scripted tool calls played before the first model call (``agent/turn_scripted_prelude.py``)."""
-    if moa_config is None:
-        user_message, moa_config, persist_user_message = _decode_inline_moa_turn(
-            user_message, persist_user_message
-        )
-
-    # The gateway caches agents across turns; compression state is per-turn, or a stale
-    # in-place boundary would make a later uncompressed result look compacted.
-    agent._last_compaction_in_place = agent._last_compression_attempt_recorded = False
-    agent._last_compression_attempt_in_place = None
-    begin_fast_mode_turn(agent, conversation_history)
-
-    # Adopt ~/.hermes/.env credential/base-url edits made since the last turn — a
-    # Settings save updates .env, not this worker's client (#67821). No-op if unchanged.
-    try:
-        agent._try_refresh_env_client_credentials()
-    except Exception:
-        logger.debug("per-turn env credential refresh failed", exc_info=True)
+    user_message, moa_config, persist_user_message, reviewer = _prepare_turn_runtime(
+        agent, user_message, moa_config, persist_user_message, conversation_history,
+    )
 
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
@@ -1623,7 +1640,8 @@ def _run_conversation_turn(
     # Voice turns may run on auxiliary.voice_chat: bound after the prompt/row/compaction were settled
     # against the main model, undone in finalize_turn (and run_conversation's finally on early exits).
     from agent.voice_turn_route import begin_voice_turn_route
-    _ctx.active_system_prompt = begin_voice_turn_route(agent, _ctx.messages, _ctx.active_system_prompt)
+    if not reviewer:
+        _ctx.active_system_prompt = begin_voice_turn_route(agent, _ctx.messages, _ctx.active_system_prompt)
 
     # Per-turn agent state (the gateway caches agents across turns, so none of this may
     # leak into the next message): interim-commentary dedup spans the whole turn but not

@@ -338,7 +338,7 @@ def execute(frame, channel):
     agent = None
     try:
         with policy_scope(policy):
-            agent = _construct_agent(frame, AIAgent, model=policy.model, provider=policy.provider, base_url=policy.base_url,
+            agent = _construct_agent(frame, AIAgent, model=policy.model, **_agent_runtime_route(frame, policy), base_url=policy.base_url,
                 api_key=frame['api_key'], session_db=store, session_id=scope['session_id'],
                 enabled_toolsets=list(policy.toolsets), max_iterations=policy.max_turns,
                 # A delegated child needs its own owner-registered execution, which this single-turn
@@ -397,6 +397,31 @@ def execute(frame, channel):
         if agent is not None:
             retire_agent(agent)
         store.close()
+
+
+def _agent_runtime_route(frame, policy):
+    """Resolve dialect/adapter in the frozen scope, never replace the owner's authority."""
+    config = policy.config().get('model') or {}
+    if not isinstance(config, dict) or config.get('openai_runtime') != 'codex_app_server':
+        return {'provider': policy.provider}
+    from hermes_cli.route_identity import normalize_route_base_url
+    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider_custom import _get_named_custom_provider
+    requested = policy.provider
+    if not requested or not policy.base_url or not policy.model:
+        raise ValueError('managed_worker_route_mismatch')
+    named = _get_named_custom_provider(requested, config=policy.config(), resolve_credentials=False)
+    route = resolve_runtime_provider(requested=requested, target_model=policy.model,
+                                     explicit_base_url=policy.base_url, explicit_api_key=frame['api_key'])
+    source = route.get('source') or ''
+    if (route.get('provider') != ('custom' if named else requested)
+            or route.get('requested_provider') != requested or route.get('api_mode') != 'codex_app_server'
+            or normalize_route_base_url(route.get('base_url')) != normalize_route_base_url(policy.base_url)
+            or not source or source == 'fallback'
+            or (named and source != f"custom_provider:{named.get('name', requested)}")
+            or (route.get('model') and route['model'] != policy.model)):
+        raise ValueError('managed_worker_route_mismatch')
+    return {key: route[key] for key in ('provider', 'requested_provider', 'api_mode')}
 
 
 def _construct_agent(frame, factory, **kwargs):

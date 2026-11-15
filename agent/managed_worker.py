@@ -402,23 +402,30 @@ def execute(frame, channel):
 def _agent_runtime_route(frame, policy):
     """Resolve dialect/adapter in the frozen scope, never replace the owner's authority."""
     config = policy.config().get('model') or {}
-    if not isinstance(config, dict) or config.get('openai_runtime') != 'codex_app_server':
+    if not isinstance(config, dict) or str(config.get('openai_runtime') or '').strip().lower() != 'codex_app_server':
         return {'provider': policy.provider}
     from hermes_cli.route_identity import normalize_route_base_url
-    from hermes_cli.runtime_provider import resolve_runtime_provider
+    from hermes_cli.runtime_provider import (
+        _maybe_apply_codex_app_server_runtime, expand_direct_api_alias,
+        resolve_requested_provider, resolve_runtime_provider,
+    )
     from hermes_cli.runtime_provider_custom import _get_named_custom_provider
     requested = policy.provider
     if not requested or not policy.base_url or not policy.model:
         raise ValueError('managed_worker_route_mismatch')
-    named = _get_named_custom_provider(requested, config=policy.config(), resolve_credentials=False)
+    alias = resolve_requested_provider(requested)
+    canonical, _ = expand_direct_api_alias(alias, policy.base_url)
+    named = _get_named_custom_provider(alias, config=policy.config(), resolve_credentials=False)
     route = resolve_runtime_provider(requested=requested, target_model=policy.model,
                                      explicit_base_url=policy.base_url, explicit_api_key=frame['api_key'])
-    source = route.get('source') or ''
-    if (route.get('provider') != ('custom' if named else requested)
-            or route.get('requested_provider') != requested or route.get('api_mode') != 'codex_app_server'
-            or normalize_route_base_url(route.get('base_url')) != normalize_route_base_url(policy.base_url)
-            or not source or source == 'fallback'
-            or (named and source != f"custom_provider:{named.get('name', requested)}")
+    provider = 'custom' if named else canonical
+    source = f"custom_provider:{named.get('name', alias)}" if named else 'direct-alias' if canonical == 'custom' else 'explicit'
+    identity = (route.get('provider'), route.get('requested_provider'),
+                normalize_route_base_url(route.get('base_url')), route.get('source'))
+    expected = (provider, canonical, normalize_route_base_url(policy.base_url), source)
+    mode = _maybe_apply_codex_app_server_runtime(provider=provider, api_mode=route.get('api_mode') or '',
+                                                model_cfg=config, requested_provider=alias)
+    if (identity != expected or not mode or route.get('api_mode') != mode
             or (route.get('model') and route['model'] != policy.model)):
         raise ValueError('managed_worker_route_mismatch')
     return {key: route[key] for key in ('provider', 'requested_provider', 'api_mode')}

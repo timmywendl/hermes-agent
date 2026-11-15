@@ -138,7 +138,8 @@ print(json.dumps({'built': captured, 'error': error}))
 '''
 
 
-def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missing=False):
+def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missing=False,
+                       kind=None, runtime='codex_app_server'):
     frame, _ = assignment(tmp_path, monkeypatch)
     endpoint = 'http://127.0.0.1:9/v1' if codex else 'https://api.openai.com/v1'
     provider = 'codex_local_access' if codex else 'openai'
@@ -146,8 +147,12 @@ def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missi
     config['model'] = {'default': 'gpt-6-luna', 'provider': provider, 'base_url': endpoint,
                        'api_mode': 'codex_responses' if codex else 'chat_completions'}
     if codex:
-        config['model']['openai_runtime'] = 'codex_app_server'
+        config['model']['openai_runtime'] = runtime
         config['providers'] = {'codex_local_access': {'base_url': endpoint, 'api_mode': 'codex_responses'}}
+    if kind:
+        config.pop('providers', None)
+        config['model'].update(provider=kind, base_url='https://api.openai.com/v1' if kind == 'openai'
+                               else 'https://api.anthropic.com')
     if missing:
         config['model'].pop('provider')
     frame = {**frame, 'api_key': 'frozen-fixture-key', 'ignore_user_config': False,
@@ -193,3 +198,23 @@ def test_execute_never_adopts_a_new_resolver_credential(tmp_path, monkeypatch):
     result = frozen_constructor(tmp_path, monkeypatch, corrupt=('api_key', 'new-unapproved-fixture-key'))
     assert result['error'] is None
     assert result['built']['api_key'] == 'frozen-fixture-key'
+
+
+@pytest.mark.parametrize('kind, provider, requested, mode, endpoint', [
+    ('openai', 'custom', 'custom', 'codex_app_server', 'https://api.openai.com/v1'),
+    ('anthropic', 'anthropic', 'anthropic', 'anthropic_messages', 'https://api.anthropic.com'),
+])
+def test_execute_keeps_original_alias_and_non_codex_overlay_semantics(
+        tmp_path, monkeypatch, kind, provider, requested, mode, endpoint):
+    result = frozen_constructor(tmp_path, monkeypatch, kind=kind)
+    assert result['error'] is None
+    assert result['built'] == {'provider': provider, 'requested_provider': requested, 'api_mode': mode,
+                               'base_url': endpoint, 'api_key': 'frozen-fixture-key', 'model': 'gpt-6-luna'}
+
+
+def test_execute_accepts_the_original_normalized_runtime_setting(tmp_path, monkeypatch):
+    result = frozen_constructor(tmp_path, monkeypatch, runtime=' CODEX_APP_SERVER ')
+    assert result['error'] is None
+    assert result['built']['provider'] == 'custom'
+    assert result['built']['requested_provider'] == 'codex_local_access'
+    assert result['built']['api_mode'] == 'codex_app_server'

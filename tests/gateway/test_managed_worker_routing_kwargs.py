@@ -138,7 +138,7 @@ print(json.dumps({'built': captured, 'error': error}))
 '''
 
 
-def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missing=False,
+def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missing=False, stale=False,
                        kind=None, runtime='codex_app_server'):
     frame, _ = assignment(tmp_path, monkeypatch)
     endpoint = 'http://127.0.0.1:9/v1' if codex else 'https://api.openai.com/v1'
@@ -155,6 +155,8 @@ def frozen_constructor(tmp_path, monkeypatch, *, codex=True, corrupt=None, missi
                                else 'https://api.anthropic.com')
     if missing:
         config['model'].pop('provider')
+    if stale:
+        config.pop('providers', None)
     frame = {**frame, 'api_key': 'frozen-fixture-key', 'ignore_user_config': False,
              'policy': {**frame['policy'], 'model': 'gpt-6-luna', 'ignore_user_config': False,
                         'config_json': json.dumps(config)}}
@@ -202,7 +204,8 @@ def test_execute_never_adopts_a_new_resolver_credential(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('kind, provider, requested, mode, endpoint', [
     ('openai', 'custom', 'custom', 'codex_app_server', 'https://api.openai.com/v1'),
-    ('anthropic', 'anthropic', 'anthropic', 'anthropic_messages', 'https://api.anthropic.com'),
+    ('anthropic', 'anthropic', None, None, 'https://api.anthropic.com'),
+    ('claude', 'claude', None, None, 'https://api.anthropic.com'),
 ])
 def test_execute_keeps_original_alias_and_non_codex_overlay_semantics(
         tmp_path, monkeypatch, kind, provider, requested, mode, endpoint):
@@ -218,3 +221,17 @@ def test_execute_accepts_the_original_normalized_runtime_setting(tmp_path, monke
     assert result['built']['provider'] == 'custom'
     assert result['built']['requested_provider'] == 'codex_local_access'
     assert result['built']['api_mode'] == 'codex_app_server'
+
+
+def test_ineligible_provider_keeps_original_construction_without_resolving_mode(tmp_path, monkeypatch):
+    result = frozen_constructor(tmp_path, monkeypatch, kind='anthropic',
+                                corrupt=('api_mode', 'codex_app_server'))
+    assert result['error'] is None
+    assert result['built']['provider'] == 'anthropic'
+    assert result['built']['requested_provider'] is None
+    assert result['built']['api_mode'] is None
+
+
+def test_missing_named_entry_cannot_fall_back_to_another_provider(tmp_path, monkeypatch):
+    result = frozen_constructor(tmp_path, monkeypatch, stale=True)
+    assert result == {'built': {}, 'error': 'managed_worker_route_mismatch'}

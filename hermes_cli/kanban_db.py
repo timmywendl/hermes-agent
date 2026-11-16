@@ -4030,16 +4030,19 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining decomposition identity until task deletion.
+    """Prune old done/archived events, retaining creation lineage for each task's lifetime.
 
-    ``older_than_seconds=0`` means everything older than now; the CLI maps
+    ``created`` and ``decomposed`` rows carry creator/decomposition identity and are
+    kept until their owning task is deleted; every other eligible event expires by
+    age. ``older_than_seconds=0`` means everything older than now; the CLI maps
     ``--event-retention-days 0`` to "disabled" before calling this.
     """
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind != 'decomposed' AND task_id IN "
-            "(SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
+            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed') "
+            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))",
+            (cutoff,),
         )
     return int(cur.rowcount or 0)
 

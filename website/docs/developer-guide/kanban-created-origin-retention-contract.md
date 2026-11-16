@@ -237,6 +237,14 @@ existing public API:
 kb.add_comment(conn, root, "probe", "ordinary history")
 ```
 
+Call it between the existing link assertions and the existing
+`with kb.write_txn(conn)` block, before `task_events.created_at=0`. It is an
+existing public API already used in tests
+(`tests/hermes_cli/test_kanban_db.py:691`), opens its own write transaction and
+requires only an existing task and non-empty author/body. It writes exactly one
+`commented` event; do not call it inside the existing `write_txn` and do not wrap
+`gc_events` in a transaction.
+
 The existing `assert kb.gc_events(conn, older_than_seconds=1) > 0` remains. The
 test additionally asserts:
 
@@ -251,8 +259,12 @@ test additionally asserts:
 | `test_completed_decomposition_survives_retriage` | RED: `created == 1` fails because GC deletes it | GREEN: `commented` collected; `created`/`decomposed` 1; repeated GC 0 and stable; retry protection intact |
 
 `task_comments` rows are not deleted by `gc_events`; the assertion is about the
-event record, not the comment row. This adds one existing test file, not a new
-file. See the [Human decision
+event record, not the comment row. `task_runs` is empty in this fixture, so the
+Task/Run snapshot is explicitly asserted as unchanged (0 runs). The
+non-production `evals/kanban_graph_identity.py` ignores the `gc_events` return
+value; after the change its sweep is a no-op for the structural-only fixture. It
+needs no adjustment and is not a fifth file. This adds one existing test file,
+not a new file. See the [Human decision
 comment](https://github.com/timmywendl/hermes-agent/pull/5#issuecomment-6910451008).
 
 ## 9. Implementation whitelist (future Human APPLY only)

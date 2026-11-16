@@ -160,3 +160,24 @@ def test_codex_sidecar_refuses_invalid_or_authority_fields_atomically(tmp_path, 
                             ('worker',))[0] == 0
     finally:
         db.close()
+
+
+@pytest.mark.parametrize('thread_id', ['valid-thread', True, None])
+def test_codex_binding_is_not_an_archive_patch_permission(tmp_path, thread_id):
+    db = SessionDB(tmp_path / 'state.db')
+    try:
+        db.create_session('owned', 'kanban', model_config={'codex_thread_id': 'retained'})
+        epoch = begin_runtime_epoch(db, instance_id='fixture')
+        scope = dict(epoch=epoch, execution_id='worker', session_id='owned', generation=0)
+        register_worker_execution(db, **scope, kind='compute', adoption_secret='fixture-secret')
+        with pytest.raises(Exception, match='invalid_params'):
+            mutate_worker_execution(db, **scope, sequence=1, operation='compression.archive', payload={
+                'messages': [{'role': 'assistant', 'content': 'summary'}],
+                'model_config_patch': {'codex_thread_id': thread_id},
+                'watermark': None, 'lock_holder': None, 'tail_count': 0})
+        assert db.get_session_model_config_value('owned', 'codex_thread_id') == 'retained'
+        assert db.get_messages('owned') == []
+        assert db._read_one('SELECT last_sequence FROM worker_executions WHERE execution_id=?',
+                            ('worker',))[0] == 0
+    finally:
+        db.close()

@@ -171,6 +171,104 @@ def test_created_origin_survives_repeated_gc(conn):
     _assert_created_origin(conn, item, root)
 
 
+def test_created_origin_full_payload_survives_first_positive_gc(conn, tmp_path):
+    """The complete created row/payload survives the FIRST positive-window sweep.
+
+    The repeated-GC snapshot above is taken after the first sweep, so it cannot
+    prove that sweep left every populated metadata value byte-for-byte intact.
+    This fixture carries representative non-default metadata, snapshots the whole
+    event row and decoded payload *before* the first GC, and compares both after.
+    """
+    root = kb.create_task(conn, title="root")
+    workspace = tmp_path / "creator-origin-worktree"
+    workspace.mkdir()
+    item = kb.create_task(
+        conn,
+        title="metadata-rich work item",
+        creator_task_id=root,
+        parents=(),
+        assignee="Retention-Probe",  # stored canonical lowercase
+        tenant="tenant-probe",
+        workspace_kind="worktree",
+        workspace_path=str(workspace),
+        branch_name="wt/retention-probe",
+        skills=("retention-probe-skill-a", "retention-probe-skill-b"),
+        goal_mode=True,
+        model_override="probe-model",
+        provider_override="probe-provider",
+    )
+    assert kb.claim_task(conn, item) is not None
+    run_id = kb.get_task(conn, item).current_run_id
+    assert run_id is not None
+    assert kb.complete_task(conn, item, result="finished", expected_run_id=run_id)
+    kb.add_comment(conn, item, "probe", "ordinary history")
+    _age_events(conn, item)
+
+    # Before the first sweep: the whole row (not a key set) and decoded payload.
+    created_row = _created_event(conn, item)
+    created_before = tuple(created_row)
+    payload_before = _created_payload(conn, item)
+    # The row was inside the sweep window (aging set every event's created_at=0).
+    assert created_row["created_at"] == 0
+
+    # The fixture must really exercise representative non-default metadata,
+    # not merely compare two equally empty payloads.
+    assert set(payload_before) == CREATED_PAYLOAD_KEYS
+    assert payload_before["creator_task_id"] == root
+    assert payload_before["status"] == "ready"
+    assert payload_before["parents"] == []
+    assert payload_before["project_id"] is None
+    assert payload_before["assignee"] == "retention-probe"
+    assert payload_before["tenant"] == "tenant-probe"
+    assert payload_before["workspace_kind"] == "worktree"
+    assert payload_before["workspace_path"] == str(workspace)
+    assert payload_before["branch_name"] == "wt/retention-probe"
+    assert payload_before["skills"] == [
+        "retention-probe-skill-a",
+        "retention-probe-skill-b",
+    ]
+    assert payload_before["goal_mode"] is True
+    assert payload_before["model_override"] == "probe-model"
+    assert payload_before["provider_override"] == "probe-provider"
+    task = kb.get_task(conn, item)
+    assert (
+        task.assignee,
+        task.tenant,
+        task.workspace_kind,
+        task.workspace_path,
+        task.branch_name,
+        task.skills,
+        task.goal_mode,
+        task.model_override,
+        task.provider_override,
+    ) == (
+        "retention-probe",
+        "tenant-probe",
+        "worktree",
+        str(workspace),
+        "wt/retention-probe",
+        ["retention-probe-skill-a", "retention-probe-skill-b"],
+        True,
+        "probe-model",
+        "probe-provider",
+    )
+
+    ordinary_before = _event_counts(conn, item)
+    assert {"created", "claimed", "completed", "commented"} <= set(ordinary_before)
+    ordinary = sum(
+        count for kind, count in ordinary_before.items() if kind not in ("created", "decomposed")
+    )
+    assert ordinary > 0
+
+    # First positive-window sweep: it really prunes ordinary history on this
+    # done Task, so the created row below is retained rather than out of scope.
+    assert kb.gc_events(conn, older_than_seconds=1) == ordinary
+
+    assert tuple(_created_event(conn, item)) == created_before
+    assert _created_payload(conn, item) == payload_before
+    assert _event_counts(conn, item) == {"created": 1}
+
+
 def test_created_origin_survives_zero_window(conn):
     root = kb.create_task(conn, title="root")
     item = _completed_work_item(conn, creator_task_id=root)

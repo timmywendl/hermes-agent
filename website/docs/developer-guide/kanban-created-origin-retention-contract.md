@@ -32,10 +32,21 @@ workspace_path, branch_name, project_id, skills, goal_mode,
 model_override, provider_override
 ```
 
-`creator_task_id` is copied by `inherit_creator_origin()` inside the same
-transaction (`hermes_cli/kanban_db_graph.py:8`; called at
-`hermes_cli/kanban_db.py:1343`). It inherits session/subscription origin and
-adds **no** `task_links` row when `parents=()`.
+`create_task()` writes the supplied `creator_task_id` directly into the
+`created` event payload through `_append_event(...)` inside the Task creation
+transaction (`hermes_cli/kanban_db.py:1304-1324`; key at `:1312`). The payload
+key is always present but its value is `null` when the caller omits the
+argument. Separately, in the same `write_txn` block, `inherit_creator_origin()`
+(`hermes_cli/kanban_db_graph.py:8`; called at `hermes_cli/kanban_db.py:1343`)
+copies only durable session/subscription origin: it fills `tasks.session_id`
+from the creator via `COALESCE(session_id, creator.session_id)` (an explicit
+child `session_id` wins) and copies the creator's `kanban_notify_subs` rows. It
+does **not** write `creator_task_id` and adds no `task_links` row or dependency
+edge. With `parents=()`, `_link()` is never called, so no dependency edge
+exists; a blocked Root therefore does not gate the Work Item. There is no
+creator existence/status validation: a missing creator leaves the session
+unchanged and copies no subscriptions, while the payload still records the
+supplied string.
 
 `gc_events()` currently deletes every event older than the cutoff for
 `done`/`archived` Tasks except `decomposed`
@@ -103,7 +114,7 @@ all of its events. Separately decompose a triage Root and age its events.
 | `gc_events(older_than_seconds=0)` on an aged `done` fixture | `created` deleted |
 | `_cmd_gc(event_days=0)` | exit 0; `created` retained (sweep disabled) |
 | `_cmd_gc(event_days=-1)` | exit 2; `created` retained |
-| `gc_events(-1)` | `ValueError: older_than_seconds must be >= 0` |
+| `gc_events(older_than_seconds=-1)` | `ValueError: older_than_seconds must be >= 0` |
 
 This is the red state for the retention tests in §8. It is a component-level
 reproduction, not a production observation.
@@ -168,10 +179,12 @@ Task; the guarantee ends at intentional deletion.
 
 - Work Item explicit deletion ends that Work Item's lineage. Do not recreate the
   child, fabricate a Run or tombstone, or infer history from surviving rows.
-- Root explicit deletion leaves surviving children whose
-  `created.payload.creator_task_id` points to an absent Task. That is a dangling
-  reference. It must be reported UNKNOWN/orphan and never rebound to another
-  Root or treated as recovered continuity.
+- Root explicit deletion leaves surviving children created through the
+  creator-origin path whose `created.payload.creator_task_id` points to an
+  absent Task. (Decomposition children record `from_decompose_of`, not
+  `creator_task_id`.) That is a dangling reference. It must be reported
+  UNKNOWN/orphan and never rebound to another Root or treated as recovered
+  continuity.
 - Same-key deduplication/recovery across hard deletion is not guaranteed. A
   later creation with the same key is a new identity (`CREATED`), not a
   `RECOVERED` one.
@@ -199,8 +212,9 @@ Task; the guarantee ends at intentional deletion.
 
 All tests are behavior tests on disposable `HERMES_HOME` boards. They must use
 `scripts/run_tests.sh`, must not write `~/.hermes/`, and must not read source
-text. Current-main status is the expected red/green baseline; no test result is
-claimed as already green.
+text. Current-main status is the expected red/green baseline; no new or
+fix-dependent test is claimed as already green. The "expected PASS" rows are
+planned regressions.
 
 New coverage in `tests/hermes_cli/test_kanban_creator_origin.py`:
 
@@ -241,8 +255,9 @@ kb.add_comment(conn, root, "probe", "ordinary history")
 Call it between the existing link assertions and the existing
 `with kb.write_txn(conn)` block, before `task_events.created_at=0`. It is an
 existing public API already used in tests
-(`tests/hermes_cli/test_kanban_db.py:691`), opens its own write transaction and
-requires only an existing task and non-empty author/body. It writes exactly one
+(`tests/hermes_cli/test_kanban_db.py:691`), uses
+`write_txn(conn, allow_nested=True)` and requires only an existing task and
+non-empty author/body. It writes exactly one
 `commented` event; do not call it inside the existing `write_txn` and do not wrap
 `gc_events` in a transaction.
 

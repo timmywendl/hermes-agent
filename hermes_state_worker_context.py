@@ -4,13 +4,14 @@ Identity and lineage remain owner-reserved. This is not arbitrary SessionDB RPC.
 """
 import json
 
-from hermes_state_runtime import RuntimeStoreError
+from hermes_state_runtime import RuntimeStoreError, _text
 
 
 # model_config sidecars a worker may patch: every key the agent persists via
 # ``patch_session_model_config`` (``_anthropic_rejected_thinking``: main's rejected-signature
 # fingerprints, agent/anthropic_thinking_replay.py) or a compaction ``model_config_patch``.
-SIDECAR_KEYS = frozenset({'_usage_anchor', '_proactive_prune_rearm_tokens', '_anthropic_rejected_thinking'})
+SIDECAR_KEYS = frozenset({'_usage_anchor', '_proactive_prune_rearm_tokens', '_anthropic_rejected_thinking',
+                          'codex_thread_id'})
 
 
 def worker_context(db, conn, session_id, payload):
@@ -39,6 +40,10 @@ def worker_prompt(db, conn, session_id, payload):
 def worker_sidecars(db, conn, session_id, payload):
     if set(payload) != {'patch'} or not isinstance(payload['patch'], dict) or set(payload['patch']) - SIDECAR_KEYS:
         raise RuntimeStoreError('invalid_params')
+    # Codex's existing resume reference is metadata, never execution authority.
+    thread_id = payload['patch'].get('codex_thread_id')
+    if thread_id is not None:
+        _text(thread_id)
     merged = db._merge_model_config_json(conn, session_id, payload['patch'], on_missing='raise')
     conn.execute('UPDATE sessions SET model_config=? WHERE id=?', (merged, session_id))
     return {'value': None}

@@ -221,9 +221,10 @@ Adjustments in `tests/hermes_cli/test_kanban_gc_retention.py`:
 - The positive-window case in `test_cmd_gc_retention_bounds` currently asserts
   `(_event_rows(conn, tid) > 0) is expect_kept` with `expect_kept=False`
   (`tests/hermes_cli/test_kanban_gc_retention.py:89`), i.e. all events for the
-  fixture disappear. After the fix, `created` remains. Split the assertion into:
-  ordinary event count `0`, `created` count `1`, Task/Run rows unchanged. Keep
-  the existing workspace/log ordering assertions.
+  fixture disappear. After the fix, `created` remains. Add one ordinary event to
+  the aged fixture (e.g. `kb.add_comment`) and split the assertion into: ordinary
+  event count `0`, `created` count `1`, Task/Run rows unchanged. Keep the
+  existing workspace/log ordering assertions.
 - Negative-window, library-zero, CLI-zero, slash-command, workspaces-root and
   shared-scratch tests must remain green without weakening their protections.
 

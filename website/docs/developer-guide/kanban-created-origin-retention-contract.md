@@ -6,8 +6,9 @@ description: "Task-lifetime retention of structural created/decomposed Kanban ev
 # Kanban created-origin retention contract
 
 **Package:** `HERMES_CREATED_ORIGIN_RETENTION_V1`
-**Status:** Source Ready design contract. Design only; no runtime or test change in this PR.
+**Status:** `DESIGN_ONLY` — Source Ready review pending; no runtime, test, Schema or production change in this PR.
 **Base main:** `24099ef7bfb348757fb02f6d11d9196734ebca1e`
+**Human decisions:** `DATA_RETENTION = ACCEPTED`; `GRAPH_TEST_SCOPE = OPTION_A_ACCEPTED` (2026-11-16, [decision comment](https://github.com/timmywendl/hermes-agent/pull/5#issuecomment-6910451008)).
 **Audience:** Kanban maintainers, reviewers, and the implementer of the future authorized native package.
 **Runtime APPLY:** not authorized. **Human APPLY:** not granted.
 
@@ -133,7 +134,7 @@ on JSON1 parsing or on a non-null `creator_task_id` would reintroduce malformed-
 payload and legacy dependence, and would not preserve ordinary `created`
 records.
 
-## 5. Retention impact — Human decision required
+## 5. Retention impact — Human decision accepted
 
 This change extends the lifetime of the **full existing `created` payload** from
 the ordinary age window to the owning Task's lifetime. It is not just
@@ -141,14 +142,19 @@ the ordinary age window to the owning Task's lifetime. It is not just
 in §1 (assignee, workspace kind/path, branch, project, tenant, skills, model and
 provider overrides, goal mode).
 
+**Human decision (2026-11-16):** ACCEPTED. The Human explicitly accepts
+Task-lifetime retention of the full existing `created` payload until explicit
+deletion of its owning Task. See the [decision
+comment](https://github.com/timmywendl/hermes-agent/pull/5#issuecomment-6910451008).
+
 - Growth is **one structural row per Task**, plus pre-existing `decomposed`
   rows and pre-existing anomalous duplicates. It is not retention of the whole
   event stream.
 - The retained values are the values already written today; this change does not
   add fields or collect new data.
 - Workspace paths and tenant/model/provider metadata may be operationally
-  sensitive. Task-lifetime retention of that payload is a Human data-retention
-  decision, not an automatic consequence of this contract.
+  sensitive. Task-lifetime retention of that payload is now an accepted Human
+  data-retention decision, not an automatic consequence of this contract.
 - The implementation must not claim that already-collected history is restored.
   Only future GC behavior changes.
 
@@ -205,53 +211,53 @@ New coverage in `tests/hermes_cli/test_kanban_creator_origin.py`:
 | `test_created_origin_survives_repeated_gc` | RED | GREEN: repeated sweeps leave `created`/Task/Run unchanged |
 | `test_created_origin_survives_zero_window` | RED | GREEN: library `0` still sweeps ordinary events, retains `created` |
 | `test_ordinary_events_expire_while_created_remains` | RED | GREEN: ordinary event count falls to 0; `created` remains 1 |
-| `test_task_and_run_rows_unchanged_by_gc` | PASS (regression) | PASS unchanged |
-| `test_explicit_work_item_delete_removes_created` | PASS (regression) | PASS unchanged |
-| `test_root_delete_leaves_dangling_creator_id` | PASS (regression) | PASS unchanged; no rebinding |
-| `test_creator_origin_has_no_dependency_edge` | PASS (existing) | PASS unchanged |
+| `test_task_and_run_rows_unchanged_by_gc` | new; expected PASS | PASS unchanged |
+| `test_explicit_work_item_delete_removes_created` | new; expected PASS | PASS unchanged |
+| `test_root_delete_leaves_dangling_creator_id` | new; expected PASS | PASS unchanged; no rebinding |
+| `test_creator_origin_survives_without_dependency_parent` (existing) | PASS (existing) | PASS unchanged |
 
 Adjustments in `tests/hermes_cli/test_kanban_gc_retention.py`:
 
 - The positive-window case in `test_cmd_gc_retention_bounds` currently asserts
-  that all events disappear (`_event_rows(tid) == 0`). After the fix, `created`
-  remains. Split the assertion into: ordinary event count `0`, `created` count
-  `1`, Task/Run rows unchanged. Keep the existing workspace/log ordering
-  assertions.
+  `(_event_rows(conn, tid) > 0) is expect_kept` with `expect_kept=False`
+  (`tests/hermes_cli/test_kanban_gc_retention.py:89`), i.e. all events for the
+  fixture disappear. After the fix, `created` remains. Split the assertion into:
+  ordinary event count `0`, `created` count `1`, Task/Run rows unchanged. Keep
+  the existing workspace/log ordering assertions.
 - Negative-window, library-zero, CLI-zero, slash-command, workspaces-root and
   shared-scratch tests must remain green without weakening their protections.
 
-### Named test-scope conflict (decision required)
+### Accepted Option A fixture in `tests/hermes_cli/test_kanban_graph_identity.py`
 
-`tests/hermes_cli/test_kanban_graph_identity.py::test_completed_decomposition_survives_retriage`
-asserts `kb.gc_events(conn, older_than_seconds=1) > 0`
-(`tests/hermes_cli/test_kanban_graph_identity.py:28`). Its Root fixture has only
-`created=1` and `decomposed=1`; under the proposed predicate the sweep removes
-**0** rows, so the assertion fails even though both structural events are
-correctly retained. Observed on the same fixture: old predicate removed `1`,
-proposed predicate removes `0`.
+Human accepted Option A on 2026-11-16. The existing disposable Root fixture
+gains one ordinary event before the existing backdate/GC block, using the
+existing public API:
 
-That file is not in the three-file implementation whitelist. The accepted
-retention semantics and "existing graph identity regression remains" cannot both
-hold without one of:
+```python
+kb.add_comment(conn, root, "probe", "ordinary history")
+```
 
-- **A (recommended):** authorize a one-line fixture addition in the existing
-  `tests/hermes_cli/test_kanban_graph_identity.py` (for example, add one
-  ordinary comment event before GC) and assert ordinary removal plus structural
-  retention. This adds no new test file and no runtime file, but it is a fourth
-  existing file.
-- **B:** authorize changing that assertion to inspect ordinary vs structural
-  counts instead of total `> 0`.
-- **C:** explicitly waive the assertion and record reduced coverage. Not
-  recommended.
-- **D:** retain only payload-bearing `created` events. Rejected: it violates the
-  accepted kind-based design, reintroduces JSON dependence, and drops ordinary
-  creation records.
+The existing `assert kb.gc_events(conn, older_than_seconds=1) > 0` remains. The
+test additionally asserts:
 
-`FINAL_SOURCE_READY` remains pending until A, B or C is decided.
+- the `commented` event is collected (ordinary history);
+- `created == 1` and `decomposed == 1` after GC;
+- a repeated GC returns `0` and leaves those structural counts unchanged;
+- the existing re-triage → `decompose_triage_task(...) is None`, task-id set and
+  `PRAGMA integrity_check` protections remain.
+
+| Test | Current main (with the ordinary event) | After fix |
+| --- | --- | --- |
+| `test_completed_decomposition_survives_retriage` | RED: `created == 1` fails because GC deletes it | GREEN: `commented` collected; `created`/`decomposed` 1; repeated GC 0 and stable; retry protection intact |
+
+`task_comments` rows are not deleted by `gc_events`; the assertion is about the
+event record, not the comment row. This adds one existing test file, not a new
+file. See the [Human decision
+comment](https://github.com/timmywendl/hermes-agent/pull/5#issuecomment-6910451008).
 
 ## 9. Implementation whitelist (future Human APPLY only)
 
-Exactly three existing files, no new runtime module or test file:
+Exactly four existing files, no new runtime module or test file:
 
 1. `hermes_cli/kanban_db.py` — only the `gc_events` predicate and docstring.
 2. `tests/hermes_cli/test_kanban_gc_retention.py` — ordinary-vs-structural
@@ -259,19 +265,23 @@ Exactly three existing files, no new runtime module or test file:
 3. `tests/hermes_cli/test_kanban_creator_origin.py` — creator origin across
    done/archive/repeated GC/zero; explicit Work Item delete; dangling Root;
    no dependency edge; no history guessing.
+4. `tests/hermes_cli/test_kanban_graph_identity.py` — accepted Option A
+   ordinary-event fixture; ordinary-event collection; `created`/`decomposed`
+   survival; repeated GC; existing decomposition retry protection.
 
-The graph-identity file in §8 is an unresolved scope question, not an implicit
-fourth file. No Schema, DDL, index, `user_version`, migration, new Store, new
-event kind, dispatcher, cron or dashboard change is proposed.
+No Schema, DDL, index, `user_version`, migration, new Store, new event kind,
+dispatcher, cron or dashboard change is proposed.
 
 User-facing `website/docs/user-guide/features/kanban.md` currently documents
 `decomposed` retention. Updating it to describe retained `created` origin is a
-separately authorized docs change after APPLY, not part of the three-file native
+separately authorized docs change after APPLY, not part of the four-file native
 implementation whitelist.
 
 ## 10. Rollback boundary
 
-- Revert the predicate/test changes; no data migration or backfill is involved.
+- Revert the predicate/docstring and the three test-file changes, including the
+  accepted graph-identity ordinary-event fixture; no data migration or backfill
+  is involved.
 - Rows retained during the change remain until normal explicit deletion; a
   revert does not delete them and must not claim to.
 - After revert, an old GC resumes deleting `created`; stop claiming durable
@@ -295,13 +305,21 @@ authorization.
 
 ## 12. Human decisions and exit criteria
 
-Required before the native APPLY:
+Human decisions recorded on 2026-11-16 ([PR #5 comment
+6910451008](https://github.com/timmywendl/hermes-agent/pull/5#issuecomment-6910451008)):
 
-1. Accept Task-lifetime retention of the full `created` event payload described
-   in §5.
-2. Decide the §8 graph-identity test-scope question (A/B/C).
-3. Authorize the separate native APPLY only after an exact-HEAD Source Ready
-   review.
+1. `DATA_RETENTION = ACCEPTED` — retain the full existing `created` event
+   payload until explicit deletion of its owning Task (§5).
+2. `GRAPH_TEST_SCOPE = OPTION_A_ACCEPTED` — one ordinary event in the existing
+   graph-identity fixture; keep the ordinary-GC assertion; verify `created` and
+   `decomposed` survive; expand the whitelist to four existing files (§8, §9).
+
+Remaining before any native APPLY:
+
+3. Codex independent exact-HEAD review of this contract.
+4. Main Control re-review.
+5. Separate explicit Human APPLY. This document and PR #5 remain `DESIGN_ONLY`;
+   no runtime or test change is authorized now.
 
 `SOURCE_READY` remains `PENDING_MAIN_CONTROL_REVIEW`. This document does not
 authorize code, tests, Schema, production, AI Colleague #140, Hermes #4, K3 or

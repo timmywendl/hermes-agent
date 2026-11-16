@@ -45,8 +45,8 @@ does **not** write `creator_task_id` and adds no `task_links` row or dependency
 edge. With `parents=()`, `_link()` is never called, so no dependency edge
 exists; a blocked Root therefore does not gate the Work Item. There is no
 creator existence/status validation: a missing creator leaves the session
-unchanged and copies no subscriptions, while the payload still records the
-supplied string.
+unchanged, while subscriptions are copied if matching `kanban_notify_subs`
+rows exist; the payload still records the supplied string.
 
 `gc_events()` currently deletes every event older than the cutoff for
 `done`/`archived` Tasks except `decomposed`

@@ -1,0 +1,308 @@
+---
+title: "Kanban Created-Origin Retention Contract"
+description: "Task-lifetime retention of structural created/decomposed Kanban events"
+---
+
+# Kanban created-origin retention contract
+
+**Package:** `HERMES_CREATED_ORIGIN_RETENTION_V1`
+**Status:** Source Ready design contract. Design only; no runtime or test change in this PR.
+**Base main:** `24099ef7bfb348757fb02f6d11d9196734ebca1e`
+**Audience:** Kanban maintainers, reviewers, and the implementer of the future authorized native package.
+**Runtime APPLY:** not authorized. **Human APPLY:** not granted.
+
+This contract exists because AI Colleague K1 needs a durable, non-blocking
+Mission → Work Item relation. The existing native
+`created.payload.creator_task_id` is queryable today but is deleted by ordinary
+age-based GC for completed/archived Tasks. Retaining the structural `created`
+event alongside the already-retained `decomposed` event is the smallest native
+change that removes that loss without adding a Task field, table, Schema
+migration, Store, Dispatcher or dependency edge.
+
+## 1. Problem and current behavior
+
+`create_task()` commits one `created` task event inside the Task creation
+transaction (`hermes_cli/kanban_db.py:1176`, event at `:1304`). Its payload
+records the origin and creation-time metadata:
+
+```
+assignee, status, parents, creator_task_id, tenant, workspace_kind,
+workspace_path, branch_name, project_id, skills, goal_mode,
+model_override, provider_override
+```
+
+`creator_task_id` is copied by `inherit_creator_origin()` inside the same
+transaction (`hermes_cli/kanban_db_graph.py:8`; called at
+`hermes_cli/kanban_db.py:1343`). It inherits session/subscription origin and
+adds **no** `task_links` row when `parents=()`.
+
+`gc_events()` currently deletes every event older than the cutoff for
+`done`/`archived` Tasks except `decomposed`
+(`hermes_cli/kanban_db.py:4032`):
+
+```sql
+DELETE FROM task_events
+ WHERE created_at < ?
+   AND kind != 'decomposed'
+   AND task_id IN (SELECT id FROM tasks WHERE status IN ('done','archived'))
+```
+
+The Task and Run rows survive this sweep; only the event rows are deleted. A
+completed/archived Work Item's `created` event — the only durable record of its
+`creator_task_id` — can therefore disappear while the Task still exists. After
+that, Mission → Work Item lineage is UNKNOWN, not empty.
+
+`decomposed` is not a substitute for `created.creator_task_id`. It is written by
+a different writer contract (`decompose_triage_task`), creates dependency
+links into the Root, changes the Root's status/assignee, and records fan-out
+graph identity rather than passive creator origin. Do not fabricate it or invoke
+decomposition to retain an inert Root.
+
+## 2. Production call chain and all GC callers
+
+`gc_events()` has one production caller:
+
+| Caller | Path | Role |
+| --- | --- | --- |
+| `_cmd_gc()` | `hermes_cli/kanban_ops.py:305` | `hermes kanban gc`; also `/kanban gc` through `hermes_cli/kanban.py:1339` |
+| `gc_events()` | `hermes_cli/kanban_db.py:4032` | only implementation of event retention |
+| eval | `evals/kanban_graph_identity.py:55` | non-production graph identity probe |
+| tests | `tests/hermes_cli/test_kanban_graph_identity.py:28`, `tests/hermes_cli/test_kanban_gc_retention.py` | regression coverage |
+
+No cron, dispatcher, daemon, gateway or dashboard path calls `gc_events()` in
+the pinned tree. A future/new caller that still uses the old predicate is an
+old-GC caller for the purposes of §7.
+
+Zero and negative semantics are existing protections and must not change:
+
+- Library: `gc_events(older_than_seconds=0)` builds a cutoff of "now" and
+  performs the sweep for eligible rows; it does not mean "disabled".
+- CLI: `--event-retention-days 0` is mapped to "skip this sweep" by
+  `_cmd_gc` (`if event_days:` at `hermes_cli/kanban_ops.py:347`).
+- Negative: rejected by `_retention_seconds()` (`hermes_cli/kanban_db.py:4016`)
+  and by the parser type (`hermes_cli/kanban_parser.py:438`); `_cmd_gc` returns
+  exit 2 before any sweep.
+
+## 3. Reproduction on current main (disposable board only)
+
+Observed on a disposable `HERMES_HOME`/board using the pinned source. No
+production DB, Worker, model, network or real service was used.
+
+Fixture: create a Root, create a Work Item with
+`creator_task_id=Root, parents=()`, claim and complete it (one Run), then age
+all of its events. Separately decompose a triage Root and age its events.
+
+| Observation | Current main |
+| --- | --- |
+| Work Item events before GC | `created=1, claimed=1, completed=1` |
+| Work Item Run rows before/after GC | `1 / 1` |
+| `task_links` touching Work Item | `0` |
+| After `gc_events(older_than_seconds=1)` | Work Item events `{}`; Task row `1`; Run row `1`; `created=0` |
+| Decomposed Root after GC | `decomposed=1` retained; `created=0` deleted |
+| `gc_events(older_than_seconds=0)` on an aged `done` fixture | `created` deleted |
+| `_cmd_gc(event_days=0)` | exit 0; `created` retained (sweep disabled) |
+| `_cmd_gc(event_days=-1)` | exit 2; `created` retained |
+| `gc_events(-1)` | `ValueError: older_than_seconds must be >= 0` |
+
+This is the red state for the retention tests in §8. It is a component-level
+reproduction, not a production observation.
+
+## 4. Proposed change
+
+One predicate change in `gc_events()` plus its docstring:
+
+```sql
+DELETE FROM task_events
+ WHERE created_at < ?
+   AND kind NOT IN ('created', 'decomposed')
+   AND task_id IN (SELECT id FROM tasks WHERE status IN ('done','archived'))
+```
+
+Resulting behavior:
+
+- `created` is retained for the lifetime of its owning Task, independent of
+  payload JSON, creator existence or payload validity.
+- `decomposed` retains its existing Task-lifetime behavior.
+- Ordinary events (claimed, completed, commented, heartbeat, blocked, etc.)
+  continue to expire under the existing age window.
+- Task, Run, link, claim, dispatcher and dependency behavior are unchanged.
+- No DDL, index, `user_version`, backfill, data copy or new event kind.
+
+The predicate must remain kind-based, not payload-based. Making retention depend
+on JSON1 parsing or on a non-null `creator_task_id` would reintroduce malformed-
+payload and legacy dependence, and would not preserve ordinary `created`
+records.
+
+## 5. Retention impact — Human decision required
+
+This change extends the lifetime of the **full existing `created` payload** from
+the ordinary age window to the owning Task's lifetime. It is not just
+`creator_task_id`: the retained row includes the creation-time metadata listed
+in §1 (assignee, workspace kind/path, branch, project, tenant, skills, model and
+provider overrides, goal mode).
+
+- Growth is **one structural row per Task**, plus pre-existing `decomposed`
+  rows and pre-existing anomalous duplicates. It is not retention of the whole
+  event stream.
+- The retained values are the values already written today; this change does not
+  add fields or collect new data.
+- Workspace paths and tenant/model/provider metadata may be operationally
+  sensitive. Task-lifetime retention of that payload is a Human data-retention
+  decision, not an automatic consequence of this contract.
+- The implementation must not claim that already-collected history is restored.
+  Only future GC behavior changes.
+
+## 6. Explicit deletion and dangling origin
+
+`delete_task()` and `delete_archived_task()` call `_delete_task_relations()`
+(`hermes_cli/kanban_db.py:3855`), which deletes that Task's `task_events`,
+`task_runs`, `task_links`, `task_comments` and notify subscriptions. Explicit
+deletion therefore removes the retained `created` and `decomposed` rows with the
+Task; the guarantee ends at intentional deletion.
+
+- Work Item explicit deletion ends that Work Item's lineage. Do not recreate the
+  child, fabricate a Run or tombstone, or infer history from surviving rows.
+- Root explicit deletion leaves surviving children whose
+  `created.payload.creator_task_id` points to an absent Task. That is a dangling
+  reference. It must be reported UNKNOWN/orphan and never rebound to another
+  Root or treated as recovered continuity.
+- Same-key deduplication/recovery across hard deletion is not guaranteed. A
+  later creation with the same key is a new identity (`CREATED`), not a
+  `RECOVERED` one.
+- Archive, unlike deletion, preserves the Task row and is the supported way to
+  retain continuity.
+
+## 7. Legacy history, mixed-version and downgrade
+
+- Events already deleted by an older GC cannot be reconstructed from surviving
+  Task/Run rows. No title, body, Session, subscription or dependency heuristic
+  may be used to backfill or guess them.
+- A board with surviving Tasks that lack a retained `created` event has UNKNOWN
+  lineage coverage. That is not evidence of no Work Items and not a reason to
+  fail unrelated fresh facts.
+- A mixed/new writer is not enough: **any old GC caller** for the selected board
+  can still delete `created`. Qualify a board only when every GC caller that can
+  run against it uses the accepted policy.
+- A downgrade remains Schema-readable, but an old binary's GC can resume
+  deleting `created`. The durability guarantee is invalid while an old GC can
+  run. Stop dependent continuity qualification before downgrade/rollback,
+  preserve the board and evidence, and require explicit reconciliation.
+- Reverting the source is not proof of safe durable rollback.
+
+## 8. Red → green test contract
+
+All tests are behavior tests on disposable `HERMES_HOME` boards. They must use
+`scripts/run_tests.sh`, must not write `~/.hermes/`, and must not read source
+text. Current-main status is the expected red/green baseline; no test result is
+claimed as already green.
+
+New coverage in `tests/hermes_cli/test_kanban_creator_origin.py`:
+
+| Test | Current main | After fix |
+| --- | --- | --- |
+| `test_created_origin_survives_done_gc` | RED (`created` deleted) | GREEN: same Root ID and full payload keys |
+| `test_created_origin_survives_archived_gc` | RED | GREEN |
+| `test_created_origin_survives_repeated_gc` | RED | GREEN: repeated sweeps leave `created`/Task/Run unchanged |
+| `test_created_origin_survives_zero_window` | RED | GREEN: library `0` still sweeps ordinary events, retains `created` |
+| `test_ordinary_events_expire_while_created_remains` | RED | GREEN: ordinary event count falls to 0; `created` remains 1 |
+| `test_task_and_run_rows_unchanged_by_gc` | PASS (regression) | PASS unchanged |
+| `test_explicit_work_item_delete_removes_created` | PASS (regression) | PASS unchanged |
+| `test_root_delete_leaves_dangling_creator_id` | PASS (regression) | PASS unchanged; no rebinding |
+| `test_creator_origin_has_no_dependency_edge` | PASS (existing) | PASS unchanged |
+
+Adjustments in `tests/hermes_cli/test_kanban_gc_retention.py`:
+
+- The positive-window case in `test_cmd_gc_retention_bounds` currently asserts
+  that all events disappear (`_event_rows(tid) == 0`). After the fix, `created`
+  remains. Split the assertion into: ordinary event count `0`, `created` count
+  `1`, Task/Run rows unchanged. Keep the existing workspace/log ordering
+  assertions.
+- Negative-window, library-zero, CLI-zero, slash-command, workspaces-root and
+  shared-scratch tests must remain green without weakening their protections.
+
+### Named test-scope conflict (decision required)
+
+`tests/hermes_cli/test_kanban_graph_identity.py::test_completed_decomposition_survives_retriage`
+asserts `kb.gc_events(conn, older_than_seconds=1) > 0`
+(`tests/hermes_cli/test_kanban_graph_identity.py:28`). Its Root fixture has only
+`created=1` and `decomposed=1`; under the proposed predicate the sweep removes
+**0** rows, so the assertion fails even though both structural events are
+correctly retained. Observed on the same fixture: old predicate removed `1`,
+proposed predicate removes `0`.
+
+That file is not in the three-file implementation whitelist. The accepted
+retention semantics and "existing graph identity regression remains" cannot both
+hold without one of:
+
+- **A (recommended):** authorize a one-line fixture addition in the existing
+  `tests/hermes_cli/test_kanban_graph_identity.py` (for example, add one
+  ordinary comment event before GC) and assert ordinary removal plus structural
+  retention. This adds no new test file and no runtime file, but it is a fourth
+  existing file.
+- **B:** authorize changing that assertion to inspect ordinary vs structural
+  counts instead of total `> 0`.
+- **C:** explicitly waive the assertion and record reduced coverage. Not
+  recommended.
+- **D:** retain only payload-bearing `created` events. Rejected: it violates the
+  accepted kind-based design, reintroduces JSON dependence, and drops ordinary
+  creation records.
+
+`FINAL_SOURCE_READY` remains pending until A, B or C is decided.
+
+## 9. Implementation whitelist (future Human APPLY only)
+
+Exactly three existing files, no new runtime module or test file:
+
+1. `hermes_cli/kanban_db.py` — only the `gc_events` predicate and docstring.
+2. `tests/hermes_cli/test_kanban_gc_retention.py` — ordinary-vs-structural
+   assertions; repeat GC; library zero; CLI zero; negative; Task/Run unchanged.
+3. `tests/hermes_cli/test_kanban_creator_origin.py` — creator origin across
+   done/archive/repeated GC/zero; explicit Work Item delete; dangling Root;
+   no dependency edge; no history guessing.
+
+The graph-identity file in §8 is an unresolved scope question, not an implicit
+fourth file. No Schema, DDL, index, `user_version`, migration, new Store, new
+event kind, dispatcher, cron or dashboard change is proposed.
+
+User-facing `website/docs/user-guide/features/kanban.md` currently documents
+`decomposed` retention. Updating it to describe retained `created` origin is a
+separately authorized docs change after APPLY, not part of the three-file native
+implementation whitelist.
+
+## 10. Rollback boundary
+
+- Revert the predicate/test changes; no data migration or backfill is involved.
+- Rows retained during the change remain until normal explicit deletion; a
+  revert does not delete them and must not claim to.
+- After revert, an old GC resumes deleting `created`; stop claiming durable
+  continuity and re-qualify any dependent AI Colleague work.
+- Preserve board, evidence and native rows; do not "repair" history by deleting
+  surviving structural rows.
+
+## 11. Verification commands for the future implementation
+
+```bash
+scripts/run_tests.sh tests/hermes_cli/test_kanban_gc_retention.py
+scripts/run_tests.sh tests/hermes_cli/test_kanban_creator_origin.py
+scripts/run_tests.sh tests/hermes_cli/test_kanban_graph_identity.py
+scripts/run_tests.sh tests/hermes_cli/ -k kanban
+python scripts/check
+```
+
+No real model, Worker dispatch, production DB, data migration or production
+installation is part of Source Ready or the future APPLY without separate
+authorization.
+
+## 12. Human decisions and exit criteria
+
+Required before the native APPLY:
+
+1. Accept Task-lifetime retention of the full `created` event payload described
+   in §5.
+2. Decide the §8 graph-identity test-scope question (A/B/C).
+3. Authorize the separate native APPLY only after an exact-HEAD Source Ready
+   review.
+
+`SOURCE_READY` remains `PENDING_MAIN_CONTROL_REVIEW`. This document does not
+authorize code, tests, Schema, production, AI Colleague #140, Hermes #4, K3 or
+Desktop UI.

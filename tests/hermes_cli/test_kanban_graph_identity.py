@@ -21,11 +21,36 @@ def test_completed_decomposition_survives_retriage(tmp_path, monkeypatch):
         assert first and kb.get_task(conn, first[0]).tenant == "business-a"
         assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (prerequisite, root)).fetchone()
         assert conn.execute("SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?", (root, downstream)).fetchone()
+        # Ordinary history must still age out; only completion identity is retained.
+        kb.add_comment(conn, root, "probe", "ordinary history")
         # Retention must not erase the identity of a completed fan-out.
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='done' WHERE id=?", (root,))
             conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (root,))
         assert kb.gc_events(conn, older_than_seconds=1) > 0
+        event_counts = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT kind, count(*) FROM task_events WHERE task_id=? GROUP BY kind", (root,)
+            )
+        }
+        assert event_counts.get("commented", 0) == 0
+        assert event_counts.get("created", 0) == 1
+        assert event_counts.get("decomposed", 0) == 1
+        task_snapshot = [tuple(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")]
+        run_snapshot = [tuple(row) for row in conn.execute("SELECT * FROM task_runs ORDER BY id")]
+        assert run_snapshot == []
+        assert kb.gc_events(conn, older_than_seconds=1) == 0
+        event_counts = {
+            row[0]: row[1]
+            for row in conn.execute(
+                "SELECT kind, count(*) FROM task_events WHERE task_id=? GROUP BY kind", (root,)
+            )
+        }
+        assert event_counts.get("created", 0) == 1
+        assert event_counts.get("decomposed", 0) == 1
+        assert [tuple(row) for row in conn.execute("SELECT * FROM tasks ORDER BY id")] == task_snapshot
+        assert [tuple(row) for row in conn.execute("SELECT * FROM task_runs ORDER BY id")] == run_snapshot
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET status='triage' WHERE id=?", (root,))
         before = list(conn.execute("SELECT id FROM tasks ORDER BY id"))

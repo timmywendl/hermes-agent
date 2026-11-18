@@ -19,6 +19,8 @@ import json
 import sqlite3
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -650,6 +652,68 @@ def test_launch_callback_exception_is_not_retried(
             raise failure("inert launcher failed")
         result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
         assert result.spawned == [] and attempts == [tid]
+
+
+@pytest.mark.parametrize("expire_during_validation", [True, False])
+def test_launch_rechecks_real_claim_expiry_after_checkout_validation(
+    kanban_home: Path, admission: dict[str, Any], all_assignees_spawnable: None,
+    monkeypatch: pytest.MonkeyPatch, expire_during_validation: bool,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    real_verify = kbw._verify_admitted_checkout
+    validations: list[dict[str, Any]] = []
+    launches: list[int] = []
+    launch_updates: list[str] = []
+    snapshot: dict[str, list[tuple[Any, ...]]] = {}
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="elapsed launch validation", assignee="alice", project_id="",
+                             workspace_kind="worktree", workspace_path=admission["workspace_path"],
+                             branch_name=admission["branch_name"], workspace_admission=admission)
+        foreign = kb.create_task(conn, title="unrelated expiry control", initial_status="blocked")
+        foreign_before = _custody_snapshot(conn, foreign)
+        def trace_launch_update(statement: str) -> None:
+            if statement.upper().startswith("UPDATE TASKS SET WORKSPACE_PATH"):
+                launch_updates.append(statement)
+        def elapsed_verify(target: Path, contract: dict[str, Any], *, initial: bool) -> None:
+            real_verify(target, contract, initial=initial)
+            if initial:
+                return
+            assert conn.in_transaction
+            expiry = conn.execute("SELECT claim_expires FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+            snapshot.update(_custody_snapshot(conn, tid))
+            conn.set_trace_callback(trace_launch_update)
+            # Read the OS clock directly; neither the native clock nor the lease row is mocked.
+            started = time.clock_gettime(time.CLOCK_REALTIME)
+            monotonic_start = time.monotonic()
+            wait_for = max(0.0, expiry - started) + 0.1 if expire_during_validation else 0.05
+            threading.Event().wait(wait_for)  # health: allow HX013 -- real claim expiry during Git validation is the behavior under test
+            finished = time.clock_gettime(time.CLOCK_REALTIME)
+            validations.append({"expires": expiry, "started": started, "finished": finished,
+                                "elapsed": time.monotonic() - monotonic_start})
+            assert (finished >= expiry) is expire_during_validation
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> int:
+            assert task.current_run_id is not None
+            launches.append(task.current_run_id)
+            return 123456789
+        monkeypatch.setattr(kbw, "_verify_admitted_checkout", elapsed_verify)
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "offline-expiry-fixture")
+        monkeypatch.setattr(kb, "_fire_worker_spawned_hook", lambda *args, **kwargs: None)
+        try:
+            result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False,
+                                       ttl_seconds=10 if expire_during_validation else 30)
+        finally:
+            conn.set_trace_callback(None)
+        assert len(validations) == 1
+        assert _custody_snapshot(conn, foreign) == foreign_before
+        current = kb.get_task(conn, tid)
+        assert current is not None and current.claim_expires == validations[0]["expires"]
+        if expire_during_validation:
+            assert launches == [] and result.spawned == [] and launch_updates == []
+            assert _custody_snapshot(conn, tid) == snapshot
+            assert current.worker_pid is None
+        else:
+            assert len(launches) == len(result.spawned) == len(launch_updates) == 1
+            assert current.worker_pid == 123456789
 
 
 @pytest.mark.parametrize("metadata", [None, {"receipt": "new"}, {"receipt": "new", "workspace_binding": {"forged": True}}])

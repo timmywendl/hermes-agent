@@ -909,6 +909,11 @@ def _workspace_claim_guard(
                 raise ValueError("launch workspace/branch differs from original admission")
             _check_workspace_ownership(conn, task, workspace)
             _verify_admitted_checkout(workspace, admission, initial=False)
+        try:
+            _check_workspace_claim(conn, task)
+        except ValueError:
+            yield False
+            return
         conn.execute("UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
                      (str(workspace), branch_name, task.id))
         task.workspace_path, task.branch_name = str(workspace), branch_name

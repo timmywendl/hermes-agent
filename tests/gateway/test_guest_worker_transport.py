@@ -8,16 +8,16 @@ and M11 operate on actual future VM/SSH channels, not fabricated SSH results.
 from __future__ import annotations
 
 import base64
-from collections.abc import Iterator
-from contextlib import contextmanager
 import json
-from pathlib import Path
 import selectors
 import shlex
 import socket
 import struct
 import subprocess
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -217,3 +217,44 @@ def test_protocol_stdout_pollution_cannot_be_accepted_as_a_result(native_lab: An
     assert native_lab.ssh_code("import json; print(json.dumps({'clean':True}))") == {'clean': True}
     with pytest.raises((AssertionError, json.JSONDecodeError)):
         native_lab.ssh_code("import json; print('UNTRUSTED_BANNER'); print(json.dumps({'clean':False}))")
+
+
+@pytest.mark.platforms('macos', arch='arm64')
+def test_same_interpreter_exec_is_observed_before_trusting_birth(native_lab: Any) -> None:
+    """C1 actual NOTE_EXEC witness: PID/birth stay the same across exec."""
+    import select
+    import sys
+
+    import psutil
+
+    script = ("import os,sys; print('READY',flush=True); sys.stdin.read(1); "
+              "os.execv(sys.executable,[sys.executable,'-I','-c',"
+              "\"import sys;print('EXECUTED',flush=True);sys.stdin.read(1)\"])")
+    child = subprocess.Popen([native_lab.binary('python'), '-I', '-c', script],
+                             env=native_lab.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, close_fds=True)
+    assert child.stdin is not None and child.stdout is not None
+    deadline = native_lab.gate['deadlines']['probe']
+    try:
+        with selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ)
+            assert ready.select(deadline) and child.stdout.readline() == 'READY\n'
+        before = psutil.Process(child.pid).create_time()
+        with select.kqueue() as events:
+            events.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC,
+                           flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                           fflags=select.KQ_NOTE_EXEC | select.KQ_NOTE_EXIT)], 0, 0)
+            child.stdin.write('G')
+            child.stdin.flush()
+            observed = events.control(None, 4, deadline)
+            assert any(event.fflags & select.KQ_NOTE_EXEC for event in observed)
+            assert psutil.Process(child.pid).create_time() == before
+            assert Path(psutil.Process(child.pid).exe()).resolve() == Path(sys.executable).resolve()
+        # An implementation accepting unchanged birth as continuation would
+        # miss the native event above; the Lab's watch rejects any later exec.
+    finally:
+        child.stdin.close()
+        child.wait(timeout=deadline)
+        child.stdout.close()
+        assert child.stderr is not None
+        child.stderr.close()

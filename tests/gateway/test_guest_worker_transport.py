@@ -231,9 +231,15 @@ def test_same_interpreter_exec_is_observed_before_trusting_birth(native_lab: Any
     script = ("import os,sys; print('READY',flush=True); sys.stdin.read(1); "
               "os.execv(sys.executable,[sys.executable,'-I','-c',"
               "\"import sys;print('EXECUTED',flush=True);sys.stdin.read(1)\"])")
-    child = subprocess.Popen([native_lab.binary('python'), '-I', '-c', script],
+    native_lab.acquiring = True
+    try:
+        child = subprocess.Popen([native_lab.binary('python'), '-I', '-c', script],
                              env=native_lab.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                              stderr=subprocess.PIPE, text=True, close_fds=True)
+    except BaseException:
+        native_lab.mark_uncertain('exec_probe_acquisition_unknown')
+        raise
+    native_lab.acquiring = False
     assert child.stdin is not None and child.stdout is not None
     deadline = native_lab.gate['deadlines']['probe']
     try:

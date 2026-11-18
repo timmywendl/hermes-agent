@@ -244,9 +244,16 @@ class Lab:
 
     def run(self, argv: list[str], timeout: float | None = None) -> subprocess.CompletedProcess[str]:
         self.check_budget()
-        return subprocess.run(argv, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
+        self.acquiring = True
+        try:
+            result = subprocess.run(argv, env=self.env, stdin=subprocess.DEVNULL, capture_output=True,
                               text=True, close_fds=True, timeout=timeout or self.gate['deadlines']['probe'],
                               check=False)
+        except BaseException:
+            self.mark_uncertain('command_acquisition_unknown')
+            raise
+        self.acquiring = False
+        return result
 
     def config(self, over_vsock: bool) -> Path:
         # Closed config: one fixed no-op skips Lima package installation;
@@ -374,9 +381,15 @@ class Lab:
 
     def ssh_code(self, code: str) -> dict[str, Any]:
         self.check_budget()
-        result = subprocess.run([*self.ssh_argv(), self.gate['guest_python'], '-'], input=code,
+        self.acquiring = True
+        try:
+            result = subprocess.run([*self.ssh_argv(), self.gate['guest_python'], '-'], input=code,
                                 env=self.env, text=True, capture_output=True, close_fds=True,
                                 timeout=self.gate['deadlines']['probe'], check=False)
+        except BaseException:
+            self.mark_uncertain('ssh_acquisition_unknown')
+            raise
+        self.acquiring = False
         assert result.returncode == 0, f'UNAVAILABLE: actual SSH probe failed: {result.stderr}'
         value = json.loads(result.stdout)
         assert isinstance(value, dict), 'protocol stdout pollution'
@@ -679,8 +692,14 @@ def host_probe(lab: Lab, values: dict[str, Any], policy: str = 'baseline',
         argv = [lab.binary('sandbox'), '-f', str(pinned(item)), '-D', 'ROOT=' + str(lab.root),
                 '-D', 'LIMA_HOME=' + lab.env['LIMA_HOME'],
                 '-D', 'SSH_PORT=' + str(lab.gate['ssh_port']), *argv]
-    result = subprocess.run(argv, env=lab.env, capture_output=True, text=True, close_fds=True,
+    lab.acquiring = True
+    try:
+        result = subprocess.run(argv, env=lab.env, capture_output=True, text=True, close_fds=True,
                             pass_fds=pass_fds, timeout=lab.gate['deadlines']['probe'], check=False)
+    except BaseException:
+        lab.mark_uncertain('probe_acquisition_unknown')
+        raise
+    lab.acquiring = False
     assert result.returncode == 0, f'UNAVAILABLE: Host probe not executed: {result.stderr}'
     value = json.loads(result.stdout)
     assert isinstance(value, dict)

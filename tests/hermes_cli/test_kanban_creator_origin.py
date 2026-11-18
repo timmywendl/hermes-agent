@@ -53,6 +53,7 @@ def test_creator_origin_survives_without_dependency_parent(tmp_path, monkeypatch
 # recorded ``creator_task_id`` disappear with the Task itself.
 
 CREATED_PAYLOAD_KEYS = {
+    "completion_contract",
     "assignee", "status", "parents", "creator_task_id", "tenant",
     "workspace_kind", "workspace_path", "branch_name", "project_id",
     "skills", "goal_mode", "model_override", "provider_override",
@@ -215,6 +216,7 @@ def test_created_origin_full_payload_survives_first_positive_gc(conn, tmp_path):
     # not merely compare two equally empty payloads.
     assert set(payload_before) == CREATED_PAYLOAD_KEYS
     assert payload_before["creator_task_id"] == root
+    assert payload_before["completion_contract"] == "local-only"
     assert payload_before["status"] == "ready"
     assert payload_before["parents"] == []
     assert payload_before["project_id"] is None

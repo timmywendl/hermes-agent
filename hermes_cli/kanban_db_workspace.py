@@ -8,13 +8,15 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import json
+import re
 import shutil
 import sqlite3
 import subprocess
 import time
 import unicodedata
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterator, Optional
 from typing import TYPE_CHECKING
 import contextlib
 
@@ -377,6 +379,8 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
             # See #33774.
             _try_cleanup_parent_workspaces(conn, task_id)
             return
+        if kind == "worktree" and _retain_admitted_worktree(conn, task_id, path):
+            return
         # Defer while any child is not yet terminal so it can still read
         # handoff artifacts from this workspace.
         if _has_active_children(conn, task_id):
@@ -429,9 +433,8 @@ def _cleanup_worktree_workspace(
     """Remove a finished task's linked git worktree when it holds no work.
     Mirrors the CLI startup pruner (``cli._prune_stale_worktrees``): removal
     requires a clean tree AND every commit reachable from a remote-tracking
-    ref; any doubt (dirty, unpushed, unresolvable repo, failing git) preserves
-    it. The auto-generated ``wt/<task-id>`` branch is deleted with it; custom
-    branches are kept. Best-effort."""
+    ref; any doubt (dirty, ignored data, unpushed, unresolvable repo, failing
+    git) preserves it. Local branches are always kept. Best-effort."""
     try:
         from hermes_cli.worktree_ops import _worktree_has_unpushed_commits, _worktree_is_dirty
     except Exception:
@@ -451,6 +454,9 @@ def _cleanup_worktree_workspace(
                 "Preserving worktree for task %s: dirty or unpushed work at %s",
                 task_id, wp,
             )
+            return
+        ignored = _git(wp, "ls-files", "--others", "--ignored", "--exclude-standard", "-z", timeout=30)
+        if ignored.returncode or ignored.stdout:
             return
         # Windows cannot delete a directory while this process has its current
         # directory inside it. Completed workers normally run from their own
@@ -489,9 +495,6 @@ def _cleanup_worktree_workspace(
             )
             return
         _kb._log.debug("Removed worktree workspace: %s", wp)
-        branch = (branch_name or "").strip() or f"wt/{task_id}"
-        if branch.startswith("wt/"):
-            _git(repo_root, "branch", "-D", branch, timeout=30)
     except Exception:
         pass  # best-effort — never block completion
 
@@ -520,6 +523,8 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
                 continue
             ws_path = row["workspace_path"]
             if row["workspace_kind"] == "worktree":
+                if _retain_admitted_worktree(conn, parent_id, ws_path):
+                    continue
                 if _defer_shared_worktree_cleanup(conn, parent_id, ws_path):
                     continue
                 _cleanup_worktree_workspace(parent_id, ws_path, row["branch_name"])
@@ -691,6 +696,9 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
+        if (_path_key(_git_toplevel(target)) != _path_key(target.resolve())
+                or _git_current_branch(target) != branch_name):
+            raise ValueError("occupied worktree has wrong checkout root or branch")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
@@ -712,12 +720,281 @@ def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple
     return target, branch_name
 
 
-def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
+_ADMISSION_FIELDS = {
+    "version", "repo", "source_root", "common_dir", "remote_url", "base_commit",
+    "branch_name", "workspace_root", "workspace_path",
+}
+
+
+def _required_git(path: Path, *args: str) -> str:
+    result = _git(path, *args, timeout=30)
+    if result.returncode or not isinstance(result.stdout, str):
+        raise ValueError("workspace Git identity could not be verified")
+    return result.stdout.strip()
+
+
+def validate_workspace_admission(
+    admission: Optional[dict[str, Any]], kind: str, path: Optional[str], branch: Optional[str],
+) -> Optional[dict[str, Any]]:
+    """Validate explicit trusted admission before native creation; never read Task prose."""
+    if admission is None:
+        return None
+    if (not isinstance(admission, dict) or set(admission) != _ADMISSION_FIELDS
+            or type(admission.get("version")) is not int or admission["version"] != 1):
+        raise ValueError("invalid workspace admission fields/version")
+    if any(not isinstance(admission[key], str) or not admission[key].strip()
+           for key in _ADMISSION_FIELDS - {"version"}):
+        raise ValueError("workspace admission requires nonempty strings")
+    if kind != "worktree" or path != admission["workspace_path"] or branch != admission["branch_name"]:
+        raise ValueError("workspace admission differs from Task workspace/branch")
+    paths = {}
+    for key in ("source_root", "common_dir", "workspace_root", "workspace_path"):
+        candidate = Path(admission[key])
+        if not candidate.is_absolute() or _path_key(candidate) != _path_key(candidate.resolve()):
+            raise ValueError("workspace admission paths must be absolute and canonical")
+        paths[key] = candidate
+    target, root, source = paths["workspace_path"], paths["workspace_root"], paths["source_root"]
+    if target.parent != root / "worktrees" or target == source:
+        raise ValueError("workspace admission must target W/worktrees/<name>")
+    if (_path_key(_git_toplevel(source)) != _path_key(source)
+            or _path_key(_git_common_dir(source)) != _path_key(paths["common_dir"])):
+        raise ValueError("workspace admission source/common-dir mismatch")
+    if _required_git(source, "remote", "get-url", "origin") != admission["remote_url"]:
+        raise ValueError("workspace admission remote repository mismatch")
+    remote = admission["remote_url"].rstrip("/").removesuffix(".git")
+    if not remote.endswith("/" + admission["repo"]) and not remote.endswith(":" + admission["repo"]):
+        raise ValueError("workspace admission repo differs from origin")
+    base = admission["base_commit"]
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base):
+        raise ValueError("workspace admission needs an exact base commit")
+    if _required_git(source, "rev-parse", "--verify", base + "^{commit}") != base:
+        raise ValueError("workspace admission base mismatch")
+    _required_git(source, "check-ref-format", "--branch", branch or "")
+    return dict(admission)
+
+
+def workspace_creation_admission(
+    conn: sqlite3.Connection, task_id: str, admission: dict[str, Any],
+) -> dict[str, Any]:
+    from hermes_cli.kanban_db_connect import _main_db_file
+    db_file = _main_db_file(conn)
+    if not db_file:
+        raise ValueError("workspace admission requires a persistent Board identity")
+    return {**admission, "task_id": task_id, "board_db": str(Path(db_file).resolve())}
+
+
+def _created_workspace_admission(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'created'", (task_id,),
+    ).fetchall()
+    payloads = [json.loads(row["payload"]) for row in rows]
+    admitted = [payload["workspace_admission"] for payload in payloads
+                if isinstance(payload, dict) and "workspace_admission" in payload]
+    if not admitted:
+        return None
+    if len(rows) != 1 or not isinstance(admitted[0], dict):
+        raise ValueError("ambiguous workspace creation admission")
+    admission = admitted[0]
+    if set(admission) != _ADMISSION_FIELDS | {"task_id", "board_db"}:
+        raise ValueError("malformed workspace creation admission")
+    expected = workspace_creation_admission(
+        conn, task_id, {key: admission[key] for key in _ADMISSION_FIELDS},
+    )
+    if admission != expected:
+        raise ValueError("workspace admission belongs to another Task/Board")
+    return admission
+
+
+def _check_workspace_claim(conn: sqlite3.Connection, task: Task) -> None:
+    row = conn.execute(
+        "SELECT t.status, t.current_run_id, t.claim_lock, t.workspace_kind, t.workspace_path, "
+        "t.branch_name, t.claim_expires, r.claim_expires AS run_expires, r.task_id, r.status AS run_status, "
+        "r.claim_lock AS run_lock FROM tasks t JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?", (task.id,),
+    ).fetchone()
+    if (row is None or row["status"] != "running" or row["run_status"] != "running"
+            or row["task_id"] != task.id or not task.current_run_id or not task.claim_lock
+            or row["current_run_id"] != task.current_run_id
+            or row["claim_lock"] != task.claim_lock or row["run_lock"] != task.claim_lock
+            or not row["claim_expires"] or row["claim_expires"] <= int(time.time())
+            or row["run_expires"] != row["claim_expires"]
+            or row["workspace_kind"] != task.workspace_kind
+            or row["workspace_path"] != task.workspace_path or row["branch_name"] != task.branch_name):
+        raise ValueError("workspace admission requires the exact current Task/Run/claim")
+
+
+def _check_workspace_ownership(conn: sqlite3.Connection, task: Task, target: Path) -> None:
+    rows = conn.execute(
+        "SELECT id, workspace_path FROM tasks WHERE id != ? AND workspace_path IS NOT NULL",
+        (task.id,),
+    ).fetchall()
+    if any(_path_key(Path(row["workspace_path"]).expanduser().resolve()) == _path_key(target)
+           for row in rows):
+        raise ValueError("workspace is assigned to another Task")
+    if _workspace_in_use_by_other(conn, task.id, target) is not None:
+        raise ValueError("workspace ownership is shared or unknown")
+    for db_file in _sibling_board_db_files(conn):
+        with sqlite3.connect(db_file.as_uri() + "?mode=ro", uri=True, timeout=1.0) as other:
+            paths = other.execute("SELECT workspace_path FROM tasks WHERE workspace_path IS NOT NULL").fetchall()
+            if any(_path_key(Path(row[0]).expanduser().resolve()) == _path_key(target) for row in paths):
+                raise ValueError("workspace belongs to a Task on another Board")
+
+
+def _retain_admitted_worktree(conn: sqlite3.Connection, task_id: str, path: str) -> bool:
+    """Central admitted trees await independently qualified PR/process/data cleanup evidence."""
+    try:
+        admitted = _created_workspace_admission(conn, task_id)
+    except (ValueError, TypeError, sqlite3.Error):
+        return True
+    if admitted is None:
+        return False
+    from hermes_cli.kanban_db_connect import write_txn
+    with write_txn(conn):
+        _kb._append_event(conn, task_id, "workspace_cleanup_deferred", {
+            "path": path, "reason": "admitted_worktree_retention_not_qualified",
+        })
+    return True
+
+
+def _read_workspace_binding(conn: sqlite3.Connection, task: Task) -> Optional[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT r.metadata, e.payload FROM task_runs r JOIN task_events e ON e.run_id = r.id "
+        "WHERE r.task_id = ? AND e.task_id = ? AND e.kind = 'workspace_bound' ORDER BY e.id DESC",
+        (task.id, task.id),
+    ).fetchall()
+    for row in rows:
+        metadata = _kb._json_dict(row["metadata"])
+        binding = metadata.get("workspace_binding")
+        if isinstance(binding, dict) and binding == _kb._json_dict(row["payload"]):
+            return binding
+    return None
+
+
+def _verify_admitted_checkout(target: Path, contract: dict[str, Any], *, initial: bool) -> None:
+    if (_path_key(_git_toplevel(target)) != _path_key(target)
+            or not _is_linked_worktree_checkout(target)
+            or _path_key(_git_common_dir(target)) != _path_key(Path(contract["common_dir"]))
+            or _git_current_branch(target) != contract["branch_name"]):
+        raise ValueError("workspace checkout repo/common-dir/branch mismatch")
+    base = contract["base_commit"]
+    if initial and _required_git(target, "rev-parse", "HEAD") != base:
+        raise ValueError("workspace checkout base mismatch")
+    _required_git(target, "merge-base", "--is-ancestor", base, "HEAD")
+
+
+@contextlib.contextmanager
+def _workspace_claim_guard(
+    conn: sqlite3.Connection, task: Task, workspace: Path, branch_name: Optional[str],
+) -> Iterator[bool]:
+    """Keep the native writer lock through launch/PID booking; hooks run after commit."""
+    from hermes_cli.kanban_db_connect import write_txn
+    with write_txn(conn):
+        try:
+            _check_workspace_claim(conn, task)
+        except ValueError:
+            yield False
+            return
+        if task.workspace_kind != "worktree":
+            branch_name = task.branch_name
+        admission = _created_workspace_admission(conn, task.id)
+        if admission is not None:
+            binding = _read_workspace_binding(conn, task)
+            if (binding is None or binding.get("run_id") != task.current_run_id
+                    or binding.get("claim_lock") != task.claim_lock
+                    or binding.get("admission") != admission):
+                raise ValueError("native workspace binding no longer matches the current launch claim")
+            if str(workspace) != admission["workspace_path"] or branch_name != admission["branch_name"]:
+                raise ValueError("launch workspace/branch differs from original admission")
+            _check_workspace_ownership(conn, task, workspace)
+            _verify_admitted_checkout(workspace, admission, initial=False)
+        try:
+            _check_workspace_claim(conn, task)
+        except ValueError:
+            yield False
+            return
+        conn.execute("UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
+                     (str(workspace), branch_name, task.id))
+        task.workspace_path, task.branch_name = str(workspace), branch_name
+        yield True
+
+
+def _resolve_admitted_worktree(
+    conn: sqlite3.Connection, task: Task, admission: dict[str, Any],
+) -> tuple[Path, str]:
+    contract = {key: admission[key] for key in _ADMISSION_FIELDS}
+    validate_workspace_admission(contract, task.workspace_kind, task.workspace_path, task.branch_name)
+    target, source = Path(contract["workspace_path"]), Path(contract["source_root"])
+    branch, base = contract["branch_name"], contract["base_commit"]
+    from hermes_cli.kanban_db_connect import write_txn
+    with write_txn(conn):
+        _check_workspace_claim(conn, task)
+        _check_workspace_ownership(conn, task, target)
+        prior = _read_workspace_binding(conn, task)
+        if target.exists():
+            if prior is None or prior.get("admission") != admission:
+                raise ValueError("occupied worktree lacks this Task's native binding")
+        else:
+            if prior is not None:
+                raise ValueError("bound worktree is missing; refusing replacement")
+            if _git_branch_exists(source, branch):
+                if _required_git(source, "rev-parse", "refs/heads/" + branch) != base:
+                    raise ValueError("workspace branch differs from exact base")
+                args = ["worktree", "add", str(target), branch]
+            else:
+                args = ["worktree", "add", "-b", branch, str(target), base]
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _required_git(source, *args)
+        _verify_admitted_checkout(target, contract, initial=prior is None)
+        _check_workspace_claim(conn, task)
+        _check_workspace_ownership(conn, task, target)
+        binding = {"admission": admission, "task_id": task.id, "run_id": task.current_run_id,
+                   "claim_lock": task.claim_lock, "head_at_binding": _required_git(target, "rev-parse", "HEAD")}
+        row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (task.current_run_id,)).fetchone()
+        metadata = _kb._json_dict(row["metadata"])
+        metadata["workspace_binding"] = binding
+        conn.execute("UPDATE task_runs SET metadata = ? WHERE id = ?", (json.dumps(metadata), task.current_run_id))
+        conn.execute("UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
+                     (str(target), branch, task.id))
+        _kb._append_event(conn, task.id, "workspace_bound", binding, run_id=task.current_run_id)
+    return target, branch
+
+
+def preserve_workspace_binding(
+    conn: sqlite3.Connection, run_id: Optional[int], metadata: Optional[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    """Only native run-scoped receipts establish custody; free metadata never does."""
+    row = conn.execute(
+        "SELECT e.payload, r.task_id, r.claim_lock FROM task_runs r JOIN task_events e ON e.run_id = r.id "
+        "WHERE r.id = ? AND e.task_id = r.task_id AND e.kind = 'workspace_bound' ORDER BY e.id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    clean = {key: value for key, value in (metadata or {}).items() if key != "workspace_binding"}
+    binding = _kb._json_dict(row["payload"] if row else None)
+    if (row is not None and binding.get("task_id") == row["task_id"]
+            and binding.get("run_id") == run_id and binding.get("claim_lock") == row["claim_lock"]):
+        return {**clean, "workspace_binding": binding}
+    return clean if metadata is not None else None
+
+
+def _resolve_worktree_workspace(
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
     every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
+    if (task.workspace_path and Path(task.workspace_path).parent.name == "worktrees"
+            and conn is None):
+        raise ValueError("central workspace resolution requires its native Board connection")
+    admission = _created_workspace_admission(conn, task.id) if conn is not None else None
+    if admission is not None:
+        assert conn is not None
+        return _resolve_admitted_worktree(conn, task, admission)
+    if task.workspace_path and Path(task.workspace_path).parent.name == "worktrees":
+        raise ValueError("central workspace requires original trusted source admission")
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -755,20 +1032,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             return requested_resolved, actual_branch
-        # The requested path is an existing checkout of a DIFFERENT task's
-        # branch (decompose children inherit the root's workspace_path
-        # verbatim, so siblings all point here). Reusing it would run this task
-        # on the other task's branch — silent cross-task provenance corruption,
-        # unsafe under concurrency — so fall back to our own worktree.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
-        if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
-                return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this task's
-        # own canonical worktree): keep the legacy reuse rather than fail dispatch.
-        return requested_resolved, actual_branch or branch_name
+        raise ValueError("occupied worktree has wrong branch; refusing fallback")
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
@@ -784,7 +1048,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     return requested, branch_name
 
 
-def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
+def resolve_workspace(
+    task: Task, *, board: Optional[str] = None, conn: Optional[sqlite3.Connection] = None,
+) -> Path:
     """Resolve (and create if needed) the workspace for a task.
 
     ``scratch``: ``<board-root>/workspaces/<id>/`` — path-stable across the
@@ -797,7 +1063,7 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     """
     kind = task.workspace_kind or "scratch"
     if kind == "worktree":
-        return _resolve_worktree_workspace(task, board=board)[0]
+        return _resolve_worktree_workspace(task, board=board, conn=conn)[0]
     if kind == "scratch" and not task.workspace_path:
         p = _kb.workspaces_root(board=board) / task.id
     elif kind == "scratch":

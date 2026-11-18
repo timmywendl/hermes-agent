@@ -522,9 +522,11 @@ def test_native_a1_a2_boundary(native_lab: Lab) -> None:
     lab.assert_identity()
     canary = lab.root / 'host-only-canary'
     canary.write_text(uuid.uuid4().hex)
-    observed = lab.ssh_code(f"""import json,os
+    observed = lab.ssh_code(f"""import json,os,tempfile
 p={str(canary)!r}
-print(json.dumps({{'host_visible':os.path.exists(p),'guest_rw':os.access('/tmp',os.W_OK),
+with tempfile.TemporaryFile() as f:
+ f.write(b'GUEST_RW');f.seek(0);rw=f.read()==b'GUEST_RW'
+print(json.dumps({{'host_visible':os.path.exists(p),'guest_rw':rw,
  'mounts':open('/proc/mounts').read()}}))
 """)
     assert observed['guest_rw'] and not observed['host_visible']
@@ -699,3 +701,37 @@ def test_native_m1_m6_policy_sensitivity(native_lab: Lab, mutation: str) -> None
                     assert connection.recv(128) == token.encode()
             else:
                 assert server.recvfrom(128)[0] == token.encode()
+
+
+@pytest.mark.platforms('macos', arch='arm64')
+def test_native_d2_host_browser_docker_and_uds_are_not_guest_capabilities(native_lab: Lab) -> None:
+    lab = native_lab
+    lab.start()
+    # Each is a real disposable listener, not a test against absent production
+    # CDP/Docker or a claim based on their conventional port numbers.
+    for label in ('browser-cdp', 'docker-api'):
+        assert_denied_with_witness(lab, lab.gate['guest_gateway'], '127.0.0.1',
+                                   socket.AF_INET, socket.SOCK_STREAM)
+        lab.record(label, {'controlled_listener': True, 'guest_denied': True})
+    path = lab.root / 'fake-docker.sock'
+    with socket.socket(socket.AF_UNIX) as server:
+        server.bind(str(path))
+        server.listen(2)
+        server.settimeout(2)
+        with socket.socket(socket.AF_UNIX) as control:
+            control.connect(str(path))
+            control.sendall(b'LOCAL_UDS_WITNESS')
+        conn, _ = server.accept()
+        with conn:
+            assert conn.recv(128) == b'LOCAL_UDS_WITNESS'
+        result = lab.ssh_code(f"""import json,socket
+s=socket.socket(socket.AF_UNIX);s.settimeout(2)
+try: s.connect({str(path)!r}); reached=True
+except OSError: reached=False
+finally: s.close()
+print(json.dumps({{'reached':reached}}))
+""")
+        assert not result['reached']
+        with pytest.raises(socket.timeout):
+            conn, _ = server.accept()
+            conn.close()

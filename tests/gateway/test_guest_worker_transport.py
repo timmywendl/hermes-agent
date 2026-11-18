@@ -16,7 +16,7 @@ import struct
 import subprocess
 import threading
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -240,7 +240,7 @@ def test_same_interpreter_exec_is_observed_before_trusting_birth(native_lab: Any
             ready.register(child.stdout, selectors.EVENT_READ)
             assert ready.select(deadline) and child.stdout.readline() == 'READY\n'
         before = psutil.Process(child.pid).create_time()
-        with select.kqueue() as events:
+        with closing(select.kqueue()) as events:
             events.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC,
                            flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
                            fflags=select.KQ_NOTE_EXEC | select.KQ_NOTE_EXIT)], 0, 0)

@@ -192,6 +192,10 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     return data
 
 
+class VsockFallbackRejected(AssertionError):
+    """Only an actual native failed/skipped event, never a generic timeout."""
+
+
 @dataclass
 class Lab:
     gate: dict[str, Any]
@@ -336,7 +340,8 @@ class Lab:
             rows = [json.loads(line)['status'] for line in events.splitlines(keepends=True)
                     if line.endswith('\n') and line.startswith('{')]
             vsocks = [r['vsock'] for r in rows if isinstance(r.get('vsock'), dict)]
-            assert not any(v.get('type') in {'failed', 'skipped'} for v in vsocks), 'vsock unavailable/fallback'
+            if any(v.get('type') in {'failed', 'skipped'} for v in vsocks):
+                raise VsockFallbackRejected('vsock failed/skipped; native fallback not admitted')
             good = [v for v in vsocks if v.get('type') == 'started' and v.get('vsockPort') == 22]
             if good and any(r.get('running') and not r.get('degraded') for r in rows):
                 assert good[-1]['hostAddr'] == f"127.0.0.1:{self.gate['ssh_port']}"

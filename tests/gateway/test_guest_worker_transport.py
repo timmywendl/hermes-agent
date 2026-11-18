@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 
+from tests.gateway.test_guest_worker_boundary import VsockFallbackRejected
 from tests.gateway.test_guest_worker_boundary import native_lab as native_lab
 
 
@@ -149,7 +150,7 @@ def test_tcp_fallback_is_not_an_admitted_vsock_channel(native_lab: Any) -> None:
     native_lab.start()
     assert native_lab.ssh_code("import json; print(json.dumps({'vsock':True}))") == {'vsock': True}
     assert native_lab.stop()['verified'] is True
-    with pytest.raises(AssertionError, match='vsock'):
+    with pytest.raises(VsockFallbackRejected, match='vsock'):
         native_lab.start(over_vsock=False)
 
 

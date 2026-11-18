@@ -4,7 +4,7 @@ Identity and lineage remain owner-reserved. This is not arbitrary SessionDB RPC.
 """
 import json
 
-from hermes_state_runtime import RuntimeStoreError
+from hermes_state_runtime import RuntimeStoreError, _text
 
 
 # model_config sidecars a worker may patch: every key the agent persists via
@@ -37,8 +37,13 @@ def worker_prompt(db, conn, session_id, payload):
 
 
 def worker_sidecars(db, conn, session_id, payload):
-    if set(payload) != {'patch'} or not isinstance(payload['patch'], dict) or set(payload['patch']) - SIDECAR_KEYS:
+    if (set(payload) != {'patch'} or not isinstance(payload['patch'], dict)
+            or set(payload['patch']) - (SIDECAR_KEYS | {'codex_thread_id'})):
         raise RuntimeStoreError('invalid_params')
+    # Codex's existing resume reference is metadata, never execution authority.
+    thread_id = payload['patch'].get('codex_thread_id')
+    if thread_id is not None:
+        _text(thread_id)
     merged = db._merge_model_config_json(conn, session_id, payload['patch'], on_missing='raise')
     conn.execute('UPDATE sessions SET model_config=? WHERE id=?', (merged, session_id))
     return {'value': None}

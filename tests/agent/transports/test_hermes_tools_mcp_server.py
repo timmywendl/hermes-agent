@@ -128,3 +128,39 @@ class TestMain:
         monkeypatch.setattr(m, "_build_server", lambda: CrashingServer())
         rc = m.main([])
         assert rc == 1
+
+
+def test_real_stdio_inventory_keeps_worker_lifecycle_scoped(tmp_path, monkeypatch):
+    import asyncio
+    import os
+    from pathlib import Path
+    import sys
+
+    from mcp import ClientSession
+    from mcp.client.stdio import StdioServerParameters, stdio_client
+
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, KANBAN_ENV_KEYS
+
+    root = Path(__file__).resolve().parents[3]
+    env = {k: os.environ[k] for k in ('PATH', 'HOME', 'TMPDIR', 'LANG') if k in os.environ}
+    env.update(HERMES_HOME=str(tmp_path), PYTHONPATH=str(root), HERMES_QUIET='1',
+               PYTHONDONTWRITEBYTECODE='1', HERMES_ENABLE_PROJECT_PLUGINS='0')
+    for key in (*KANBAN_ENV_KEYS, DELEGATED_CHILD_ENV_MARKER):
+        monkeypatch.delenv(key, raising=False)
+
+    async def inventory(worker_env):
+        params = StdioServerParameters(command=sys.executable,
+            args=['-m', 'agent.transports.hermes_tools_mcp_server'], env=worker_env, cwd=str(root))
+        async with stdio_client(params) as (read, write), ClientSession(read, write) as session:
+            await session.initialize()
+            return {tool.name: tool for tool in (await session.list_tools()).tools}
+
+    owned = env | {'HERMES_KANBAN_TASK': 'synthetic-task', 'HERMES_KANBAN_RUN_ID': '42',
+                   'HERMES_KANBAN_CLAIM_LOCK': 'synthetic-claim',
+                   'HERMES_KANBAN_DB': str(tmp_path / 'kanban.db')}
+    tools = asyncio.run(inventory(owned))
+    assert {'kanban_block', 'kanban_complete', 'kanban_comment', 'kanban_heartbeat'} <= tools.keys()
+    assert 'reason' in tools['kanban_block'].input_schema['properties']
+    assert not {'kanban_list', 'kanban_unblock'} & tools.keys()
+    for unowned in (env, owned | {DELEGATED_CHILD_ENV_MARKER: str(tmp_path)}):
+        assert not {name for name in asyncio.run(inventory(unowned)) if name.startswith('kanban_')}

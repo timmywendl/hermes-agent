@@ -319,12 +319,10 @@ def _cmd_gc(args: argparse.Namespace) -> int:
         for row in rows:
             if row["workspace_kind"] == "worktree":
                 # Backstop for worktrees that escaped the completion/archive hook.
-                # Same safety predicate: only clean, fully-pushed worktrees go.
+                # Use the lifecycle predicate, including admitted-tree retention.
                 wt_path = row["workspace_path"]
                 if wt_path and Path(wt_path).is_dir():
-                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
-                        continue
-                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    kbw._cleanup_workspace(conn, row["id"])
                     if not Path(wt_path).is_dir():
                         removed_ws += 1
                 continue

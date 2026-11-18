@@ -683,11 +683,11 @@ def test_launch_rechecks_real_claim_expiry_after_checkout_validation(
             snapshot.update(_custody_snapshot(conn, tid))
             conn.set_trace_callback(trace_launch_update)
             # Read the OS clock directly; neither the native clock nor the lease row is mocked.
-            started = time.clock_gettime(time.CLOCK_REALTIME)
+            started = time.time_ns() / 1e9
             monotonic_start = time.monotonic()
             wait_for = max(0.0, expiry - started) + 0.1 if expire_during_validation else 0.05
             threading.Event().wait(wait_for)  # health: allow HX013 -- real claim expiry during Git validation is the behavior under test
-            finished = time.clock_gettime(time.CLOCK_REALTIME)
+            finished = time.time_ns() / 1e9
             validations.append({"expires": expiry, "started": started, "finished": finished,
                                 "elapsed": time.monotonic() - monotonic_start})
             assert (finished >= expiry) is expire_during_validation

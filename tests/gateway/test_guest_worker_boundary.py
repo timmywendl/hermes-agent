@@ -510,6 +510,9 @@ class Lab:
         if self._exec_watch is not None:
             self._exec_watch.close()
             self._exec_watch = None
+        if self.acquiring:
+            self.mark_uncertain('unbooked_process_custody')
+            raise AssertionError('UNKNOWN: unbooked native acquisition prevents verified stop')
         self.verified_stop = True
         self._stop_receipt = {'verified': True, 'vm_stopped': True, 'processes_gone': True,
                               'endpoints_closed': True, 'writers_quiescent': True,

@@ -221,6 +221,7 @@ class Lab:
     applied_policy_path: Path | None = None
     leak_fds: tuple[int, ...] = ()
     current_variant: str = 'baseline'
+    acquiring: bool = False
 
     def __post_init__(self) -> None:
         self.env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(self.root),
@@ -299,10 +300,16 @@ class Lab:
                     '-D', 'ROOT=' + str(self.root), '-D', 'LIMA_HOME=' + str(home),
                     '-D', 'SSH_PORT=' + str(self.gate['ssh_port']), *argv]
         out, err = self.root / f'events-{self.attempt}.log', self.root / f'stderr-{self.attempt}.log'
-        self.process = subprocess.Popen([self.binary('python'), '-I', '-c', _OWNER],
+        self.acquiring = True
+        try:
+            self.process = subprocess.Popen([self.binary('python'), '-I', '-c', _OWNER],
                                         env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, close_fds=True,
                                         start_new_session=True, pass_fds=self.leak_fds)
+        except BaseException:
+            self.mark_uncertain('owner_acquisition_unknown')
+            raise
+        self.acquiring = False
         assert self.process.stdin is not None and self.process.stdout is not None
         self.process.stdin.write(json.dumps({'argv': argv, 'env': self.env,
                                             'stdout': str(out), 'stderr': str(err), 'exec': _EXEC, 'leak_fds': self.leak_fds}) + '\n')
@@ -377,10 +384,16 @@ class Lab:
 
     def spawn_transport(self, argv: list[str]) -> subprocess.Popen[str]:
         self.assert_identity()
-        child = subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, close_fds=True, start_new_session=True)
-        self.transport_processes.append(child)
-        self.process_identities[child.pid] = psutil.Process(child.pid).create_time()
+        self.acquiring = True
+        try:
+            child = subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True, close_fds=True, start_new_session=True)
+            self.transport_processes.append(child)
+            self.process_identities[child.pid] = psutil.Process(child.pid).create_time()
+        except BaseException:
+            self.mark_uncertain('transport_acquisition_unknown')
+            raise
+        self.acquiring = False
         return child
 
     def listener_identity(self) -> dict[str, int]:
@@ -449,6 +462,9 @@ class Lab:
             for stream in (child.stdin, child.stdout, child.stderr):
                 if stream is not None:
                     stream.close()
+        if self.process is not None and not self.driver_pid:
+            self.mark_uncertain('driver_handle_unbooked')
+            raise AssertionError('UNKNOWN: no committed VMM identity; retain active fence')
         if self.driver_pid:
             # Scoped fresh LIMA_HOME + exact own instance; never stop-all/delete/adopt.
             result = subprocess.run([self.binary('limactl'), 'stop', self.instance],
@@ -513,6 +529,8 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
         try:
             yield lab
         finally:
+            if lab.acquiring:
+                lab.mark_uncertain('native_acquisition_incomplete')
             if lab.process is not None:
                 try:
                     lab.stop()

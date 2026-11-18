@@ -87,8 +87,8 @@ def test_clean_pushed_worktree_removed(repo: Path) -> None:
     wt = _make_worktree(repo, "t_aaaa1111")
     kbw._cleanup_worktree_workspace("t_aaaa1111", str(wt))
     assert not wt.exists()
-    # auto-generated task branch goes with it
-    assert not _branch_exists(repo, "wt/t_aaaa1111")
+    # local branches remain recoverable after checkout removal
+    assert _branch_exists(repo, "wt/t_aaaa1111")
     # main checkout untouched
     assert (repo / "README.md").exists()
 
@@ -129,7 +129,7 @@ def test_cleanup_proceeds_when_cwd_was_deleted(
     kbw._cleanup_worktree_workspace("t_deadcwd113073", str(wt))
 
     assert not wt.exists()
-    assert not _branch_exists(repo, "wt/t_deadcwd113073")
+    assert _branch_exists(repo, "wt/t_deadcwd113073")
 
 
 def test_cleanup_retries_worktree_removal_once(
@@ -166,6 +166,16 @@ def test_dirty_worktree_preserved(repo: Path) -> None:
     assert (wt / "wip.txt").exists()
 
 
+def test_ignored_evidence_preserved(repo: Path) -> None:
+    wt = _make_worktree(repo, "t_ignored")
+    exclude = Path(_git("-C", str(repo), "rev-parse", "--path-format=absolute", "--git-path", "info/exclude").strip())
+    exclude.write_text("evidence-secret\n", encoding="utf-8")
+    (wt / "evidence-secret").write_text("unique ignored data", encoding="utf-8")
+    kbw._cleanup_worktree_workspace("t_ignored", str(wt))
+    assert (wt / "evidence-secret").read_text() == "unique ignored data"
+    assert _branch_exists(repo, "wt/t_ignored")
+
+
 def test_unpushed_commits_preserved(repo: Path) -> None:
     wt = _make_worktree(repo, "t_cccc3333")
     (wt / "work.txt").write_text("committed but not pushed\n", encoding="utf-8")
@@ -179,7 +189,7 @@ def test_custom_branch_survives_worktree_removal(repo: Path) -> None:
     wt = _make_worktree(repo, "t_dddd4444", branch="feature/custom")
     kbw._cleanup_worktree_workspace("t_dddd4444", str(wt), "feature/custom")
     assert not wt.exists()
-    # only auto-generated wt/* branches are deleted
+    # custom branches and auto-generated branches both survive
     assert _branch_exists(repo, "feature/custom")
 
 
@@ -245,7 +255,7 @@ def test_complete_task_reaps_clean_worktree(kanban_home: Path, repo: Path) -> No
         assert kb.claim_task(conn, tid, claimer="worker") is not None
         assert kb.complete_task(conn, tid, summary="done")
     assert not wt.exists()
-    assert not _branch_exists(repo, f"wt/{tid}")
+    assert _branch_exists(repo, f"wt/{tid}")
 
 
 def test_complete_task_preserves_dirty_worktree(kanban_home: Path, repo: Path) -> None:

@@ -1187,6 +1187,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    workspace_admission: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1234,13 +1235,13 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
+    from hermes_cli.kanban_db_workspace import validate_workspace_admission, workspace_creation_admission
+    workspace_admission = validate_workspace_admission(workspace_admission, workspace_kind, workspace_path, branch_name)
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
-
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
     # race may insert twice, the next lookup stabilises on the newest.
     if idempotency_key:
@@ -1251,16 +1252,13 @@ def create_task(
         ).fetchone()
         if row:
             return row["id"]
-
     now = int(time.time())
-
     # Only persistent kinds inherit the board ``default_workdir``: a scratch
     # task inheriting it would point cleanup at the user's source tree.
     if workspace_path is None and project_repo is None and workspace_kind in {"dir", "worktree"}:
         board_default = _board_meta_for(board).get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
-
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -1276,7 +1274,6 @@ def create_task(
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
-
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -1315,6 +1312,8 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "completion_contract": completion_contract,
+                        **({"workspace_admission": workspace_creation_admission(conn, task_id, workspace_admission)} if workspace_admission is not None else {}),
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -1888,6 +1887,7 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    from hermes_cli.kanban_db_workspace import preserve_workspace_binding
     conn.execute(
         """
         UPDATE task_runs
@@ -1901,7 +1901,7 @@ def _end_run(
          WHERE id = ?
            AND ended_at IS NULL
         """,
-        (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
+        (status or outcome, outcome, summary, error, _json_or_null(preserve_workspace_binding(conn, run_id, metadata)), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
     return run_id
@@ -4030,7 +4030,7 @@ def _retention_seconds(older_than_seconds: int) -> int:
 
 
 def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3600) -> int:
-    """Prune old done/archived events, retaining created/decomposed identity until task deletion.
+    """Prune terminal history, retaining creation/graph/workspace identity until task deletion.
 
     Ordinary events still expire; ``older_than_seconds=0`` means everything older
     than now (the CLI maps ``--event-retention-days 0`` to "disabled").
@@ -4038,7 +4038,7 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
         cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed') "
+            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed', 'workspace_bound') "
             "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
         )
     return int(cur.rowcount or 0)

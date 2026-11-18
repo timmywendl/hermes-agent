@@ -498,20 +498,33 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert not (parent / 'STOP_UNCERTAIN').exists(), 'UNKNOWN custody under lock; no new VM'
+        active = parent / 'ACTIVE_RUN'
+        assert not active.exists(), 'UNKNOWN: prior runner may have died; no automatic adoption'
         root = parent / ('case-' + uuid.uuid4().hex)
         root.mkdir(mode=0o700)
         lab = Lab(gate, root, gate['namespace'])
         lab.record('execution-manifest', gate)
+        # Durable fail-closed presence survives abrupt pytest/owner death; flock
+        # release alone is never evidence that an old VM/writer has stopped.
+        with active.open('x') as lease:
+            json.dump({'case_root': str(root), 'instance_namespace': gate['namespace']}, lease)
+            lease.flush()
+            os.fsync(lease.fileno())
         try:
             yield lab
         finally:
             if lab.process is not None:
                 try:
                     lab.stop()
-                except Exception:
+                except BaseException:
                     lab.mark_uncertain('teardown_failed')
                     (parent / 'STOP_UNCERTAIN').touch(exist_ok=True)
                     raise
+            if lab.uncertain:
+                (parent / 'STOP_UNCERTAIN').touch(exist_ok=True)
+            else:
+                assert lab.process is None or lab.verified_stop
+                active.unlink()
     finally:
         lock.close()
 

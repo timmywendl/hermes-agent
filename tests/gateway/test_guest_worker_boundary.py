@@ -544,6 +544,9 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
             os.fsync(lease.fileno())
         try:
             yield lab
+        except BaseException:
+            lab.mark_uncertain('case_failed_or_interrupted')
+            raise
         finally:
             if lab.acquiring:
                 lab.mark_uncertain('native_acquisition_incomplete')

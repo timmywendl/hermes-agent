@@ -742,7 +742,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
             return _err(f"cannot claim {args.task_id}: status={existing.status} "
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task, conn=conn)
-        kbw.set_workspace_path(conn, task.id, str(workspace))
+        branch = (task.branch_name or f"wt/{task.id}") if task.workspace_kind == "worktree" else None
+        with kbw._workspace_claim_guard(conn, task, workspace, branch) as current:
+            if not current:
+                return _err(f"claim for {task.id} changed before workspace binding")
     print(f"Claimed {task.id}\nWorkspace: {workspace}")
     return 0
 

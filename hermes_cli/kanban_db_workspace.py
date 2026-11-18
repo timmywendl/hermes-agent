@@ -16,7 +16,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 from typing import TYPE_CHECKING
 import contextlib
 
@@ -872,6 +872,49 @@ def _read_workspace_binding(conn: sqlite3.Connection, task: Task) -> Optional[di
     return None
 
 
+def _verify_admitted_checkout(target: Path, contract: dict[str, Any], *, initial: bool) -> None:
+    if (_path_key(_git_toplevel(target)) != _path_key(target)
+            or not _is_linked_worktree_checkout(target)
+            or _path_key(_git_common_dir(target)) != _path_key(Path(contract["common_dir"]))
+            or _git_current_branch(target) != contract["branch_name"]):
+        raise ValueError("workspace checkout repo/common-dir/branch mismatch")
+    base = contract["base_commit"]
+    if initial and _required_git(target, "rev-parse", "HEAD") != base:
+        raise ValueError("workspace checkout base mismatch")
+    _required_git(target, "merge-base", "--is-ancestor", base, "HEAD")
+
+
+@contextlib.contextmanager
+def _workspace_claim_guard(
+    conn: sqlite3.Connection, task: Task, workspace: Path, branch_name: Optional[str],
+) -> Iterator[bool]:
+    """Keep the native writer lock through launch/PID booking; hooks run after commit."""
+    from hermes_cli.kanban_db_connect import write_txn
+    with write_txn(conn):
+        try:
+            _check_workspace_claim(conn, task)
+        except ValueError:
+            yield False
+            return
+        if task.workspace_kind != "worktree":
+            branch_name = task.branch_name
+        admission = _created_workspace_admission(conn, task.id)
+        if admission is not None:
+            binding = _read_workspace_binding(conn, task)
+            if (binding is None or binding.get("run_id") != task.current_run_id
+                    or binding.get("claim_lock") != task.claim_lock
+                    or binding.get("admission") != admission):
+                raise ValueError("native workspace binding no longer matches the current launch claim")
+            if str(workspace) != admission["workspace_path"] or branch_name != admission["branch_name"]:
+                raise ValueError("launch workspace/branch differs from original admission")
+            _check_workspace_ownership(conn, task, workspace)
+            _verify_admitted_checkout(workspace, admission, initial=False)
+        conn.execute("UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
+                     (str(workspace), branch_name, task.id))
+        task.workspace_path, task.branch_name = str(workspace), branch_name
+        yield True
+
+
 def _resolve_admitted_worktree(
     conn: sqlite3.Connection, task: Task, admission: dict[str, Any],
 ) -> tuple[Path, str]:
@@ -898,14 +941,7 @@ def _resolve_admitted_worktree(
                 args = ["worktree", "add", "-b", branch, str(target), base]
             target.parent.mkdir(parents=True, exist_ok=True)
             _required_git(source, *args)
-        if (_path_key(_git_toplevel(target)) != _path_key(target)
-                or not _is_linked_worktree_checkout(target)
-                or _path_key(_git_common_dir(target)) != _path_key(Path(contract["common_dir"]))
-                or _git_current_branch(target) != branch):
-            raise ValueError("workspace checkout repo/common-dir/branch mismatch")
-        if prior is None and _required_git(target, "rev-parse", "HEAD") != base:
-            raise ValueError("workspace checkout base mismatch")
-        _required_git(target, "merge-base", "--is-ancestor", base, "HEAD")
+        _verify_admitted_checkout(target, contract, initial=prior is None)
         _check_workspace_claim(conn, task)
         _check_workspace_ownership(conn, task, target)
         binding = {"admission": admission, "task_id": task.id, "run_id": task.current_run_id,
@@ -921,15 +957,20 @@ def _resolve_admitted_worktree(
 
 
 def preserve_workspace_binding(
-    conn: sqlite3.Connection, run_id: int, metadata: Optional[dict[str, Any]],
+    conn: sqlite3.Connection, run_id: Optional[int], metadata: Optional[dict[str, Any]],
 ) -> Optional[dict[str, Any]]:
-    row = conn.execute("SELECT metadata FROM task_runs WHERE id = ?", (run_id,)).fetchone()
-    existing = _kb._json_dict(row["metadata"] if row else None)
-    if "workspace_binding" not in existing:
-        if metadata is not None and "workspace_binding" in metadata:
-            return {key: value for key, value in metadata.items() if key != "workspace_binding"}
-        return metadata
-    return {**(metadata or {}), "workspace_binding": existing["workspace_binding"]}
+    """Only native run-scoped receipts establish custody; free metadata never does."""
+    row = conn.execute(
+        "SELECT e.payload, r.task_id, r.claim_lock FROM task_runs r JOIN task_events e ON e.run_id = r.id "
+        "WHERE r.id = ? AND e.task_id = r.task_id AND e.kind = 'workspace_bound' ORDER BY e.id DESC LIMIT 1",
+        (run_id,),
+    ).fetchone()
+    clean = {key: value for key, value in (metadata or {}).items() if key != "workspace_binding"}
+    binding = _kb._json_dict(row["payload"] if row else None)
+    if (row is not None and binding.get("task_id") == row["task_id"]
+            and binding.get("run_id") == run_id and binding.get("claim_lock") == row["claim_lock"]):
+        return {**clean, "workspace_binding": binding}
+    return clean if metadata is not None else None
 
 
 def _resolve_worktree_workspace(

@@ -1376,6 +1376,7 @@ def _record_task_failure(
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
     infrastructure: bool = False,
+    expected_run_id: Optional[int] = None, expected_claim_lock: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome and maybe trip the circuit breaker; every
     non-success path funnels through here so ``consecutive_failures`` stays
@@ -1400,10 +1401,14 @@ def _record_task_failure(
     error = error[:500]
     with _kb.write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries, current_run_id "
+            "SELECT consecutive_failures, status, max_retries, current_run_id, claim_lock "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
+            return False
+        if expected_run_id is not None and (
+                row["status"] != "running" or row["current_run_id"] != expected_run_id
+                or row["claim_lock"] != expected_claim_lock):
             return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
@@ -1411,14 +1416,12 @@ def _record_task_failure(
             else ("review" if row["status"] == "review" else "ready")
         )
         failures = int(row["consecutive_failures"]) + (0 if infrastructure else 1)
-
         # Per-task override wins over caller-supplied and default thresholds.
         task_override = _kb._row_get(row, "max_retries")
         if task_override is not None:
             effective_limit, limit_source = int(task_override), "task"
         else:
             effective_limit, limit_source = int(failure_limit), "dispatcher"
-
         if infrastructure or not (force_trip or failures >= effective_limit):
             if release_claim:
                 # Spawn path: restore the claimed source phase + clear claim.
@@ -1445,7 +1448,6 @@ def _record_task_failure(
                 )
                 _kb._append_event(conn, task_id, outcome, {"error": error, **detail}, run_id=run_id)
             return False
-
         # Spawn path (release_claim) is still running and also clears claim
         # state; the timeout/crash path already did.
         conn.execute(
@@ -1486,7 +1488,6 @@ def _record_task_failure(
         _kb._append_event(conn, task_id, "gave_up", payload, run_id=run_id)
         return True
 
-
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=None, claim_lock=None) -> None:
     """Publish the launcher only while this claim has no executing worker yet, together with its
     restart-stable fingerprint (``_process_fingerprint``); the ``spawned`` event carries both. The
@@ -1495,7 +1496,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, run_id=
     never NULL: NULL is the legacy pre-fingerprint row whose bare-PID kill authority a new spawn must
     not inherit."""
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
-    with _kb.write_txn(conn):
+    with _kb.write_txn(conn, allow_nested=True):
         if run_id is None:
             run_id = _kb._current_run_id(conn, task_id)
         cur = conn.execute(
@@ -2032,17 +2033,17 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+def _call_spawn_fn(spawn_fn: Callable[..., Optional[int]], task: Task, workspace: str, board: Optional[str], *, lane: str = "ready") -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
+    if lane == "review":
+        task.skills = list(dict.fromkeys([*(task.skills or []), "sdlc-review"]))
     try:
-        sig = inspect.signature(spawn_fn)
-        if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
+        supports_board = "board" in inspect.signature(spawn_fn).parameters
     except (TypeError, ValueError):
-        return spawn_fn(task, workspace)
+        supports_board = False
+    return spawn_fn(task, workspace, board=board) if supports_board else spawn_fn(task, workspace)
 
 
 def _dispatch_lane_task(
@@ -2107,7 +2108,6 @@ def _dispatch_lane_task(
             with _kb.write_txn(conn):
                 _kb._append_event(conn, task_id, "respawn_guarded", {"reason": guard_reason})
         return False
-
     def _count_spawn(name: str) -> None:
         # Later rows in this tick respect the per-profile cap; subsequent
         # ticks re-query from the DB.
@@ -2132,21 +2132,18 @@ def _dispatch_lane_task(
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            expected_run_id=claimed.current_run_id, expected_claim_lock=claimed.claim_lock,
         ):
             result.auto_blocked.append(claimed.id)
         return False
-    _kbw.set_workspace_path(conn, claimed.id, str(workspace))
-    if claimed.workspace_kind == "worktree":
-        _kbw.set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
-    _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-    if lane == "review":
-        # Force-load sdlc-review; the kanban lifecycle is already in every
-        # worker's system prompt via KANBAN_GUIDANCE.
-        claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
-        if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        with _kbw._workspace_claim_guard(conn, claimed, workspace, resolved_branch_name) as current:
+            if not current:
+                return False
+            pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board, lane=lane)
+            if pid:
+                _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
+        _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2167,6 +2164,7 @@ def _dispatch_lane_task(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
             infrastructure=infrastructure,
+            expected_run_id=claimed.current_run_id, expected_claim_lock=claimed.claim_lock,
         ):
             result.auto_blocked.append(claimed.id)
         return False

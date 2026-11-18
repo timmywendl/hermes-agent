@@ -1968,6 +1968,7 @@ def _synthesize_ended_run(
     ``profile`` overrides the profile read off the task row: transitions that
     reassign the task (e.g. review handoff) pass the acting profile captured
     before the rewrite, so the run names the actor, not the new assignee."""
+    from hermes_cli.kanban_db_workspace import preserve_workspace_binding
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?", (task_id,),
@@ -1985,8 +1986,8 @@ def _synthesize_ended_run(
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            task_id, profile, step_key, outcome, outcome, summary, error, _json_or_null(metadata),
-            now, now,
+            task_id, profile, step_key, outcome, outcome, summary, error,
+            _json_or_null(preserve_workspace_binding(conn, None, metadata)), now, now,
         ),
     )
     return int(cur.lastrowid or 0)
@@ -3067,6 +3068,7 @@ def edit_task(
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
     """Edit task fields, optionally backfilling a completed task's result."""
+    from hermes_cli.kanban_db_workspace import preserve_workspace_binding
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3113,16 +3115,14 @@ def edit_task(
             (task_id,),
         ).fetchone()
             if run is None:
-                run_id = _synthesize_ended_run(
-                    conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata,
-                )
+                run_id = _synthesize_ended_run(conn, task_id, outcome="completed", summary=handoff_summary, metadata=metadata)
             else:
                 run_id = int(run["id"])
                 conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
                 if metadata is not None:
                     conn.execute(
                         "UPDATE task_runs SET metadata = ? WHERE id = ?",
-                        (json.dumps(metadata, ensure_ascii=False), run_id),
+                        (json.dumps(preserve_workspace_binding(conn, run_id, metadata), ensure_ascii=False), run_id),
                     )
             _append_event(
                 conn, task_id, "edited",

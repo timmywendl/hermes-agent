@@ -148,11 +148,13 @@ def admission(tmp_path: Path) -> dict[str, Any]:
     }
 
 
-def _admitted_task(conn: sqlite3.Connection, admission: dict[str, Any]) -> kb.Task:
+def _admitted_task(
+    conn: sqlite3.Connection, admission: dict[str, Any], *, parents: tuple[str, ...] = (),
+) -> kb.Task:
     tid = kb.create_task(
         conn, title="admitted work", workspace_kind="worktree", project_id="",
         workspace_path=admission["workspace_path"], branch_name=admission["branch_name"],
-        workspace_admission=admission,
+        workspace_admission=admission, parents=parents,
     )
     task = kb.claim_task(conn, tid)
     assert task is not None
@@ -454,5 +456,251 @@ def test_creation_contract_snapshot_survives_later_publication_binding(kanban_ho
             conn.execute("UPDATE task_events SET created_at=1 WHERE task_id=?", (tid,))
         kb.gc_events(conn, older_than_seconds=1)
         assert conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created'", (tid,)).fetchone()[0] == original
+
+
+def _custody_snapshot(conn: sqlite3.Connection, task_id: str) -> dict[str, list[tuple[Any, ...]]]:
+    return {
+        table: [tuple(row) for row in conn.execute(
+            f"SELECT * FROM {table} WHERE {'id' if table == 'tasks' else 'task_id'} = ? ORDER BY id", (task_id,),
+        )] for table in ("tasks", "task_runs", "task_events")
+    }
+
+
+@pytest.mark.parametrize("action", ["revoke", "reclaim", "revoke_and_raise"])
+def test_dispatch_refuses_post_resolution_revocation_without_stale_mutations(
+    kanban_home: Path, admission: dict[str, Any], all_assignees_spawnable: None,
+    monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    real_resolve = kbw._resolve_worktree_workspace
+    spawns: list[int | None] = []
+    captured: dict[str, dict[str, list[tuple[Any, ...]]]] = {}
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="revoked dispatch", assignee="alice", project_id="",
+                             workspace_kind="worktree", workspace_path=admission["workspace_path"],
+                             branch_name=admission["branch_name"], workspace_admission=admission)
+        foreign = kb.create_task(conn, title="unrelated task", initial_status="blocked")
+        before_foreign = _custody_snapshot(conn, foreign)
+        def revoke_after_resolve(task: kb.Task, **kwargs: Any) -> tuple[Path, str]:
+            resolved = real_resolve(task, **kwargs)
+            with kbc.connect_closing() as other:
+                assert kb.block_task(other, task.id, reason="control revoked", kind="needs_input",
+                                     expected_run_id=task.current_run_id)
+                if action == "reclaim":
+                    assert kb.unblock_task(other, task.id)
+                    newer = kb.claim_task(other, task.id, claimer="new-owner")
+                    assert newer is not None and newer.current_run_id != task.current_run_id
+                kbw.set_workspace_path(other, task.id, str(Path(admission["workspace_root"]) / "new-owner"))
+                kbw.set_branch_name(other, task.id, "new-owner/branch")
+                captured["revoked"] = _custody_snapshot(other, task.id)
+            if action == "revoke_and_raise":
+                raise RuntimeError("workspace readback became unavailable after revocation")
+            return resolved
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> None:
+            spawns.append(task.current_run_id)
+        monkeypatch.setattr(kbw, "_resolve_worktree_workspace", revoke_after_resolve)
+        result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
+        assert spawns == [] and result.spawned == []
+        assert _custody_snapshot(conn, tid) == captured["revoked"]
+        assert _custody_snapshot(conn, foreign) == before_foreign
+
+
+@pytest.mark.parametrize("journal_mode", ["WAL", "DELETE"])
+def test_native_launch_holds_board_writer_lock_through_pid_booking(
+    kanban_home: Path, admission: dict[str, Any], all_assignees_spawnable: None,
+    monkeypatch: pytest.MonkeyPatch, journal_mode: str,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    contender = """
+import json, sqlite3, sys
+from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+from hermes_cli.sqlite_safe_read import connect_tracked
+kbc._BUSY_MAX_RETRIES = 0
+conn = connect_tracked(sys.argv[1], timeout=0, isolation_level=None)
+conn.row_factory = sqlite3.Row
+try:
+    changed = kb.block_task(conn, sys.argv[2], reason='independent writer', kind='needs_input', expected_run_id=int(sys.argv[3]))
+    print(json.dumps({'blocked': changed}))
+except sqlite3.OperationalError as exc:
+    if 'locked' not in str(exc).lower() and 'busy' not in str(exc).lower():
+        raise
+    print(json.dumps({'locked': True}))
+finally:
+    conn.close()
+"""
+    with kbc.connect_closing() as conn:
+        assert conn.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0].upper() == journal_mode
+        tid = kb.create_task(conn, title="serialized launch", assignee="alice", project_id="",
+                             workspace_kind="worktree", workspace_path=admission["workspace_path"],
+                             branch_name=admission["branch_name"], workspace_admission=admission)
+        attempts: list[dict[str, Any]] = []
+        run_ids: list[int] = []
+        hooks: list[int] = []
+        def attempt_revoke(run_id: int) -> dict[str, Any]:
+            db = conn.execute("PRAGMA database_list").fetchone()[2]
+            result = subprocess.run([sys.executable, "-c", contender, db, tid, str(run_id)],
+                                    cwd=Path(kb.__file__).resolve().parent.parent,
+                                    capture_output=True, text=True, check=True, timeout=15)
+            value: dict[str, Any] = json.loads(result.stdout)
+            return value
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> int:
+            assert task.current_run_id is not None
+            run_ids.append(task.current_run_id)
+            attempts.append(attempt_revoke(task.current_run_id))
+            assert conn.in_transaction
+            return 123456789
+        def spawned_hook(db: sqlite3.Connection, task: kb.Task, workspace: str, pid: int | None, **kwargs: Any) -> None:
+            assert not db.in_transaction
+            with kbc.connect_closing() as other:
+                stored = other.execute("SELECT worker_pid FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()
+                assert stored[0] == pid == 123456789
+            hooks.append(pid)
+        monkeypatch.setattr(kbd, "_process_fingerprint", lambda _pid: "offline-fixture")
+        monkeypatch.setattr(kb, "_fire_worker_spawned_hook", spawned_hook)
+        result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
+        assert len(result.spawned) == 1 and attempts == [{"locked": True}]
+        task = kb.get_task(conn, tid)
+        assert task is not None and task.worker_pid == 123456789
+        assert conn.execute("SELECT worker_pid FROM task_runs WHERE id=?", (run_ids[0],)).fetchone()[0] == 123456789
+        assert not conn.in_transaction
+        assert hooks == [123456789]
+        assert attempt_revoke(run_ids[0]) == {"blocked": True}
+
+
+def test_launch_rechecks_another_task_binding_added_after_resolution(
+    kanban_home: Path, admission: dict[str, Any], all_assignees_spawnable: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    real_resolve = kbw._resolve_worktree_workspace
+    aliases: list[tuple[str, dict[str, list[tuple[Any, ...]]]]] = []
+    spawns: list[int | None] = []
+    with kbc.connect_closing() as conn:
+        kb.create_task(conn, title="owned checkout", assignee="alice", project_id="",
+                       workspace_kind="worktree", workspace_path=admission["workspace_path"],
+                       branch_name=admission["branch_name"], workspace_admission=admission)
+        def add_alias_after_resolve(task: kb.Task, **kwargs: Any) -> tuple[Path, str]:
+            resolved = real_resolve(task, **kwargs)
+            with kbc.connect_closing() as other:
+                alias = kb.create_task(other, title="new competing path binding", initial_status="blocked",
+                                       project_id="", workspace_kind="dir", workspace_path=str(resolved[0]))
+                aliases.append((alias, _custody_snapshot(other, alias)))
+            return resolved
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> None:
+            spawns.append(task.current_run_id)
+        monkeypatch.setattr(kbw, "_resolve_worktree_workspace", add_alias_after_resolve)
+        result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
+        assert result.spawned == [] and spawns == []
+        assert all(_custody_snapshot(conn, tid) == snapshot for tid, snapshot in aliases)
+
+
+def test_spawn_failure_accounting_cannot_close_a_newer_claim(
+    kanban_home: Path, admission: dict[str, Any], all_assignees_spawnable: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    real_failure = kbd._record_task_failure
+    captured: dict[str, dict[str, list[tuple[Any, ...]]]] = {}
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="old launch fails", assignee="alice", project_id="",
+                             workspace_kind="worktree", workspace_path=admission["workspace_path"],
+                             branch_name=admission["branch_name"], workspace_admission=admission)
+        def launch_failure(task: kb.Task, workspace: str, board: str | None = None) -> None:
+            raise RuntimeError("inert launcher refused")
+        def replace_claim_before_failure(db: sqlite3.Connection, task_id: str, *args: Any, **kwargs: Any) -> bool:
+            with kbc.connect_closing() as other:
+                assert kb.block_task(other, task_id, reason="revoked failed launcher", kind="needs_input")
+                assert kb.unblock_task(other, task_id)
+                assert kb.claim_task(other, task_id, claimer="new-owner") is not None
+                captured["newer"] = _custody_snapshot(other, task_id)
+            return real_failure(db, task_id, *args, **kwargs)
+        monkeypatch.setattr(kbd, "_record_task_failure", replace_claim_before_failure)
+        result = kbd.dispatch_once(conn, spawn_fn=launch_failure, reconcile_orphans=False)
+        assert result.spawned == []
+        assert _custody_snapshot(conn, tid) == captured["newer"]
+
+
+@pytest.mark.parametrize("kind", ["scratch", "dir"])
+def test_launch_preserves_existing_non_worktree_branch_metadata(
+    kanban_home: Path, tmp_path: Path, all_assignees_spawnable: None, kind: str,
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="legacy branch metadata", assignee="alice", project_id="",
+                             workspace_kind=kind, workspace_path=str(tmp_path / "checkout") if kind == "dir" else None)
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE tasks SET branch_name='legacy/retained' WHERE id=?", (tid,))
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> None:
+            assert task.branch_name == "legacy/retained"
+            assert conn.execute("SELECT branch_name FROM tasks WHERE id=?", (tid,)).fetchone()[0] == "legacy/retained"
+        result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
+        assert len(result.spawned) == 1
+
+
+@pytest.mark.parametrize("failure", [TypeError, ValueError, RuntimeError])
+def test_launch_callback_exception_is_not_retried(
+    kanban_home: Path, all_assignees_spawnable: None, failure: type[Exception],
+) -> None:
+    from hermes_cli import kanban_db_dispatch as kbd
+    attempts: list[str] = []
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="single launch attempt", assignee="alice", project_id="")
+        def inert_spawn(task: kb.Task, workspace: str, board: str | None = None) -> None:
+            attempts.append(task.id)
+            raise failure("inert launcher failed")
+        result = kbd.dispatch_once(conn, spawn_fn=inert_spawn, reconcile_orphans=False)
+        assert result.spawned == [] and attempts == [tid]
+
+
+@pytest.mark.parametrize("metadata", [None, {"receipt": "new"}, {"receipt": "new", "workspace_binding": {"forged": True}}])
+def test_result_edit_preserves_native_binding_through_owner_reopen_and_reuse(
+    kanban_home: Path, admission: dict[str, Any], metadata: dict[str, Any] | None,
+) -> None:
+    with kbc.connect_closing() as conn:
+        parent = kb.create_task(conn, title="offline dependency")
+        assert kb.complete_task(conn, parent, summary="dependency done")
+        task = _admitted_task(conn, admission, parents=(parent,))
+        target = kbw.resolve_workspace(task, conn=conn)
+        native = kbw._read_workspace_binding(conn, task)
+        assert native is not None
+        assert kb.complete_task(conn, task.id, summary="first result", expected_run_id=task.current_run_id,
+                                metadata={"receipt": "original"})
+        assert kb.edit_task(conn, task.id, result="corrected result", metadata=metadata)
+        assert kbw._read_workspace_binding(conn, task) == native
+        stored = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?", (task.current_run_id,)).fetchone()[0])
+        assert stored["workspace_binding"] == native
+        assert stored["receipt"] == ("original" if metadata is None else "new")
+        # The native parent-reopen caller composes its status flip with descendant invalidation.
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (parent,))
+            kb.invalidate_descendants_for_parent_reopen(conn, parent, author="offline-control")
+        assert kb.complete_task(conn, parent, summary="dependency done again")
+        resumed = kb.claim_task(conn, task.id)
+        assert resumed is not None and resumed.current_run_id != task.current_run_id
+        assert kbw.resolve_workspace(resumed, conn=conn) == target
+        rebound = kbw._read_workspace_binding(conn, resumed)
+        assert rebound is not None and rebound["run_id"] == resumed.current_run_id
+        assert stored["workspace_binding"] == native
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_result_edit_and_synthesized_run_cannot_inject_workspace_authority(
+    kanban_home: Path, claimed: bool,
+) -> None:
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="no native workspace")
+        task = kb.claim_task(conn, tid) if claimed else None
+        forged = {"workspace_binding": {"forged": True}, "receipt": "valid"}
+        assert kb.complete_task(conn, tid, summary="done", metadata=forged,
+                                expected_run_id=task.current_run_id if task is not None else None)
+        assert all("workspace_binding" not in json.loads(row[0]) for row in conn.execute(
+            "SELECT metadata FROM task_runs WHERE task_id=?", (tid,),
+        ))
+        # A legacy free-metadata forgery without a native workspace_bound event is not authority either.
+        with kbc.write_txn(conn):
+            conn.execute("UPDATE task_runs SET metadata=? WHERE task_id=?", (json.dumps(forged), tid))
+        assert kb.edit_task(conn, tid, result="backfilled", metadata=forged)
+        rows = conn.execute("SELECT metadata FROM task_runs WHERE task_id=?", (tid,)).fetchall()
+        assert all(json.loads(row[0]) == {"receipt": "valid"} for row in rows)
 
 

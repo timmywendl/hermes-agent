@@ -11,7 +11,7 @@ Manifest v1 (all paths absolute/canonical; no real credentials):
   expires_at=Unix seconds; root=<private temporary directory>; namespace=q1-<32hex>;
   binaries={limactl,ssh,sandbox,python,lsof,git,scutil}: {path,sha256}; artifacts={image,policy,
   identity,known_hosts,guestagent}: {path,sha256}; policies={M1..M6}: {path,sha256};
-  dns_control={server:'127.0.0.1',port:53,suffix:'q1.test.'};
+  dns_control={server:'127.0.0.1',port:53,suffix:'q1.test.',exclusive_host_lease:decision_ref};
   guest_user; guest_python=/usr/bin/python3; ssh_port>1024; host_ipv6=<local ULA>;
   guest_gateway=192.168.5.2; resources={cpus:2,memory_gib:4,disk_gib:12};
   deadlines={start:180,stop:45,probe:5,total:2700}; allowed_nodeids=[exact nodeids].
@@ -127,6 +127,10 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     if not required.issubset(data):
         pytest.skip('UNAVAILABLE/NOT_RUN: incomplete frozen authorization parameters')
     assert set(data) == required and type(data['version']) is int and data['version'] == 1
+    if sys.flags.optimize:
+        raise RuntimeError('UNAVAILABLE: native qualification cannot use python -O')
+    assert data['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.',
+                                   'exclusive_host_lease': data['decision_ref']}
     assert data['allow_unconfined_controls'] is True, 'native positive/mutant controls need explicit scope'
     assert data['authorization'] == 'STAGE3_Q1_NATIVE_VZ_EXECUTION_V1'
     assert re.fullmatch(r'https://github\.com/[^/]+/[^/]+/(issues|pull)/\d+#issuecomment-\d+',
@@ -251,7 +255,7 @@ class Lab:
                  'containerd': {'system': False, 'user': False},
                  'hostResolver': {'enabled': False}, 'propagateProxyEnv': False,
                  'rosetta': {'enabled': False},
-                 'user': {'name': self.gate['guest_user']}, 'passwordlessSudo': False,
+                 'user': {'name': self.gate['guest_user'], 'passwordlessSudo': False},
                  'ssh': {'localPort': self.gate['ssh_port'], 'overVsock': over_vsock,
                          'forwardAgent': False, 'loadDotSSHPubKeys': False}}
         if self.current_variant == 'M6':
@@ -325,6 +329,7 @@ class Lab:
         deadline = time.monotonic() + self.gate['deadlines']['start']
         while time.monotonic() < deadline:
             self.check_budget()
+            assert not self._events_path.exists() or self._events_path.stat().st_size <= 1048576, 'event log budget'
             events = self._events_path.read_text() if self._events_path.exists() else ''
             # Parse native structured HostAgent events, not a Guest hello/log substring.
             # Ignore only an incomplete final line; malformed complete events fail.
@@ -709,6 +714,9 @@ def test_native_m1_m4_vmm_policy_sensitivity(native_lab: Lab, mutation: str) -> 
     with witness(family, kind, host) as (server, token):
         # This operation traverses the actual mutant VMM/gvisor, not a separate
         # Host Python process bearing a different executable entitlement.
+        if mutation == 'M3':
+            # Valid DNS-format bytes sent only to our disposable UDP listener.
+            token = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x02q1\x04test\x00\x00\x10\x00\x01'
         guest_connect(lab, target, server.getsockname()[1], family, kind, token)
         if kind == socket.SOCK_STREAM:
             connection, _ = server.accept()
@@ -790,6 +798,9 @@ print(json.dumps({{'reached':reached}}))
 def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
     """Existing resolver configuration must ALREADY name only our loopback stub.
 
+    Requires an explicitly approved exclusive Host resolver lease in the later
+    D1 decision. scutil metadata alone does NOT establish that lease or absence
+    of unrelated clients. On a shared/production Host this case is UNAVAILABLE.
     This never installs/changes a resolver, adopts an occupied port, forwards a
     query, or contacts a public nameserver. An ordinary production Host with a
     different DNS setup is UNAVAILABLE for this native case; no skip is PASS.
@@ -798,7 +809,8 @@ def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
     import selectors
     import struct
 
-    assert lab.gate['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.'}
+    assert lab.gate['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.',
+                                        'exclusive_host_lease': lab.gate['decision_ref']}
     config = lab.run([lab.binary('scutil'), '--dns'])
     assert config.returncode == 0
     servers = re.findall(r'nameserver\[\d+\]\s*:\s*(\S+)', config.stdout)
@@ -819,9 +831,14 @@ def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
             offset += size + 1
         name = '.'.join(labels) + '.'
         assert re.fullmatch(r'[0-9a-f]{32}\.q1\.test\.', name), 'non-test query: resolver is not isolated'
-        assert packet[offset + 1:offset + 5] == b'\x00\x01\x00\x01'  # A/IN only.
+        qtype = struct.unpack('!H', packet[offset + 1:offset + 3])[0]
+        assert qtype in {1, 28} and packet[offset + 3:offset + 5] == b'\x00\x01'
         seen.append(name)
         question = packet[12:offset + 5]
+        # AF_UNSPEC LookupIPAddr may ask both A and AAAA. Return controlled
+        # A and authoritative NOERROR/NODATA for AAAA, never use upstream DNS.
+        if qtype == 28:
+            return packet[:2] + b'\x81\x80\x00\x01\x00\x00\x00\x00\x00\x00' + question
         header = packet[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'
         record = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x04' + socket.inet_aton('198.18.0.7')
         return header + question + record

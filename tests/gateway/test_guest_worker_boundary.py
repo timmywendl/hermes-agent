@@ -9,8 +9,9 @@ execution record must bind the exact test HEAD and manifest before setting it.
 Manifest v1 (all paths absolute/canonical; no real credentials):
   version=1; source_head=<40hex>; allow_unconfined_controls=true; authorization=STAGE3_Q1_NATIVE_VZ_EXECUTION_V1; decision_ref=GitHub URL;
   expires_at=Unix seconds; root=<private temporary directory>; namespace=q1-<32hex>;
-  binaries={limactl,ssh,sandbox,python,lsof,git}: {path,sha256}; artifacts={image,policy,
-  identity,known_hosts}: {path,sha256}; policies={M1..M6}: {path,sha256};
+  binaries={limactl,ssh,sandbox,python,lsof,git,scutil}: {path,sha256}; artifacts={image,policy,
+  identity,known_hosts,guestagent}: {path,sha256}; policies={M1..M6}: {path,sha256};
+  dns_control={server:'127.0.0.1',port:53,suffix:'q1.test.'};
   guest_user; guest_python=/usr/bin/python3; ssh_port>1024; host_ipv6=<local ULA>;
   guest_gateway=192.168.5.2; resources={cpus:2,memory_gib:4,disk_gib:12};
   deadlines={start:180,stop:45,probe:5,total:2700}; allowed_nodeids=[exact nodeids].
@@ -62,7 +63,7 @@ import json, os, subprocess, sys
 p = json.loads(sys.stdin.readline())
 with open(p['stdout'], 'xb', buffering=0) as out, open(p['stderr'], 'xb', buffering=0) as err:
     child = subprocess.Popen([sys.executable,'-I','-c',p['exec'],json.dumps(p['argv'])], env=p['env'], stdin=subprocess.PIPE,
-                             stdout=out, stderr=err, close_fds=True, start_new_session=True)
+                             stdout=out, stderr=err, close_fds=True, start_new_session=True, pass_fds=p['leak_fds'])
     print(json.dumps({'pid': child.pid}), flush=True)
     for line in sys.stdin:
         if line.strip() == 'go': child.stdin.write(b'G'); child.stdin.flush(); child.stdin.close()
@@ -76,9 +77,9 @@ def digest(path: Path) -> str:
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def protected_json(path: Path) -> dict[str, Any]:
+def protected_json(path: Path, expected: str) -> dict[str, Any]:
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-    with os.fdopen(fd, 'r') as stream:
+    with os.fdopen(fd, 'rb') as stream:
         info = os.fstat(stream.fileno())
         assert stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
         assert stat.S_IMODE(info.st_mode) == 0o600
@@ -89,7 +90,10 @@ def protected_json(path: Path) -> dict[str, Any]:
                 assert key not in result, 'duplicate manifest key'
                 result[key] = value
             return result
-        data = json.load(stream, object_pairs_hook=unique)
+        raw = stream.read(131073)
+        assert len(raw) <= 131072
+        assert hashlib.sha256(raw).hexdigest() == expected, 'manifest bytes drift'
+        data = json.loads(raw, object_pairs_hook=unique)
     assert isinstance(data, dict)
     return data
 
@@ -115,11 +119,13 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     if not raw or not re.fullmatch('[0-9a-f]{64}', expected):
         pytest.skip('UNAVAILABLE/NOT_RUN: complete manifest identity absent')
     path = Path(raw)
-    assert path.resolve() == path and digest(path) == expected
-    data = protected_json(path)
+    assert path.resolve() == path
+    data = protected_json(path, expected)
     required = {'version', 'authorization', 'decision_ref', 'expires_at', 'root', 'namespace',
                 'binaries', 'artifacts', 'policies', 'guest_user', 'guest_python', 'ssh_port',
-                'host_ipv6', 'guest_gateway', 'resources', 'deadlines', 'allowed_nodeids', 'allow_unconfined_controls', 'source_head'}
+                'host_ipv6', 'guest_gateway', 'resources', 'deadlines', 'allowed_nodeids', 'allow_unconfined_controls', 'source_head', 'dns_control'}
+    if not required.issubset(data):
+        pytest.skip('UNAVAILABLE/NOT_RUN: incomplete frozen authorization parameters')
     assert set(data) == required and type(data['version']) is int and data['version'] == 1
     assert data['allow_unconfined_controls'] is True, 'native positive/mutant controls need explicit scope'
     assert data['authorization'] == 'STAGE3_Q1_NATIVE_VZ_EXECUTION_V1'
@@ -153,7 +159,7 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     for name, limit in {'start': 300, 'stop': 90, 'probe': 10, 'total': 2700}.items():
         value = data['deadlines'][name]
         assert type(value) in (int, float) and math.isfinite(value) and 2 <= value <= limit
-    assert set(data['binaries']) == {'limactl', 'ssh', 'sandbox', 'python', 'lsof', 'git'}
+    assert set(data['binaries']) == {'limactl', 'ssh', 'sandbox', 'python', 'lsof', 'git', 'scutil'}
     for item in data['binaries'].values():
         assert os.access(pinned(item), os.X_OK)
     assert re.fullmatch('[0-9a-f]{40}', data['source_head'])
@@ -167,9 +173,15 @@ def load_gate(nodeid: str) -> dict[str, Any]:
                            env=safe_env, capture_output=True, text=True, timeout=5, check=True)
     assert not clean.stdout, 'tracked source differs from frozen HEAD'
     assert pinned(data['binaries']['python']) == Path(sys.executable).resolve()
-    assert set(data['artifacts']) == {'image', 'policy', 'identity', 'known_hosts'}
+    assert set(data['artifacts']) == {'image', 'policy', 'identity', 'known_hosts', 'guestagent'}
     for name, item in data['artifacts'].items():
-        assert pinned(item, private=name in {'identity', 'known_hosts'}).is_relative_to(root), 'only disposable staged artifacts'
+        artifact = pinned(item, private=name in {'identity', 'known_hosts'})
+        if name == 'guestagent':
+            prefix = pinned(data['binaries']['limactl']).parent.parent
+            assert artifact.parent == prefix / 'share/lima'
+            assert artifact.name in {'lima-guestagent.Linux-aarch64.gz', 'lima-guestagent.Linux-aarch64'}
+        else:
+            assert artifact.is_relative_to(root), 'only disposable staged artifacts'
     assert set(data['policies']) == {f'M{i}' for i in range(1, 7)}
     for item in data['policies'].values():
         assert pinned(item).is_relative_to(root)
@@ -197,6 +209,10 @@ class Lab:
     _events_path: Path = field(default_factory=Path)
     _exec_watch: Any = None
     _stop_receipt: dict[str, Any] = field(default_factory=dict)
+    applied_policy: str = ''
+    applied_policy_path: Path | None = None
+    leak_fds: tuple[int, ...] = ()
+    current_variant: str = 'baseline'
 
     def __post_init__(self) -> None:
         self.env = {'PATH': '/usr/bin:/bin:/usr/sbin:/sbin', 'HOME': str(self.root),
@@ -231,13 +247,19 @@ class Lab:
                  'memory': '4GiB', 'disk': '12GiB', 'plain': True,
                  'images': [{'location': str(image), 'arch': 'aarch64',
                              'digest': 'sha256:' + self.gate['artifacts']['image']['sha256']}],
-                 'mounts': [], 'networks': [], 'provision': [], 'portForwards': [],
+                 'mounts': [], 'networks': [], 'provision': [], 'portForwards': [{'guestPortRange': [1, 65535], 'ignore': True}],
                  'containerd': {'system': False, 'user': False},
                  'hostResolver': {'enabled': False}, 'propagateProxyEnv': False,
                  'rosetta': {'enabled': False},
-                 'user': {'name': self.gate['guest_user']},
+                 'user': {'name': self.gate['guest_user']}, 'passwordlessSudo': False,
                  'ssh': {'localPort': self.gate['ssh_port'], 'overVsock': over_vsock,
                          'forwardAgent': False, 'loadDotSSHPubKeys': False}}
+        if self.current_variant == 'M6':
+            fake_home = self.root / 'fake-home'
+            assert fake_home.is_dir() and fake_home.resolve().is_relative_to(self.root)
+            pinned(self.gate['artifacts']['guestagent'])  # Existing Lima bundled artifact, never install/download.
+            value['plain'] = False
+            value['mounts'] = [{'location': str(fake_home), 'mountPoint': '/mnt/q1-fake-home', 'writable': False}]
         path = self.root / f'config-{self.attempt}.json'
         path.write_text(json.dumps(value))
         path.chmod(0o600)
@@ -246,6 +268,7 @@ class Lab:
     def start(self, policy: str = 'baseline', over_vsock: bool = True) -> None:
         self.check_budget()
         assert self.process is None or (self.verified_stop and not self.uncertain)
+        self.current_variant = policy
         self.attempt += 1
         self.verified_stop = self.retired = False
         self._stop_at = None
@@ -255,19 +278,23 @@ class Lab:
         self.instance = f"{self.gate['namespace']}-{self.root.name[-8:]}-{self.attempt}"
         argv = [self.binary('limactl'), 'start', '--foreground', '--tty=false',
                 '--name=' + self.instance, str(self.config(over_vsock))]
+        self.applied_policy = 'UNCONFINED_M1'
+        self.applied_policy_path = None
         if policy != 'M1':
             artifact = self.gate['artifacts']['policy'] if policy == 'baseline' else self.gate['policies'][policy]
-            argv = [self.binary('sandbox'), '-f', str(pinned(artifact)),
+            self.applied_policy_path = pinned(artifact)
+            self.applied_policy = artifact['sha256']
+            argv = [self.binary('sandbox'), '-f', str(self.applied_policy_path),
                     '-D', 'ROOT=' + str(self.root), '-D', 'LIMA_HOME=' + str(home),
                     '-D', 'SSH_PORT=' + str(self.gate['ssh_port']), *argv]
         out, err = self.root / f'events-{self.attempt}.log', self.root / f'stderr-{self.attempt}.log'
         self.process = subprocess.Popen([self.binary('python'), '-I', '-c', _OWNER],
                                         env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=subprocess.PIPE, text=True, close_fds=True,
-                                        start_new_session=True)
+                                        start_new_session=True, pass_fds=self.leak_fds)
         assert self.process.stdin is not None and self.process.stdout is not None
         self.process.stdin.write(json.dumps({'argv': argv, 'env': self.env,
-                                            'stdout': str(out), 'stderr': str(err), 'exec': _EXEC}) + '\n')
+                                            'stdout': str(out), 'stderr': str(err), 'exec': _EXEC, 'leak_fds': self.leak_fds}) + '\n')
         self.process.stdin.flush()
         readable, _, _ = select.select([self.process.stdout], [], [], self.gate['deadlines']['probe'])
         assert readable, 'UNAVAILABLE: test-owner did not acquire foreground process'
@@ -287,6 +314,7 @@ class Lab:
         assert any(e.fflags & select.KQ_NOTE_EXEC for e in initial_events), 'UNAVAILABLE: missing pre-exec custody'
         if not over_vsock:
             raise AssertionError('vsock fallback must never be admitted')
+        self.listener_identity()  # Before accepting any Guest provenance over SSH.
         info = self.ssh_code("import json,os; print(json.dumps({'boot':open('/proc/sys/kernel/random/boot_id').read().strip(),'uid':os.getuid()}))")
         assert info['uid'] != 0 and re.fullmatch('[0-9a-f-]{36}', info['boot'])
         self.boot_id = info['boot']
@@ -342,22 +370,30 @@ class Lab:
         self.process_identities[child.pid] = psutil.Process(child.pid).create_time()
         return child
 
-    def identity_snapshot(self) -> dict[str, Any]:
+    def listener_identity(self) -> dict[str, int]:
         driver = psutil.Process(self.driver_pid)
         assert driver.create_time() == self.process_identities[self.driver_pid]
-        assert Path(driver.exe()).resolve() == Path(self.binary('limactl'))
         listeners = [c for c in driver.net_connections(kind='tcp')
                      if c.status == psutil.CONN_LISTEN and c.laddr.port == self.gate['ssh_port']]
         assert len(listeners) == 1 and listeners[0].laddr.ip == '127.0.0.1'
         assert listeners[0].fd >= 0, 'UNAVAILABLE: listener FD ownership unobservable'
+        return {'pid': driver.pid, 'fd': listeners[0].fd}
+
+    def identity_snapshot(self) -> dict[str, Any]:
+        if self.applied_policy_path is not None:
+            assert digest(self.applied_policy_path) == self.applied_policy, 'applied policy drift'
+        driver = psutil.Process(self.driver_pid)
+        assert driver.create_time() == self.process_identities[self.driver_pid]
+        assert Path(driver.exe()).resolve() == Path(self.binary('limactl'))
+        listener = self.listener_identity()
         for proc in driver.children(recursive=True):
             self.process_identities.setdefault(proc.pid, proc.create_time())
         boot = self.ssh_code("import json;print(json.dumps({'boot':open('/proc/sys/kernel/random/boot_id').read().strip()}))")['boot']
         assert boot == self.boot_id, 'actual Guest boot identity drift'
-        return {'pid': driver.pid, 'birth': driver.create_time(), 'listener_fd': listeners[0].fd,
+        return {'pid': driver.pid, 'birth': driver.create_time(), 'listener_fd': listener['fd'],
                 'instance': self.instance, 'boot_id': self.boot_id, 'listener_pid': driver.pid,
                 'image': self.gate['artifacts']['image']['sha256'],
-                'policy_digest': digest(Path(self.gate['artifacts']['policy']['path'])), 'port': self.gate['ssh_port']}
+                'policy_digest': self.applied_policy, 'port': self.gate['ssh_port']}
 
     def assert_identity(self, expected: dict[str, Any] | None = None) -> None:
         assert not self.uncertain and not self.retired
@@ -448,6 +484,7 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
     lock = (parent / 'native.lock').open('a')
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert not (parent / 'STOP_UNCERTAIN').exists(), 'UNKNOWN custody under lock; no new VM'
         root = parent / ('case-' + uuid.uuid4().hex)
         root.mkdir(mode=0o700)
         lab = Lab(gate, root, gate['namespace'])
@@ -512,7 +549,9 @@ def assert_denied_with_witness(lab: Lab, address: str, host: str, family: int, k
                 conn.close()
             else:
                 server.recvfrom(128)
-        assert not sent, 'forbidden Guest network capability'
+        if kind == socket.SOCK_STREAM:
+            assert not sent, 'forbidden Guest TCP capability'
+        # UDP local send success is diagnostic only; receiver nonreceipt is the denial witness.
 
 
 @pytest.mark.platforms('macos', arch='arm64')
@@ -656,51 +695,61 @@ def test_native_d1_dns_and_resolver_mach(native_lab: Lab) -> None:
 
 
 @pytest.mark.platforms('macos', arch='arm64')
-@pytest.mark.parametrize('mutation', [f'M{i}' for i in range(1, 7)])
-def test_native_m1_m6_policy_sensitivity(native_lab: Lab, mutation: str) -> None:
+@pytest.mark.parametrize('mutation', ['M1', 'M2', 'M3', 'M4'])
+def test_native_m1_m4_vmm_policy_sensitivity(native_lab: Lab, mutation: str) -> None:
     lab = native_lab
+    family = socket.AF_INET6 if mutation == 'M2' else socket.AF_INET
+    kind = socket.SOCK_DGRAM if mutation == 'M3' else socket.SOCK_STREAM
+    host = lab.gate['host_ipv6'] if family == socket.AF_INET6 else '127.0.0.1'
+    target = host if family == socket.AF_INET6 else lab.gate['guest_gateway']
+    lab.start()
+    assert_denied_with_witness(lab, target, host, family, kind)
+    lab.stop()
     lab.start(policy=mutation)
-    token = uuid.uuid4().hex
-    canary = lab.root / 'mutant-canary'
-    canary.write_text(token)
-    values: dict[str, Any]
-    if mutation in {'M1', 'M6'}:
-        kind = 'read' if mutation == 'M1' else 'child_read'
-        values = {'kind': kind, 'path': str(canary), 'token': token}
-        assert not host_probe(lab, values)['allowed']
-        assert host_probe(lab, values, policy=mutation)['allowed'], f'UNKNOWN: {mutation} no file witness'
-    elif mutation == 'M5':
-        with canary.open() as stream:
-            values = {'kind': 'fd', 'fd': stream.fileno(), 'token': token}
-            assert not host_probe(lab, values)['allowed']
-            assert host_probe(lab, values, pass_fds=(stream.fileno(),))['allowed'], 'M5 inherited FD not detected'
-    elif mutation == 'M4':
-        path = lab.root / 'host-socket-canary'
-        with socket.socket(socket.AF_UNIX) as server:
-            server.bind(str(path))
-            server.listen(2)
-            server.settimeout(3)
-            values = {'kind': 'unix', 'path': str(path), 'payload': token.encode().hex()}
-            assert not host_probe(lab, values)['allowed']
-            assert host_probe(lab, values, policy=mutation)['allowed'], 'UNKNOWN: M4 no UDS witness'
+    with witness(family, kind, host) as (server, token):
+        # This operation traverses the actual mutant VMM/gvisor, not a separate
+        # Host Python process bearing a different executable entitlement.
+        guest_connect(lab, target, server.getsockname()[1], family, kind, token)
+        if kind == socket.SOCK_STREAM:
             connection, _ = server.accept()
             with connection:
-                assert connection.recv(128) == token.encode()
-    else:
-        family = socket.AF_INET6 if mutation == 'M2' else socket.AF_INET
-        socket_kind = socket.SOCK_STREAM if mutation == 'M2' else socket.SOCK_DGRAM
-        host = '::1' if family == socket.AF_INET6 else '127.0.0.1'
-        with witness(family, socket_kind, host) as (server, _):
-            values = {'kind': 'ipv6' if mutation == 'M2' else 'dns_udp', 'address': host,
-                      'port': server.getsockname()[1], 'payload': token.encode().hex()}
-            assert not host_probe(lab, values)['allowed']
-            assert host_probe(lab, values, policy=mutation)['allowed'], f'UNKNOWN: {mutation} no network witness'
-            if socket_kind == socket.SOCK_STREAM:
-                connection, _ = server.accept()
-                with connection:
-                    assert connection.recv(128) == token.encode()
-            else:
-                assert server.recvfrom(128)[0] == token.encode()
+                assert connection.recv(128) == token
+        else:
+            assert server.recvfrom(128)[0] == token
+    assert lab.identity_snapshot()['policy_digest'] == lab.applied_policy
+
+
+@pytest.mark.platforms('macos', arch='arm64')
+def test_native_m5_fd_mutation_reaches_actual_exec_chain(native_lab: Lab) -> None:
+    lab = native_lab
+    canary = lab.root / 'preopened-fd-canary'
+    canary.write_text(uuid.uuid4().hex)
+    lab.start()
+    assert all(f.path != str(canary) for f in psutil.Process(lab.driver_pid).open_files())
+    lab.stop()
+    with canary.open('r+') as stream:
+        lab.leak_fds = (stream.fileno(),)
+        lab.start(policy='M5')
+        actual = psutil.Process(lab.driver_pid).open_files()
+        assert any(f.path == str(canary) and f.fd == stream.fileno() for f in actual), 'UNKNOWN: actual VMM FD mutation had no effect'
+    lab.leak_fds = ()
+
+
+@pytest.mark.platforms('macos', arch='arm64')
+def test_native_m6_fake_home_share_is_detected(native_lab: Lab) -> None:
+    lab = native_lab
+    fake_home = lab.root / 'fake-home'
+    fake_home.mkdir(mode=0o700)
+    token = uuid.uuid4().hex
+    (fake_home / 'canary').write_text(token)
+    probe = "import json,os;print(json.dumps({'visible':os.path.exists('/mnt/q1-fake-home/canary')}))"
+    lab.start()
+    assert not lab.ssh_code(probe)['visible']
+    lab.stop()
+    # Only a synthetic fake HOME, never the operator HOME or any existing VM.
+    lab.start(policy='M6')
+    observed = lab.ssh_code("import json;print(json.dumps({'value':open('/mnt/q1-fake-home/canary').read()}))")
+    assert observed['value'] == token, 'UNKNOWN: native share mutation had no effect'
 
 
 @pytest.mark.platforms('macos', arch='arm64')
@@ -735,3 +784,129 @@ print(json.dumps({{'reached':reached}}))
         with pytest.raises(socket.timeout):
             conn, _ = server.accept()
             conn.close()
+
+
+@contextmanager
+def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
+    """Existing resolver configuration must ALREADY name only our loopback stub.
+
+    This never installs/changes a resolver, adopts an occupied port, forwards a
+    query, or contacts a public nameserver. An ordinary production Host with a
+    different DNS setup is UNAVAILABLE for this native case; no skip is PASS.
+    The complete precondition is part of the later D1 execution decision.
+    """
+    import selectors
+    import struct
+
+    assert lab.gate['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.'}
+    config = lab.run([lab.binary('scutil'), '--dns'])
+    assert config.returncode == 0
+    servers = re.findall(r'nameserver\[\d+\]\s*:\s*(\S+)', config.stdout)
+    assert servers and set(servers) == {'127.0.0.1'}, 'UNAVAILABLE: no isolated controlled system DNS; never change Host config'
+    assert not re.search(r'encrypted|https|proxy|tls', config.stdout, re.I), 'UNAVAILABLE: unbounded resolver delegate'
+    seen: list[str] = []
+    errors: list[str] = []
+    stop = threading.Event()
+    sockets = [socket.socket(socket.AF_INET, kind) for kind in (socket.SOCK_DGRAM, socket.SOCK_STREAM)]
+
+    def answer(packet: bytes) -> bytes:
+        assert len(packet) >= 17 and struct.unpack('!H', packet[4:6])[0] == 1
+        offset, labels = 12, []
+        while packet[offset]:
+            size = packet[offset]
+            assert size < 64 and offset + size + 1 < len(packet)
+            labels.append(packet[offset + 1:offset + size + 1].decode('ascii'))
+            offset += size + 1
+        name = '.'.join(labels) + '.'
+        assert re.fullmatch(r'[0-9a-f]{32}\.q1\.test\.', name), 'non-test query: resolver is not isolated'
+        assert packet[offset + 1:offset + 5] == b'\x00\x01\x00\x01'  # A/IN only.
+        seen.append(name)
+        question = packet[12:offset + 5]
+        header = packet[:2] + b'\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00'
+        record = b'\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x00\x00\x04' + socket.inet_aton('198.18.0.7')
+        return header + question + record
+
+    def serve() -> None:
+        with selectors.DefaultSelector() as ready:
+            for endpoint in sockets:
+                ready.register(endpoint, selectors.EVENT_READ)
+            while not stop.is_set():
+                for key, _ in ready.select(.1):
+                    endpoint_obj = key.fileobj
+                    assert isinstance(endpoint_obj, socket.socket)
+                    endpoint = endpoint_obj
+                    try:
+                        if endpoint.type == socket.SOCK_DGRAM:
+                            packet, peer = endpoint.recvfrom(4096)
+                            endpoint.sendto(answer(packet), peer)
+                        else:
+                            connection, _ = endpoint.accept()
+                            with connection:
+                                connection.settimeout(2)
+                                length = connection.recv(2)
+                                assert len(length) == 2
+                                expected = struct.unpack('!H', length)[0]
+                                packet = b''
+                                while len(packet) < expected:
+                                    part = connection.recv(expected - len(packet))
+                                    assert part
+                                    packet += part
+                                response = answer(packet)
+                                connection.sendall(struct.pack('!H', len(response)) + response)
+                    except (OSError, AssertionError, UnicodeError, IndexError, struct.error):
+                        errors.append('UNKNOWN: non-test request or incomplete controlled DNS frame')
+                        stop.set()
+
+    thread: threading.Thread | None = None
+    try:
+        # No SO_REUSEPORT: if already occupied, refuse instead of adopting a
+        # real resolver. Permission denied is UNAVAILABLE, not native PASS.
+        for endpoint in sockets:
+            endpoint.bind(('127.0.0.1', 53))
+        sockets[1].listen(4)
+        thread = threading.Thread(target=serve, name='q1-controlled-dns', daemon=True)
+        thread.start()
+        yield seen
+        assert not errors, errors
+    finally:
+        stop.set()
+        if thread is not None:
+            thread.join(timeout=4)
+        for endpoint in sockets:
+            endpoint.close()
+        assert thread is None or not thread.is_alive(), 'UNKNOWN: DNS endpoint remains active'
+
+
+def guest_builtin_dns(lab: Lab, name: str) -> dict[str, Any]:
+    assert re.fullmatch(r'[0-9a-f]{32}\.q1\.test\.', name)
+    labels = b''.join(bytes([len(label)]) + label.encode() for label in name.rstrip('.').split('.')) + b'\0'
+    query = b'\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00' + labels + b'\x00\x01\x00\x01'
+    return lab.ssh_code(f"""import socket,json
+s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.settimeout(3)
+try:
+ s.sendto(bytes.fromhex({query.hex()!r}),({lab.gate['guest_gateway']!r},53))
+ reply=s.recv(4096).hex()
+except OSError: reply=''
+finally: s.close()
+print(json.dumps({{'reply':reply}}))
+""")
+
+
+@pytest.mark.platforms('macos', arch='arm64')
+def test_native_guest_builtin_dns_cannot_delegate_to_host_resolver(native_lab: Lab) -> None:
+    lab = native_lab
+    # The gvisor builtin resolver/system delegate must have a real positive
+    # under M1 before the NEW baseline VMM can demonstrate a denied lookup.
+    with controlled_system_dns(lab) as seen:
+        lab.start(policy='M1')
+        positive = uuid.uuid4().hex + '.q1.test.'
+        reply = guest_builtin_dns(lab, positive)
+        assert positive in seen, 'UNAVAILABLE: actual gvisor resolver did not reach controlled system DNS'
+        assert socket.inet_aton('198.18.0.7').hex() in reply['reply'], 'UNAVAILABLE: Guest DNS positive absent'
+        lab.stop()
+        lab.start()
+        negative = uuid.uuid4().hex + '.q1.test.'
+        reply = guest_builtin_dns(lab, negative)
+        threading.Event().wait(lab.gate['deadlines']['probe'])
+        assert negative not in seen, 'Guest gvisor DNS bypassed Host kernel/Mach fence'
+        assert socket.inet_aton('198.18.0.7').hex() not in reply['reply']

@@ -248,14 +248,17 @@ class Lab:
                               check=False)
 
     def config(self, over_vsock: bool) -> Path:
-        # Closed config: no user-supplied hooks, downloads, template, extra NIC,
+        # Closed config: one fixed no-op skips Lima package installation;
+        # no user-supplied hooks, downloads, template, extra NIC,
         # mounts, agent forwarding, HostResolver or proxy inheritance.
         image = pinned(self.gate['artifacts']['image'])
         value = {'vmType': 'vz', 'arch': 'aarch64', 'os': 'Linux', 'cpus': 2,
                  'memory': '4GiB', 'disk': '12GiB', 'plain': True,
                  'images': [{'location': str(image), 'arch': 'aarch64',
                              'digest': 'sha256:' + self.gate['artifacts']['image']['sha256']}],
-                 'mounts': [], 'networks': [], 'provision': [], 'portForwards': [{'guestPortRange': [1, 65535], 'ignore': True}],
+                 'mounts': [], 'networks': [],
+                 'provision': [{'mode': 'dependency', 'skipDefaultDependencyResolution': True,
+                                'script': '#!/bin/sh\nexit 0\n'}], 'portForwards': [{'guestPortRange': [1, 65535], 'ignore': True}],
                  'containerd': {'system': False, 'user': False},
                  'hostResolver': {'enabled': False}, 'propagateProxyEnv': False,
                  'rosetta': {'enabled': False},

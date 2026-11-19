@@ -1,0 +1,346 @@
+"""P0 Telegram ingress self-recovery: a plugin that fails its cold-start load deadline must heal.
+
+Real incident (Issue #90): after network degradation the gateway reached ``running`` but the
+``telegram-platform`` plugin exceeded its 10s import/register deadline. The abandoned worker's late
+``register_platform()`` was refused, ``platforms={}``, and nothing ever retried — ingress stayed dead
+for hours while the process looked alive.
+
+Two seams made that permanent, and each test below pins one:
+  * startup treated "no adapter" as a bare ``continue``: no retry queue entry, no status, no
+    ``needs_attention`` — the enabled platform looked served.
+  * the reconnect watcher dropped a platform whose ``_create_adapter`` returned None, so even a
+    queued platform could never come back once its plugin had failed to load.
+
+A permanent failure must still be reported as unhealthy and must not enter a fast restart loop.
+"""
+from __future__ import annotations
+
+import threading
+import time
+from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from gateway.config import Platform, PlatformConfig
+from gateway.run import GatewayRunner
+
+
+class _StubAdapter:
+    """Minimal adapter: records the connect mode and reports success."""
+
+    send_path_degraded = False
+    has_fatal_error = False
+    fatal_error_retryable = True
+    fatal_error_code = None
+    fatal_error_message = None
+
+    def __init__(self, succeed: bool = True):
+        self._succeed = succeed
+        self.connect_calls: list[bool] = []
+
+    async def connect(self, is_reconnect: bool = False) -> bool:
+        self.connect_calls.append(is_reconnect)
+        return self._succeed
+
+    async def disconnect(self) -> None:
+        pass
+
+    async def cancel_background_tasks(self) -> None:
+        pass
+
+    def rewire_plugin_handlers(self) -> None:
+        pass
+
+
+def _make_runner(platforms: dict | None = None):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {}
+    runner._failed_platforms = {}
+    runner.config = MagicMock()
+    runner.config.multiplex_profiles = False
+    runner.config.platforms = platforms if platforms is not None else {}
+    return runner
+
+
+def _executor(shim):
+    """Replacement for ``_run_in_executor_with_context``: call the real function eagerly.
+
+    The production helper hops to an executor thread; here the function under test is cheap and
+    already patched, so run it inline and hand back a resolved awaitable.
+    """
+    async def _run(func, *args):
+        return func(*args)
+    return _run
+
+
+def _queued(config: PlatformConfig | None = None) -> dict:
+    return {
+        "config": config or PlatformConfig(enabled=True, token="test"),
+        "attempts": 1,
+        "next_retry": time.monotonic() - 1,
+    }
+
+
+class TestAdapterMayHealClassification:
+    """``_adapter_may_heal`` decides retry-vs-fatal for a platform with no adapter."""
+
+    def test_unregistered_plugin_with_credential_may_heal(self):
+        runner = _make_runner()
+        config = PlatformConfig(enabled=True, token="test-token")
+        with patch("gateway.platform_registry.platform_registry.is_registered", return_value=False):
+            assert runner._adapter_may_heal(Platform.TELEGRAM, config) is True
+
+    def test_registered_plugin_returning_none_needs_a_config_change(self):
+        """A registered platform that still produced no adapter is a config/deps problem:
+        retrying it re-warns forever at the backoff cap."""
+        runner = _make_runner()
+        config = PlatformConfig(enabled=True, token="test-token")
+        with patch("gateway.platform_registry.platform_registry.is_registered", return_value=True):
+            assert runner._adapter_may_heal(Platform.TELEGRAM, config) is False
+
+    def test_missing_bot_credential_needs_a_config_change(self):
+        runner = _make_runner()
+        config = PlatformConfig(enabled=True, token="")
+        with patch("gateway.platform_registry.platform_registry.is_registered", return_value=False):
+            assert runner._adapter_may_heal(Platform.TELEGRAM, config) is False
+
+
+class TestStartupRegistersMissingAdapterForRetry:
+    """Case C: gateway running with no adapter must not look like healthy Telegram."""
+
+    @pytest.mark.asyncio
+    async def test_healable_missing_adapter_is_queued_and_flags_attention(self):
+        config = PlatformConfig(enabled=True, token="test-token")
+        runner = _make_runner({Platform.TELEGRAM: config})
+
+        with patch.object(runner, "_create_adapter", return_value=None), \
+                patch.object(runner, "_adapter_may_heal", return_value=True), \
+                patch.object(runner, "_abort_startup_if_shutdown_requested", return_value=False), \
+                patch.object(runner, "_multiplex_on", return_value=False), \
+                patch.object(runner, "_update_platform_runtime_status") as status:
+            aborted, count, skipped, pending = await runner._start_prefilter_platforms()
+
+        assert aborted is False
+        assert pending == [], "a platform with no adapter cannot enter the connect phase"
+        assert Platform.TELEGRAM in runner._failed_platforms, (
+            "a healable missing adapter must be queued for the reconnect watcher"
+        )
+        kwargs = status.call_args.kwargs
+        assert kwargs["platform_state"] == "retrying"
+        assert kwargs["error_code"] == "adapter_unavailable"
+        assert kwargs["needs_attention"] is True, (
+            "an enabled platform with no adapter must be visible, not silently healthy"
+        )
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_is_fatal_not_retrying(self):
+        """Case B/C: an unhealable platform is reported fatal + needs_attention, never queued."""
+        config = PlatformConfig(enabled=True, token="test-token")
+        runner = _make_runner({Platform.TELEGRAM: config})
+
+        with patch.object(runner, "_create_adapter", return_value=None), \
+                patch.object(runner, "_adapter_may_heal", return_value=False), \
+                patch.object(runner, "_abort_startup_if_shutdown_requested", return_value=False), \
+                patch.object(runner, "_multiplex_on", return_value=False), \
+                patch.object(runner, "_update_platform_runtime_status") as status:
+            await runner._start_prefilter_platforms()
+
+        assert Platform.TELEGRAM not in runner._failed_platforms, (
+            "a permanent failure must not enter a retry loop"
+        )
+        kwargs = status.call_args.kwargs
+        assert kwargs["platform_state"] == "fatal"
+        assert kwargs["needs_attention"] is True
+
+    @pytest.mark.asyncio
+    async def test_healthy_startup_path_is_unchanged(self):
+        """Case D: a normal start still reaches the connect phase with no retry entry."""
+        config = PlatformConfig(enabled=True, token="test-token")
+        runner = _make_runner({Platform.TELEGRAM: config})
+        adapter = _StubAdapter(succeed=True)
+
+        with patch.object(runner, "_create_adapter", return_value=adapter), \
+                patch.object(runner, "_abort_startup_if_shutdown_requested", return_value=False), \
+                patch.object(runner, "_multiplex_on", return_value=False), \
+                patch.object(runner, "_wire_adapter_handlers") as wire:
+            aborted, count, skipped, pending = await runner._start_prefilter_platforms()
+
+        assert aborted is False
+        assert runner._failed_platforms == {}
+        assert pending == [(Platform.TELEGRAM, config, adapter)]
+        wire.assert_called_once_with(adapter)
+
+
+class TestWatcherRearmsFailedPluginLoad:
+    """Case A: transient load failure then clean recovery, without dropping the platform."""
+
+    @pytest.mark.asyncio
+    async def test_no_adapter_rearms_the_failed_plugin_and_keeps_the_platform_queued(self):
+        runner = _make_runner()
+        info = _queued()
+        runner._failed_platforms[Platform.TELEGRAM] = info
+        manager = MagicMock()
+        manager.rearm_failed_platform.return_value = True
+
+        with patch.object(runner, "_create_adapter", return_value=None), \
+                patch.object(runner, "_adapter_may_heal", return_value=True), \
+                patch.object(runner, "_run_in_executor_with_context", _executor(None)), \
+                patch("gateway.platform_registry.platform_registry.get", return_value=None), \
+                patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), \
+                patch.object(runner, "_update_platform_runtime_status"):
+            await runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic())
+
+        manager.rearm_failed_platform.assert_called_once_with("telegram")
+        assert info.get("load_rearms") == 1
+        assert Platform.TELEGRAM in runner._failed_platforms, (
+            "a platform whose plugin failed to load must stay queued so the next tick can retry"
+        )
+        assert info["next_retry"] > time.monotonic() - 1
+
+    @pytest.mark.asyncio
+    async def test_rearm_is_capped_so_a_broken_plugin_does_not_loop(self):
+        """Case B: bounded re-arms — a permanently broken plugin must not re-import forever."""
+        runner = _make_runner()
+        info = _queued()
+        info["load_rearms"] = 3  # cap under test  # already at the cap
+        runner._failed_platforms[Platform.TELEGRAM] = info
+        manager = MagicMock()
+        manager.rearm_failed_platform.return_value = True
+
+        with patch.object(runner, "_create_adapter", return_value=None), \
+                patch.object(runner, "_adapter_may_heal", return_value=True), \
+                patch.object(runner, "_run_in_executor_with_context", _executor(None)), \
+                patch("gateway.platform_registry.platform_registry.get", return_value=None), \
+                patch("hermes_cli.plugins.get_plugin_manager", return_value=manager), \
+                patch.object(runner, "_update_platform_runtime_status"):
+            await runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic())
+
+        manager.rearm_failed_platform.assert_not_called()
+        assert info.get("load_rearms") == 3  # cap under test
+        assert Platform.TELEGRAM in runner._failed_platforms
+
+    @pytest.mark.asyncio
+    async def test_unhealable_missing_adapter_is_dropped_as_fatal(self):
+        """Case B: no fast restart loop — an unhealable platform leaves the queue as fatal."""
+        runner = _make_runner()
+        runner._failed_platforms[Platform.TELEGRAM] = _queued()
+
+        with patch.object(runner, "_create_adapter", return_value=None), \
+                patch.object(runner, "_adapter_may_heal", return_value=False), \
+                patch.object(runner, "_run_in_executor_with_context", _executor(None)), \
+                patch("gateway.platform_registry.platform_registry.get", return_value=None), \
+                patch.object(runner, "_update_platform_runtime_status") as status:
+            await runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic())
+
+        assert Platform.TELEGRAM not in runner._failed_platforms
+        assert status.call_args.kwargs.get("platform_state") == "fatal"
+        assert status.call_args.kwargs.get("needs_attention") is True
+
+
+class TestRecoveryInstallsOneAdapter:
+    """Case A/D: recovery re-registers exactly one adapter — no duplicate."""
+
+    @pytest.mark.asyncio
+    async def test_successful_retry_installs_a_single_adapter(self):
+        runner = _make_runner()
+        runner._failed_platforms[Platform.TELEGRAM] = _queued()
+        adapter = _StubAdapter(succeed=True)
+
+        with patch.object(runner, "_create_adapter", return_value=adapter), \
+                patch.object(runner, "_run_in_executor_with_context", _executor(None)), \
+                patch("gateway.platform_registry.platform_registry.get", return_value=None), \
+                patch.object(runner, "_wire_adapter_handlers"), \
+                patch.object(runner, "_connect_adapter_with_timeout", return_value=True), \
+                patch.object(runner, "_install_reconnected_adapter") as install, \
+                patch.object(runner, "_update_platform_runtime_status"):
+            await runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic())
+
+        install.assert_called_once()
+        assert install.call_args.args[0] is Platform.TELEGRAM
+        assert install.call_args.args[1] is adapter
+
+
+class TestRearmRefusesWhileTheAbandonedImportIsStillRunning:
+    """The re-arm must not stack a second importer on top of a still-hung one.
+
+    A timed-out plugin's worker keeps running as a daemon. Re-importing while it is alive leaks
+    another blocked loader thread per retry, which is exactly the startup hang the deadline
+    exists to prevent.
+    """
+
+    def test_rearm_returns_false_when_a_loader_thread_is_alive(self):
+        import threading
+
+        from hermes_cli import plugins_loader as pl
+
+        stop = threading.Event()
+        rearmed = []
+
+        def _hang() -> None:
+            stop.wait(5)
+
+        manager, key = _make_manager_with_failed_platform("telegram", rearmed)
+        worker = threading.Thread(target=_hang, name=f"plugin-load:{key}", daemon=True)
+        worker.start()
+        try:
+            with patch.object(pl, "_ABANDONED_LOADERS", [worker]):
+                assert manager.rearm_failed_platform("telegram") is False
+        finally:
+            stop.set()
+            worker.join(timeout=5)
+
+        assert rearmed == [], "a still-hung import must not be re-armed again"
+
+    def test_rearm_proceeds_once_the_hung_loader_is_gone(self):
+        """Same platform, no live importer: the retry is allowed (the transient case)."""
+        from hermes_cli import plugins_loader as pl
+
+        rearmed = []
+        manager, _key = _make_manager_with_failed_platform("telegram", rearmed)
+
+        with patch.object(pl, "_ABANDONED_LOADERS", []):
+            assert manager.rearm_failed_platform("telegram") is True
+
+        assert rearmed == ["telegram-platform"]
+
+
+def _make_manager_with_failed_platform(platform_name: str, rearmed: list):
+    """A real loader object with one failed platform plugin, recording any re-registration.
+
+    Uses the genuine ``rearm_failed_platform`` bound onto a bare instance so the retry decision
+    path is exercised for real rather than through a mock.
+    """
+    from types import SimpleNamespace
+
+    from hermes_cli.plugins_loader import PluginLoaderMixin
+    from hermes_cli.plugins_manifest import PluginManifest
+
+    manifest = PluginManifest(
+        name=f"{platform_name}-platform",
+        kind="platform",
+        source="bundled",
+        path=f"/plugins/{platform_name}-platform",
+        key="key",
+    )
+    loaded = SimpleNamespace(error="load timed out after 10s", enabled=False, manifest=manifest)
+
+    class _Loader(PluginLoaderMixin):
+        """Bare loader: only the attributes ``rearm_failed_platform`` reaches are provided."""
+
+        def __init__(self):
+            self._plugins = {"key": loaded}
+            self._discovery_lock = threading.Lock()
+            self.home_path = Path("/tmp")
+
+        @staticmethod
+        def _platform_name_from_manifest(manifest):
+            return platform_name
+
+        @staticmethod
+        def _register_deferred_platform(manifest):
+            rearmed.append(manifest.name)
+
+    return _Loader(), "key"
+

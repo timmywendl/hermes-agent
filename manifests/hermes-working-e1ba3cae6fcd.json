@@ -1,0 +1,16 @@
+{
+  "source_commit": "adebb5ebb3ba3627be003de2211927c486c08ba3",
+  "snapshot": "hermes-working-e1ba3cae6fcd",
+  "files": [
+    {
+      "path": "tests/hermes_cli/test_kanban_completion_handoff_contract.py",
+      "source_sha256": "5f1a5959be3f5ef6c25dbe5b74a64c8b90b93d7978e8c7714d005fd1043efec4",
+      "archived_sha256": "8c9cfce946cdb2b453d9263d4a0834ea3c06c4df42cc43d7a722fae4bdd90f3a",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true,
+      "credential_like_literal_redaction": true
+    }
+  ],
+  "scope": "Sanitized uncommitted engineering source; excludes raw memory, credentials, conversations, DBs, environment config, runtime data and binaries."
+}

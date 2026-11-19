@@ -1,0 +1,23 @@
+{
+  "source_commit": "36a1488be1351163a441f3868f602d04ef1d666b",
+  "snapshot": "hermes-working-7d971b4ac2ee",
+  "files": [
+    {
+      "path": "hermes_cli/dashboard_tcc_repair.py",
+      "source_sha256": "8532d96f24fa0e460f86caed009ff6d08c3519bb64a7b8f0606c9263d16f2bb0",
+      "archived_sha256": "8532d96f24fa0e460f86caed009ff6d08c3519bb64a7b8f0606c9263d16f2bb0",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_dashboard_tcc_repair.py",
+      "source_sha256": "66a6e4178ac58cb3eb51802ab14c554ae6d7352382f5b7ed25ea0c912a43ed93",
+      "archived_sha256": "33037d15c45c14e89a42020f9ef7c761ac4565f6f2b15179c19ff8cf30f95f63",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    }
+  ],
+  "scope": "Sanitized uncommitted engineering source; excludes raw memory, credentials, conversations, DBs, environment config, runtime data and binaries."
+}

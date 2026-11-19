@@ -1,0 +1,16 @@
+// swift-tools-version:5.9
+import PackageDescription
+
+// The host is built as a plain executable and then wrapped into a signed .app bundle by
+// `build-host.sh`; SwiftPM cannot emit Info.plist + code signature on its own, and the bundle
+// layout (Contents/Library/LaunchAgents) is what SMAppService requires.
+let package = Package(
+    name: "HermesDashboardHost",
+    platforms: [.macOS(.v13)],
+    targets: [
+        .executableTarget(
+            name: "hermes-dashboard-host",
+            path: "Sources/HermesDashboardHost"
+        )
+    ]
+)

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.hermes.dashboard</string>
+
+    <!-- BundleProgram is an app-bundle-relative path and is only honored for plists installed
+         through SMAppService. It is what keeps the Dashboard inside the signed app's identity:
+         launchd runs this host, and the host execs the Dashboard as a child, so the app remains
+         the TCC responsible process for the MCP node process too.
+
+         BundleProgram cannot carry arguments, so the argv is split across BundleProgramArguments:
+         launchd executes `<host> <BundleProgramArguments...>`, and the trailing `--` separates the
+         host's own mode flag from the child command. -->
+    <key>BundleProgram</key>
+    <string>Contents/MacOS/hermes-dashboard-host</string>
+
+    <key>BundleProgramArguments</key>
+    <array>
+        <string>--child-exec</string>
+        <string>--</string>
+        <string>__HERMES_DASHBOARD_CHILD_EXECUTABLE__</string>
+        <string>__HERMES_DASHBOARD_CHILD_ARGUMENTS__</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>ExitTimeOut</key>
+    <integer>60</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__HERMES_DASHBOARD_WORKING_DIRECTORY__</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HERMES_DASHBOARD_PATH__</string>
+        <key>VIRTUAL_ENV</key>
+        <string>__HERMES_DASHBOARD_VENV__</string>
+        <key>HERMES_HOME</key>
+        <string>__HERMES_DASHBOARD_HOME__</string>
+        <key>HERMES_SUPERVISED_CHILD</key>
+        <string>1</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HERMES_DASHBOARD_STDOUT__</string>
+
+    <key>StandardErrorPath</key>
+    <string>__HERMES_DASHBOARD_STDERR__</string>
+</dict>
+</plist>

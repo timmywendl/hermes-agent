@@ -1,0 +1,221 @@
+"""Installed-version backport: Kanban mutation worktrees must not start from a stale base.
+
+Local backport of the reviewed Issue #77 fix adapted to the installed Hermes 0.21.4
+tree (commit 33a30fdd). A Kanban worker was handed a worktree based on the *local*
+repo's stale ``origin/main``, so its correct change landed on a superseded base and the
+task branch carried unrelated history.
+
+Contract (mirrors the operator-facing ``worktree_sync`` setting):
+
+* remote-backed + stale, sync on  -> new branch starts at the canonical remote tip;
+* primary checkout parked on a feature branch -> base is still the remote default tip;
+* already current -> correct base, primary workspace untouched;
+* existing task branch -> reused untouched (never re-based/reset);
+* local-only repo -> documented local HEAD fallback;
+* ``worktree_sync: false`` -> intentional local HEAD behavior preserved;
+* remote unavailable + sync on -> explicit failure, never a silent stale branch.
+"""
+
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+import pytest
+
+
+def _git(cwd: Path, *args: str) -> str:
+    out = subprocess.run(
+        ["git", *args], cwd=str(cwd), capture_output=True, text=True,
+        stdin=subprocess.DEVNULL,
+    )
+    if out.returncode != 0:
+        raise AssertionError(f"git {' '.join(args)} failed in {cwd}: {out.stderr or out.stdout}")
+    return (out.stdout or "").strip()
+
+
+def _commit(cwd: Path, message: str) -> str:
+    (cwd / "file.txt").write_text(message, encoding="utf-8")
+    _git(cwd, "add", "file.txt")
+    _git(cwd, "-c", "user.email=t@t", "-c", "user.name=T", "commit", "-m", message)
+    return _git(cwd, "rev-parse", "HEAD")
+
+
+@pytest.fixture()
+def stale_clone(tmp_path, monkeypatch):
+    """Canonical remote A -> B -> C; local clone deliberately left stale at A."""
+    bare = tmp_path / "canonical.git"
+    bare.mkdir()
+    _git(bare, "init", "--bare", "-b", "main")
+
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-b", "main")
+    sha_a = _commit(seed, "A")
+    _git(seed, "remote", "add", "origin", str(bare))
+    _git(seed, "push", "origin", "main")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/main")
+
+    local = tmp_path / "local"
+    subprocess.run(["git", "clone", str(bare), str(local)],
+                   capture_output=True, text=True, check=True,
+                   env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+
+    sha_b = _commit(seed, "B")
+    _git(seed, "push", "origin", "main")
+    sha_c = _commit(seed, "C")
+    _git(seed, "push", "origin", "main")
+
+    assert _git(local, "rev-parse", "origin/main") == sha_a, "fixture must be stale at A"
+    assert _git(seed, "rev-parse", "HEAD") == sha_c, "canonical remote must be at C"
+
+    import hermes_cli.kanban_db_workspace as kdw
+    monkeypatch.setattr(kdw, "_git_branch_exists", lambda root, name: False)
+    return {"local": local, "sha_a": sha_a, "sha_b": sha_b, "sha_c": sha_c, "bare": bare}
+
+
+def _provision(fixture, tmp_path, branch="kanban-task"):
+    """Run the REAL provisioning path and return the worktree HEAD."""
+    import hermes_cli.kanban_db_workspace as kdw
+    target = tmp_path / "worktrees" / branch
+    kdw._ensure_git_worktree(fixture["local"], target, branch)
+    return _git(target, "rev-parse", "HEAD"), target
+
+
+def _set_sync(monkeypatch, value):
+    import hermes_cli.config as cfg
+    monkeypatch.setattr(cfg, "load_config", lambda *a, **k: {"worktree_sync": value})
+
+
+def test_stale_local_base_uses_canonical_remote_tip(stale_clone, tmp_path, monkeypatch):
+    """THE EXACT INCIDENT: stale local A must not become the worker's base."""
+    head, _ = _provision(stale_clone, tmp_path)
+    assert head == stale_clone["sha_c"], (
+        f"Kanban worktree started at {head[:8]} — expected canonical remote tip "
+        f"{stale_clone['sha_c'][:8]}, got stale local base "
+        f"{stale_clone['sha_a'][:8]}"
+    )
+    assert head != stale_clone["sha_a"]
+
+
+def test_new_branch_has_no_unrelated_stale_history(stale_clone, tmp_path, monkeypatch):
+    """The worker branch must not inherit the stale base's limited ancestry."""
+    head, target = _provision(stale_clone, tmp_path)
+    log = _git(target, "log", "--format=%H")
+    assert log.splitlines()[0] == stale_clone["sha_c"]
+    assert stale_clone["sha_a"] in log, "canonical tip's ancestry should be intact"
+    assert _git(stale_clone["local"], "rev-parse", "HEAD") == stale_clone["sha_a"], (
+        "primary checkout must not be moved by provisioning"
+    )
+
+
+def test_parked_feature_branch_does_not_contaminate_base(stale_clone, tmp_path, monkeypatch):
+    """A parked primary checkout must not decide the worker's base (#68201)."""
+    local = stale_clone["local"]
+    _git(local, "fetch", "origin")
+    _git(local, "checkout", "-b", "my-feature", stale_clone["sha_a"])
+    feature = _commit(local, "F")
+    assert _git(local, "rev-parse", "HEAD") == feature
+
+    head, target = _provision(stale_clone, tmp_path)
+    assert head == stale_clone["sha_c"]
+    assert feature not in _git(target, "log", "--format=%H"), (
+        "worker branch inherited the parked feature commit"
+    )
+
+
+def test_already_current_repo_fast_path(stale_clone, tmp_path, monkeypatch):
+    """A current clone reaches the same base without disturbing the primary checkout."""
+    local = stale_clone["local"]
+    _git(local, "fetch", "origin")
+    _git(local, "checkout", "main")
+    _git(local, "merge", "--ff-only", "origin/main")
+    assert _git(local, "rev-parse", "HEAD") == stale_clone["sha_c"]
+
+    head, _ = _provision(stale_clone, tmp_path)
+    assert head == stale_clone["sha_c"]
+    assert _git(local, "rev-parse", "HEAD") == stale_clone["sha_c"]
+
+
+def test_existing_task_branch_is_reused_untouched(stale_clone, tmp_path, monkeypatch):
+    """An existing task branch keeps its commits; provisioning never re-bases it."""
+    local = stale_clone["local"]
+    _git(local, "fetch", "origin")
+    _git(local, "checkout", "-b", "kanban-task", stale_clone["sha_c"])
+    worker = _commit(local, "worker-wip")
+    _git(local, "checkout", "main")
+    _git(local, "reset", "--hard", stale_clone["sha_a"])
+
+    import hermes_cli.kanban_db_workspace as kdw
+    monkeypatch.setattr(kdw, "_git_branch_exists", lambda root, name: True)
+    target = tmp_path / "worktrees" / "kanban-task"
+    kdw._ensure_git_worktree(local, target, "kanban-task")
+
+    assert _git(target, "rev-parse", "HEAD") == worker, "existing worker commits were lost"
+    assert _git(local, "rev-parse", "kanban-task") == worker
+
+
+def test_local_only_repo_falls_back_to_head(tmp_path, monkeypatch):
+    """No remote: documented HEAD fallback, still provisions successfully."""
+    repo = tmp_path / "solo"
+    repo.mkdir()
+    _git(repo, "init", "-b", "main")
+    head_sha = _commit(repo, "only")
+    assert _git(repo, "remote") == ""
+
+    import hermes_cli.kanban_db_workspace as kdw
+    monkeypatch.setattr(kdw, "_git_branch_exists", lambda root, name: False)
+    target = tmp_path / "worktrees" / "t"
+    kdw._ensure_git_worktree(repo, target, "t")
+    assert _git(target, "rev-parse", "HEAD") == head_sha
+
+
+def test_sync_disabled_preserves_local_head_behavior(stale_clone, tmp_path, monkeypatch):
+    """worktree_sync: false is an explicit operator choice — local HEAD stays the base."""
+    _set_sync(monkeypatch, False)
+    head, _ = _provision(stale_clone, tmp_path)
+    assert head == stale_clone["sha_a"], "sync disabled must intentionally use local HEAD"
+
+
+def test_remote_unavailable_with_sync_enabled_fails_closed(stale_clone, tmp_path, monkeypatch):
+    """Mutation-capable provisioning must not silently start from a stale base."""
+    import hermes_cli.kanban_db_workspace as kdw
+    monkeypatch.setattr(kdw, "_git_branch_exists", lambda root, name: False)
+    local = stale_clone["local"]
+    _git(local, "remote", "set-url", "origin", str(tmp_path / "does-not-exist.git"))
+
+    target = tmp_path / "worktrees" / "offline-task"
+    with pytest.raises(RuntimeError) as err:
+        kdw._ensure_git_worktree(local, target, "offline-task")
+    message = str(err.value)
+    assert "worktree_sync" in message and "local HEAD" in message
+    assert not target.exists(), "no worktree may be created on an untrustworthy base"
+
+
+def test_remote_default_rename_is_detected(stale_clone, tmp_path, monkeypatch):
+    """Live ls-remote beats the cached origin/HEAD symref.
+
+    git fetch does NOT refresh a cached origin/HEAD when the remote changes its default
+    branch, so a resolver trusting the local symref would silently pick the wrong branch.
+    """
+    bare = stale_clone["bare"]
+    local = stale_clone["local"]
+
+    _git(bare, "branch", "release/2.x", "main")
+    _git(bare, "symbolic-ref", "HEAD", "refs/heads/release/2.x")
+    release_sha = _git(bare, "rev-parse", "refs/heads/release/2.x")
+
+    _git(local, "fetch", "origin")
+    cached = _git(local, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD") or ""
+    assert "main" in cached, f"precondition: stale cached symref should say main, got {cached!r}"
+
+    import hermes_cli.worktree_ops as wo
+    base = wo.resolve_remote_default_base(str(local))
+    assert base == "origin/release/2.x", (
+        f"resolver followed the cached local symref instead of the live remote: {base!r}"
+    )
+    assert _git(local, "rev-parse", base) == release_sha
+
+    head, _ = _provision(stale_clone, tmp_path)
+    assert head == release_sha

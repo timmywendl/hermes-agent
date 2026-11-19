@@ -1,0 +1,107 @@
+"""A self-injected notification wake must never rotate the Human's session.
+
+``_hmwa_compression_exhaustion_reset`` auto-resets a session whose context can no
+longer be compressed. For a HUMAN turn that is the right recovery. For a
+self-injected notification wake it is not: the wake exists only because a Human
+notification already went out (issue #92), and rotating the session on that turn
+strands the operator's next real message in a fresh session they never asked for.
+
+Pinned here: the internal turn is skipped, and the human path is untouched.
+"""
+
+import asyncio
+
+from gateway.run_turn import GatewayTurnMixin
+
+
+class _Runner(GatewayTurnMixin):
+    """Just the mixin: the reset path uses none of GatewayRunner's facade state."""
+
+
+class _Entry:
+    def __init__(self, session_id="sess-1"):
+        self.session_id = session_id
+
+
+class _Store:
+    def __init__(self):
+        self.resets = []
+
+    async def reset_session(self, session_key):
+        self.resets.append(session_key)
+        return _Entry("sess-rotated")
+
+
+def _runner():
+    runner = _Runner.__new__(_Runner)
+    runner.async_session_store = _Store()
+    runner._evict_cached_agent = lambda key: None
+    runner._clear_conversation_scope = lambda key, reason=None: None
+    runner._sync_telegram_topic_binding = lambda *a, **k: None
+    return runner
+
+
+def _result():
+    return {"compression_exhausted": True}
+
+
+def test_internal_wake_does_not_rotate_the_session():
+    runner = _runner()
+    entry = _Entry()
+
+    class _Event:
+        internal = True
+
+    response, out_entry = asyncio.run(runner._hmwa_compression_exhaustion_reset(
+        _result(), "partial", entry, "agent:main:telegram:dm:1", None, event=_Event(),
+    ))
+
+    assert runner.async_session_store.resets == [], "a notification wake must not reset the session"
+    assert out_entry is entry, "the caller keeps the session it was working in"
+    assert "auto-reset" not in (response or ""), "no reset notice on a notification wake"
+
+
+def test_human_turn_still_auto_resets():
+    runner = _runner()
+    entry = _Entry()
+
+    class _Event:
+        internal = False
+
+    response, out_entry = asyncio.run(runner._hmwa_compression_exhaustion_reset(
+        _result(), "partial", entry, "agent:main:telegram:dm:1", None, event=_Event(),
+    ))
+
+    assert runner.async_session_store.resets == ["agent:main:telegram:dm:1"], (
+        "the human recovery path must be preserved")
+    assert out_entry.session_id == "sess-rotated"
+    assert "auto-reset" in response
+
+
+def test_the_default_helper_recognizes_an_injected_event():
+    """No caller has to remember a boolean: the event's own flag decides."""
+    runner = _runner()
+    entry = _Entry()
+
+    class _Event:
+        internal = True
+
+    _, out_entry = asyncio.run(runner._hmwa_compression_exhaustion_reset(
+        _result(), "", entry, "key", None, event=_Event(),
+    ))
+
+    assert runner.async_session_store.resets == []
+    assert out_entry is entry
+
+
+def test_compression_deferred_is_never_a_reset():
+    """A concurrent compressor is the opposite case: the session is shrinking, not stuck."""
+    runner = _runner()
+    entry = _Entry()
+
+    _, out_entry = asyncio.run(runner._hmwa_compression_exhaustion_reset(
+        {"compression_deferred": True}, "", entry, "key", None, internal_turn=False,
+    ))
+
+    assert runner.async_session_store.resets == []
+    assert out_entry is entry

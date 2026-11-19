@@ -1,0 +1,95 @@
+{
+  "source_commit": "ef75bc708867e3884cb40a91363be6dc6fddc034",
+  "snapshot": "hermes-working-84a21bb67ea0",
+  "files": [
+    {
+      "path": "hermes_cli/kanban.py",
+      "source_sha256": "9a01ab0d2b3f25e83fc9807416fd6e9e62115c53ad3a84be9a8cd8e70b191370",
+      "archived_sha256": "9a01ab0d2b3f25e83fc9807416fd6e9e62115c53ad3a84be9a8cd8e70b191370",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "source_sha256": "f09658852d8abb2f667e62e0a425750626ab07ba9de5796c303cf15802640627",
+      "archived_sha256": "f09658852d8abb2f667e62e0a425750626ab07ba9de5796c303cf15802640627",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_connect.py",
+      "source_sha256": "3dbeebcb8219718ad8ea293c80f950bfef5771f0d80c67e4e8a43503cce1e7a9",
+      "archived_sha256": "3dbeebcb8219718ad8ea293c80f950bfef5771f0d80c67e4e8a43503cce1e7a9",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_dispatch.py",
+      "source_sha256": "4987bc5d9069b974d671391a1d85e469d779dea64e17534268d7c046e7e0aff3",
+      "archived_sha256": "4987bc5d9069b974d671391a1d85e469d779dea64e17534268d7c046e7e0aff3",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_review_lane.py",
+      "source_sha256": "3fc8997a0da156f1021f1ed937d6d96a9c054492a8651f8a6b692f9bbce903a5",
+      "archived_sha256": "3fc8997a0da156f1021f1ed937d6d96a9c054492a8651f8a6b692f9bbce903a5",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_diagnostics.py",
+      "source_sha256": "9936de50ad55f8e9753e1c5d0d5be7107e992b0e34d02c83ff0f007597766029",
+      "archived_sha256": "9936de50ad55f8e9753e1c5d0d5be7107e992b0e34d02c83ff0f007597766029",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "skills/devops/sdlc-review/SKILL.md",
+      "source_sha256": "edc700da4dca8a2727e0d374991390e9766d1bed118293710323d3cc8056e3d2",
+      "archived_sha256": "edc700da4dca8a2727e0d374991390e9766d1bed118293710323d3cc8056e3d2",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_review_lifecycle_complete.py",
+      "source_sha256": "7252ef38b7db4c4af15cbf2aa048c026ed13cf8026aa982d9709f2067fa4e809",
+      "archived_sha256": "7252ef38b7db4c4af15cbf2aa048c026ed13cf8026aa982d9709f2067fa4e809",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_review_no_verdict.py",
+      "source_sha256": "7337b57995ba7dfb9f2cd616af39ac5d66fa3d450d748a703b8bb9f48b62bc8f",
+      "archived_sha256": "7337b57995ba7dfb9f2cd616af39ac5d66fa3d450d748a703b8bb9f48b62bc8f",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tools/kanban_tools.py",
+      "source_sha256": "08a0bc0fb5565be1cf871cf3113bfe4854e2b9072b96b36df4c59b4a464eea81",
+      "archived_sha256": "08a0bc0fb5565be1cf871cf3113bfe4854e2b9072b96b36df4c59b4a464eea81",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tools/kanban_tools_schemas.py",
+      "source_sha256": "aadf7ce9f0ddca6c8436ae21afdf519965952213e6619d9235371ee446525c80",
+      "archived_sha256": "aadf7ce9f0ddca6c8436ae21afdf519965952213e6619d9235371ee446525c80",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    }
+  ],
+  "scope": "Sanitized uncommitted engineering source; excludes raw memory, credentials, conversations, DBs, environment config, runtime data and binaries."
+}

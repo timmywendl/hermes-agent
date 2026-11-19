@@ -1,0 +1,504 @@
+// Hermes Dashboard TCC Host
+//
+// A minimal macOS app bundle whose only job is to give the Hermes Dashboard a stable, code-signed
+// bundle identity so macOS can attribute TCC "Files & Folders" grants to an app instead of to a
+// bare interpreter.
+//
+// Why this exists (macOS 27, Apple issue 184660124): a process that does not carry a bundle
+// identifier cannot be granted App Data access belonging to another developer's application.
+// uv's `python3.11` and `/usr/bin/osascript` are both bundle-less, so the Google Chrome toggle in
+// System Settings appears and then silently reverts, and `chrome-devtools-mcp --autoConnect` keeps
+// failing with EPERM on `~/Library/Application Support/Google/Chrome/DevToolsActivePort`.
+//
+// This bundle runs exactly one child: the already-installed Hermes Dashboard. It deliberately does
+// NOT reimplement the Dashboard, start a second Hermes, touch TCC.db, or require Full Disk Access.
+//
+// `--register` / `--unregister` / `--status` drive Apple's SMAppService LaunchAgent registration
+// for Contents/Library/LaunchAgents/ai.hermes.dashboard.host.plist. The `--child-exec` mode is what
+// launchd uses: it execs the Dashboard in place, so the chain stays
+// app -> Dashboard python -> node (MCP) and the signed app remains the TCC responsible process.
+
+import Foundation
+import ServiceManagement
+import CommonCrypto
+
+let defaultBundleID = "ai.hermes.dashboard.host"
+let agentPlistName = "ai.hermes.dashboard.host.plist"
+let agentLabel = "ai.hermes.dashboard"
+let chromeMCPExecutable = "<HOME>/.hermes/cache/scratch/foreground-mcp-artifact-v1/install/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"
+let chromeMCPNode = "/opt/homebrew/Cellar/node/26.8.1/bin/node"
+let chromeMCPEntrypointSHA256 = "e8b0290a8fe9a1edc31d595ccc870df926bfaaafe19fb14cd4d8d47bf6194979"
+
+enum HostError: Error, CustomStringConvertible {
+    case message(String)
+
+    var description: String {
+        switch self {
+        case .message(let text): return text
+        }
+    }
+}
+
+func currentBundleIdentifier() -> String {
+    Bundle.main.bundleIdentifier ?? defaultBundleID
+}
+
+func fail(_ text: String) -> Never {
+    FileHandle.standardError.write(("ERROR: " + text + "\n").data(using: .utf8)!)
+    exit(2)
+}
+
+func emit(_ text: String) {
+    print(text)
+}
+
+func sha256(_ path: String) throws -> String {
+    let data = try Data(contentsOf: URL(fileURLWithPath: path), options: [.mappedIfSafe])
+    var digest = [UInt8](repeating: 0, count: 32)
+    data.withUnsafeBytes { _ = CC_SHA256($0.baseAddress, CC_LONG(data.count), &digest) }
+    return digest.map { String(format: "%02x", $0) }.joined()
+}
+
+func verifyMCPArtifact() throws {
+    let entry = URL(fileURLWithPath: chromeMCPExecutable).standardizedFileURL
+    guard entry.path == chromeMCPExecutable, FileManager.default.fileExists(atPath: chromeMCPExecutable) else {
+        throw HostError.message("foreground MCP artifact missing")
+    }
+    guard FileManager.default.isReadableFile(atPath: chromeMCPExecutable),
+          entry.resolvingSymlinksInPath().path == chromeMCPExecutable else {
+        throw HostError.message("foreground MCP artifact path rejected")
+    }
+    guard try sha256(chromeMCPExecutable) == chromeMCPEntrypointSHA256 else {
+        throw HostError.message("foreground MCP artifact integrity mismatch")
+    }
+}
+
+func runForegroundMCP() -> Never {
+    do { try verifyMCPArtifact() } catch { fail(error.localizedDescription) }
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: chromeMCPNode)
+    process.arguments = [chromeMCPExecutable, "--autoConnect", "--no-usage-statistics"]
+    let input = Pipe()
+    let output = Pipe()
+    let error = Pipe()
+    process.standardInput = input
+    process.standardOutput = output
+    process.standardError = error
+    do {
+        try process.run()
+        let initializeBody = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{},\"clientInfo\":{\"name\":\"HermesDashboardHost\",\"version\":\"1\"}}}"
+        input.fileHandleForWriting.write(Data((initializeBody + "\n").utf8))
+        input.fileHandleForWriting.closeFile()
+        let deadline = Date().addingTimeInterval(30)
+        while process.isRunning && Date() < deadline {
+            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+        }
+        if process.isRunning { process.terminate(); process.waitUntilExit(); fail("foreground MCP timed out") }
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        guard let text = String(data: data, encoding: .utf8), text.contains("\"id\":1"), text.contains("\"result\"") else { fail("foreground MCP initialize failed") }
+        let notification = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"
+        let toolsListBody = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{}}"
+        let listPagesBody = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"list_pages\",\"arguments\":{}}}"
+        let followUpPipe = Pipe(); process.standardInput = followUpPipe
+        followUpPipe.fileHandleForWriting.write(Data((notification + "\n" + toolsListBody + "\n" + listPagesBody + "\n").utf8))
+        followUpPipe.fileHandleForWriting.closeFile()
+        let followUpDeadline = Date().addingTimeInterval(30)
+        while process.isRunning && Date() < followUpDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.1)) }
+        if process.isRunning { process.terminate(); process.waitUntilExit(); fail("foreground MCP timed out") }
+        let followUpText = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        guard followUpText.contains("\"id\":2"), followUpText.contains("list_pages"), followUpText.contains("\"id\":3"), followUpText.contains("\"result\"") else { fail("foreground MCP list_pages failed") }
+        exit(0)
+    } catch {
+        fail("foreground MCP failed to start: \(error)")
+    }
+}
+
+/// Refuse trailing arguments on modes that take none.
+///
+/// Without this, `--register extra-junk` would silently register while the operator believes they
+/// passed something meaningful, and a typo like `--statuss` would fall through to the unknown-mode
+/// error only because of the default case. Modes with a fixed arity are checked explicitly.
+func requireNoExtraArguments(_ arguments: [String]) throws {
+    if arguments.count > 1 {
+        throw HostError.message("refusing unexpected extra arguments for \(arguments[0]): \(arguments.dropFirst().joined(separator: " "))")
+    }
+}
+
+// MARK: - Child command validation
+
+/// The single child command this bundle is allowed to run.
+///
+/// Deliberately explicit: the host launches only a supported Hermes server entrypoint with an
+/// option allowlist, so an edited plist or a hand-run argv cannot turn the signed app into a
+/// general-purpose launcher for arbitrary code.
+struct ChildCommand {
+    let executable: String
+    let arguments: [String]
+
+    static func from(arguments: [String]) throws -> ChildCommand {
+        guard let separator = arguments.firstIndex(of: "--"), separator + 1 < arguments.count else {
+            throw HostError.message("missing child command after --")
+        }
+        let executable = arguments[separator + 1]
+        let childArguments = Array(arguments[(separator + 2)...])
+        try validate(executable: executable, arguments: childArguments)
+        return ChildCommand(executable: executable, arguments: childArguments)
+    }
+
+    static func validate(executable: String, arguments: [String]) throws {
+        guard executable.hasPrefix("/") else {
+            throw HostError.message("refusing relative child executable: \(executable)")
+        }
+        guard !executable.contains("\0"),
+              !arguments.contains(where: { $0.contains("\0") }) else {
+            throw HostError.message("refusing child command containing NUL")
+        }
+        let resolved = URL(fileURLWithPath: executable).resolvingSymlinksInPath().path
+        guard resolved.hasPrefix("/") else {
+            throw HostError.message("refusing unresolvable child executable: \(executable)")
+        }
+
+        // Bind to the REAL Hermes install, not to a filename. Checking only the basename would let
+        // any executable called `hermes` (or any interpreter whose name starts with "python") run
+        // in this signed app's identity — which is the entire value the app provides, so a
+        // basename check would hand that value to arbitrary code.
+        //
+        // The child executable must be the venv entrypoint of a Hermes install, or an interpreter
+        // whose sibling `hermes_cli/main.py` exists. Symlinks are resolved first, so a shim cannot
+        // point the check at one file and the exec at another.
+        var index = 0
+        if try isHermesVenvEntrypoint(resolved) {
+            index = 0
+        } else {
+            try verifyHermesMainModule(arguments: arguments, interpreter: resolved)
+            index = 2
+        }
+
+        // An optional profile selector may sit between the entrypoint and the subcommand.
+        var rest = Array(arguments[index...])
+        if let first = rest.first, first == "-p" || first == "--profile" {
+            guard rest.count >= 2 else {
+                throw HostError.message("refusing profile selector without a value")
+            }
+            try validateProfileValue(rest[1])
+            rest.removeFirst(2)
+        } else if let first = rest.first, first.hasPrefix("--profile=") {
+            try validateProfileValue(String(first.dropFirst("--profile=".count)))
+            rest.removeFirst()
+        }
+
+        guard let mode = rest.first, mode == "dashboard" || mode == "serve" else {
+            throw HostError.message("refusing child that is not a Hermes dashboard or serve command")
+        }
+        try validateTail(mode: mode, tail: Array(rest.dropFirst()))
+    }
+
+    /// True when `path` is `<…>/venv/bin/hermes` inside a directory that also holds a
+    /// `hermes_cli/main.py`, i.e. an actual Hermes checkout rather than a look-alike.
+    private static func isHermesVenvEntrypoint(_ path: String) throws -> Bool {
+        let url = URL(fileURLWithPath: path)
+        let name = url.lastPathComponent
+        guard name == "hermes" || name == "hermes.py" else { return false }
+        guard url.deletingLastPathComponent().lastPathComponent == "bin" else {
+            throw HostError.message("refusing Hermes entrypoint outside a venv bin directory: \(path)")
+        }
+        let venv = url.deletingLastPathComponent().deletingLastPathComponent()
+        guard venv.lastPathComponent == "venv" || venv.lastPathComponent == ".venv" else {
+            throw HostError.message("refusing Hermes entrypoint outside a venv: \(path)")
+        }
+        let root = venv.deletingLastPathComponent()
+        let main = root.appendingPathComponent("hermes_cli").appendingPathComponent("main.py")
+        guard FileManager.default.fileExists(atPath: main.path) else {
+            throw HostError.message("refusing entrypoint whose install has no hermes_cli/main.py: \(path)")
+        }
+        return true
+    }
+
+    /// Accept only `<interpreter> -m hermes_cli.main …`, where the interpreter really belongs to a
+    /// Hermes install (its own directory or the current working directory holds `hermes_cli/main.py`).
+    private static func verifyHermesMainModule(arguments: [String], interpreter: String) throws {
+        guard arguments.count >= 3, arguments[0] == "-m", arguments[1] == "hermes_cli.main" else {
+            throw HostError.message("refusing python child that is not `-m hermes_cli.main`")
+        }
+        let interpreterName = (interpreter as NSString).lastPathComponent
+        guard interpreterName.hasPrefix("python") else {
+            throw HostError.message("refusing child executable that is not a Hermes entrypoint: \(interpreter)")
+        }
+        let root = URL(fileURLWithPath: interpreter).deletingLastPathComponent().deletingLastPathComponent()
+        // Only the interpreter's OWN install counts. Accepting `hermes_cli/main.py` from the process
+        // working directory would let any python-named binary off the street execute in this app's
+        // identity simply because a Hermes checkout happened to be the cwd.
+        let main = root.appendingPathComponent("hermes_cli").appendingPathComponent("main.py")
+        guard FileManager.default.fileExists(atPath: main.path) else {
+            throw HostError.message("refusing interpreter with no Hermes install beside it: \(interpreter)")
+        }
+    }
+
+    /// Validate a profile selector with the same ASCII grammar Hermes itself enforces.
+    ///
+    /// Checked on the raw token, before any case-folding, so an uppercase/lowercase-fold pair or a
+    /// non-ASCII homoglyph cannot be normalized into a valid selector after the check.
+    private static func validateProfileValue(_ value: String) throws {
+        guard !value.isEmpty else {
+            throw HostError.message("refusing empty profile selector")
+        }
+        guard value.unicodeScalars.allSatisfy({ $0.isASCII }) else {
+            throw HostError.message("refusing non-ASCII profile selector: \(value)")
+        }
+        guard value.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil else {
+            throw HostError.message("refusing invalid profile selector: \(value)")
+        }
+    }
+
+    private static func validateTail(mode: String, tail: [String]) throws {
+        let commonFlags: Set<String> = ["--insecure", "--skip-build", "--isolated", "--no-open"]
+        let dashboardOnlyFlags: Set<String> = ["--tui"]
+        let valueFlags: Set<String> = ["--port", "--host", "--open-profile"]
+        var seenValues: Set<String> = []
+
+        var index = 0
+        while index < tail.count {
+            let token = tail[index]
+            if token == "--" || !token.hasPrefix("-") {
+                throw HostError.message("refusing unexpected positional argument: \(token)")
+            }
+            if token == "--stop" || token == "--status" || token == "--help" {
+                throw HostError.message("refusing lifecycle flag: \(token)")
+            }
+            if let equals = token.firstIndex(of: "=") {
+                let flag = String(token[token.startIndex..<equals])
+                let value = String(token[token.index(after: equals)...])
+                guard valueFlags.contains(flag), !value.isEmpty, !seenValues.contains(flag) else {
+                    throw HostError.message("refusing option: \(token)")
+                }
+                try validateValue(flag: flag, value: value)
+                seenValues.insert(flag)
+                index += 1
+                continue
+            }
+            if commonFlags.contains(token) || (mode == "dashboard" && dashboardOnlyFlags.contains(token)) {
+                index += 1
+                continue
+            }
+            guard valueFlags.contains(token), !seenValues.contains(token), index + 1 < tail.count else {
+                throw HostError.message("refusing option: \(token)")
+            }
+            let value = tail[index + 1]
+            guard !value.hasPrefix("-") else {
+                throw HostError.message("refusing option without a value: \(token)")
+            }
+            try validateValue(flag: token, value: value)
+            seenValues.insert(token)
+            index += 2
+        }
+    }
+
+    private static func validateValue(flag: String, value: String) throws {
+        switch flag {
+        case "--port":
+            guard let port = Int(value), port > 0, port < 65536 else {
+                throw HostError.message("refusing non-numeric port: \(value)")
+            }
+        case "--host":
+            let allowed = ["127.0.0.1", "localhost", "::1", "0.0.0.0"]
+            guard allowed.contains(value) else {
+                throw HostError.message("refusing unsupported bind host: \(value)")
+            }
+        case "--open-profile":
+            let ascii = value.unicodeScalars.allSatisfy { $0.isASCII }
+            let matches = value.range(of: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$", options: .regularExpression) != nil
+            guard ascii, matches else {
+                throw HostError.message("refusing invalid profile selector: \(value)")
+            }
+        default:
+            throw HostError.message("refusing option: \(flag)")
+        }
+    }
+}
+
+// MARK: - Child execution
+
+/// Replace this process with the Dashboard.
+///
+/// `execv` (rather than fork + spawn + supervise) is what keeps the identity chain intact: the
+/// Dashboard and every descendant — including the `node` process that reads `DevToolsActivePort` —
+/// inherit this signed app as their TCC responsible process. A supervising wrapper would add a
+/// process and couple the app's exit status to a supervisor loop.
+func runChild(_ command: ChildCommand) -> Never {
+    var argv: [UnsafeMutablePointer<CChar>?] = [strdup(command.executable)]
+    for argument in command.arguments {
+        argv.append(strdup(argument))
+    }
+    argv.append(nil)
+    execv(command.executable, argv)
+    let code = errno
+    fail("execv \(command.executable) failed: \(String(cString: strerror(code))) (errno \(code))")
+}
+
+func embeddedAgentPlistURL() -> URL? {
+    // The LaunchAgents directory is `Contents/Library/LaunchAgents`; resolving it from the
+    // executable's own path avoids depending on `builtInPlugInsURL`, which is nil unless the
+    // bundle also declares `Contents/PlugIns`.
+    let contents = Bundle.main.bundleURL.appendingPathComponent("Contents")
+    let candidate = contents
+        .appendingPathComponent("Library")
+        .appendingPathComponent("LaunchAgents")
+        .appendingPathComponent(agentPlistName)
+    if FileManager.default.fileExists(atPath: candidate.path) {
+        return candidate
+    }
+    return Bundle.main.url(forResource: agentPlistName, withExtension: nil)
+}
+
+// MARK: - Foreground TCC probe
+
+let chromeDevToolsActivePortPath = FileManager.default.homeDirectoryForCurrentUser
+    .appendingPathComponent("Library/Application Support/Google/Chrome/DevToolsActivePort")
+
+func errnoName(_ value: Int32) -> String {
+    switch value {
+    case EPERM: return "EPERM"
+    case EACCES: return "EACCES"
+    case ENOENT: return "ENOENT"
+    default: return "ERRNO_\(value)"
+    }
+}
+
+/// Perform a bounded, non-persistent probe for a Human-launched app session.
+///
+/// This mode intentionally probes only the fixed Chrome DevToolsActivePort path. It never accepts
+/// a command, executable, or path from argv, never calls ServiceManagement, and never starts the
+/// Dashboard. The app result and the child result are separate: a successful app open does not
+/// prove that a future MCP child would inherit the same responsible host.
+func runForegroundProbe() -> Never {
+    let appResult: String
+    let appDescriptor = open(chromeDevToolsActivePortPath.path, O_RDONLY | O_CLOEXEC)
+    if appDescriptor >= 0 {
+        close(appDescriptor)
+        appResult = "PASS"
+    } else {
+        appResult = "FAIL_\(errnoName(errno))"
+    }
+
+    emit("BUNDLE_ID=\(currentBundleIdentifier())")
+    emit("PROBE_MODE=FOREGROUND_TCC")
+    emit("APP_FILE_PROBE=\(appResult)")
+    emit("CHILD_FILE_PROBE=NOT_RUN")
+    emit("CHILD_RESPONSIBLE_BUNDLE=NOT_RUN")
+    emit("PERSISTENT_SERVICE_MUTATION=NO")
+    emit("DASHBOARD_STARTED=NO")
+    emit("FILE_CONTENT_READ=NO")
+
+    if appResult == "PASS" || appResult == "FAIL_ENOENT" {
+        exit(0)
+    }
+    exit(2)
+}
+
+// MARK: - SMAppService control
+
+func serviceStatusName(_ status: SMAppService.Status) -> String {
+    switch status {
+    case .notRegistered: return "NotRegistered"
+    case .enabled: return "Enabled"
+    case .requiresApproval: return "RequiresApproval"
+    case .notFound: return "NotFound"
+    @unknown default: return "Unknown(\(status.rawValue))"
+    }
+}
+
+func registerService() throws {
+    let service = SMAppService.agent(plistName: agentPlistName)
+    emit("SERVICE_STATUS_BEFORE=\(serviceStatusName(service.status))")
+    do {
+        try service.register()
+    } catch {
+        let nsError = error as NSError
+        // kSMErrorAlreadyRegistered (15) is the benign re-run case.
+        if nsError.code == 15 {
+            emit("SERVICE_REGISTER=already_registered")
+        } else {
+            throw HostError.message("register failed: \(nsError.localizedDescription) (code \(nsError.code))")
+        }
+    }
+    emit("SERVICE_STATUS_AFTER=\(serviceStatusName(service.status))")
+    emit("SERVICE_REGISTERED=YES")
+}
+
+func unregisterService() throws {
+    let service = SMAppService.agent(plistName: agentPlistName)
+    do {
+        try service.unregister()
+    } catch {
+        let nsError = error as NSError
+        // kSMErrorJobNotFound (3): already absent, which is the desired end state.
+        if nsError.code == 3 {
+            emit("SERVICE_UNREGISTER=already_absent")
+            emit("SERVICE_UNREGISTERED=YES")
+            return
+        }
+        throw HostError.message("unregister failed: \(nsError.localizedDescription) (code \(nsError.code))")
+    }
+    emit("SERVICE_UNREGISTERED=YES")
+}
+
+func showStatus() {
+    let service = SMAppService.agent(plistName: agentPlistName)
+    let status = service.status
+    emit("BUNDLE_ID=\(currentBundleIdentifier())")
+    emit("AGENT_PLIST=\(agentPlistName)")
+    emit("AGENT_LABEL=\(agentLabel)")
+    emit("SERVICE_STATUS=\(serviceStatusName(status))")
+    // `status` alone is not trustworthy evidence that this bundle's agent is registered: an agent
+    // whose plist is absent from the bundle, or a bundle LaunchServices has not indexed, can report
+    // a non-NotFound status without any registration having happened. Report the facts that a
+    // caller can actually verify instead of letting one accessor stand for the whole question.
+    emit("AGENT_PLIST_FOUND=\(embeddedAgentPlistURL() != nil ? "YES" : "NO")")
+    emit("BUNDLE_PATH=\(Bundle.main.bundleURL.path)")
+    emit("STATUS_IS_STRONG_EVIDENCE=NO")
+}
+
+// MARK: - Entry point
+
+let arguments = Array(CommandLine.arguments.dropFirst())
+
+guard let mode = arguments.first else {
+    emit("usage: hermes-dashboard-host --foreground-probe | --status | --register | --unregister | --show-agent")
+    emit("       hermes-dashboard-host --child-exec -- <dashboard argv>")
+    exit(1)
+}
+
+do {
+    switch mode {
+    case "--foreground-mcp":
+        try requireNoExtraArguments(arguments)
+        runForegroundMCP()
+    case "--foreground-probe":
+        try requireNoExtraArguments(arguments)
+        runForegroundProbe()
+    case "--status":
+        try requireNoExtraArguments(arguments)
+        showStatus()
+    case "--register":
+        try requireNoExtraArguments(arguments)
+        try registerService()
+    case "--unregister":
+        try requireNoExtraArguments(arguments)
+        try unregisterService()
+    case "--show-agent":
+        try requireNoExtraArguments(arguments)
+        guard let url = embeddedAgentPlistURL() else {
+            throw HostError.message("embedded agent plist \(agentPlistName) not found in bundle")
+        }
+        emit("AGENT_PLIST_PATH=\(url.path)")
+    case "--child-exec":
+        let command = try ChildCommand.from(arguments: arguments)
+        runChild(command)
+    case "--version":
+        emit("\(currentBundleIdentifier()) 1.0.0")
+    default:
+        throw HostError.message("unknown mode: \(mode)")
+    }
+} catch {
+    fail("\(error)")
+}

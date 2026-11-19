@@ -1,0 +1,387 @@
+"""Review-lane verdict obligations: the durable "this card owes a verdict" flag
+and the explicit-verdict gate on the review-approval path.
+
+Extracted from ``kanban_db`` (a ratcheted facade) so the review-lane guard has a
+topical home. The facade re-exports the public names; siblings late-import the
+facade for anything they need back (see root AGENTS.md, "Facade + siblings").
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+from typing import Optional
+
+# Closed verdict vocabulary for a review-lane completion (``review_outcome`` in
+# the completion metadata). ``approved`` is the only value that may reach
+# ``done`` through ``kanban_complete``; a caller holding one of the others must
+# take that verdict's own path (``request_changes`` / ``block_task``).
+REVIEW_VERDICTS = ("approved", "changes_requested", "escalate")
+
+
+class ReviewVerdictRequiredError(ValueError):
+    """``complete_task`` refused: the card owes a review verdict and the caller
+    supplied none (or one that must not close the card). A ``ValueError`` so
+    tool error handlers treat it as recoverable — the card is untouched."""
+
+    def __init__(self, task_id: str, supplied: Optional[str] = None):
+        self.task_id = task_id
+        self.supplied = supplied
+        detail = (
+            f"review_outcome={supplied!r} is not 'approved'" if supplied is not None
+            else "no review_outcome was supplied"
+        )
+        super().__init__(
+            f"completion blocked: {task_id} owes a review verdict and {detail}. Pass "
+            f'metadata={{"review_outcome": "approved"}} with the verification you ran to '
+            f"approve, or use kanban_request_changes / kanban_block instead."
+        )
+
+
+def review_lane_owes_verdict(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when the card's reviewer run was claimed out of the review lane."""
+    from hermes_cli import kanban_db as _kb
+
+    row = conn.execute(
+        "SELECT review_lane_pending FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    return bool(_kb._row_get(row, "review_lane_pending"))
+
+
+def check_review_verdict(metadata: Optional[dict]) -> Optional[str]:
+    """The caller's ``review_outcome``, normalized, or None when absent.
+
+    ``None`` is NOT "no verdict owed" — use :func:`review_lane_owes_verdict`.
+    The verdict rides the existing completion ``metadata`` under
+    ``review_outcome`` with a closed vocabulary: no second verdict store.
+    """
+    value = metadata.get("review_outcome") if isinstance(metadata, dict) else None
+    return str(value).strip().lower() if value is not None else None
+
+
+def gate_review_verdict(
+    conn: sqlite3.Connection, task_id: str, metadata: Optional[dict],
+) -> Optional[str]:
+    """Refuse a review-lane completion that carries no ``approved`` verdict.
+
+    ``kanban_complete`` from a reviewer run IS the approval, so it must say so:
+    silently accepting it is what let a review with no verdict read as a PASS.
+    Returns the accepted verdict (None when the card owes none) so the caller can
+    record it on the closing run and event — never an anonymous PASS.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    if not review_lane_owes_verdict(conn, task_id):
+        return None
+    supplied = check_review_verdict(metadata)
+    if supplied == "approved":
+        return supplied
+    with _kb.write_txn(conn):
+        _kb._append_event(conn, task_id, "completion_blocked_no_verdict", {
+            "supplied": supplied, "expected": ["approved"],
+        })
+    raise ReviewVerdictRequiredError(task_id, supplied)
+
+
+# --- Reviewer death accounting (reached from ``kanban_db_dispatch``) ---------
+
+def _kb():
+    """Late-bound facade import (never a module-level cycle; see root AGENTS.md)."""
+    from hermes_cli import kanban_db as kanban_db
+    return kanban_db
+
+
+_REVIEW_HUMAN_ACTION = (
+    "Inspect the branch/HEAD above yourself; then either approve with "
+    "`hermes kanban complete {tid}` (records the verdict) or send it back with "
+    "`hermes kanban request-changes {tid} --reason ...`. Unblocking re-runs the "
+    "reviewer once the provider/quota condition is fixed."
+)
+
+
+def _review_head_for_task(conn: sqlite3.Connection, task_id: str, workspace_path: Optional[str]) -> str:
+    """Best durable evidence of WHAT the review was against.
+
+    Priority: the commit the reviewer's workspace was sitting on (read-only
+    ``git rev-parse``, failure-tolerant — the worktree may be gone), then the
+    ``head``/``head_sha`` the implementer recorded on its ``review_requested``
+    handoff. ``unknown`` rather than a guess when neither is available.
+    """
+    if workspace_path:
+        try:
+            out = subprocess.run(
+                ["git", "-C", workspace_path, "rev-parse", "HEAD"],
+                capture_output=True, text=True, timeout=10,
+            )
+            sha = (out.stdout or "").strip()
+            if out.returncode == 0 and sha:
+                return sha
+        except (OSError, subprocess.SubprocessError):
+            pass
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'review_requested' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    payload = _kb()._json_dict(_kb()._row_get(row, "payload"))
+    for key in ("head", "head_sha", "commit"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "unknown"
+
+
+def _review_no_verdict_error(conn: sqlite3.Connection, task_id: str, dead: "_DeadWorker") -> str:
+    """The breaker's stored error for a reviewer that produced no verdict: names
+    the reviewed card, its branch/HEAD and the terminal failure class so the
+    board and the retry worker both see WHY the review cannot finish."""
+    row = conn.execute(
+        "SELECT branch_name, workspace_path FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    branch = (_kb()._row_get(row, "branch_name") or "").strip() or "unspecified"
+    head = _review_head_for_task(
+        conn, task_id, (_kb()._row_get(row, "workspace_path") or "").strip() or None,
+    )
+    return (
+        f"review lane produced no verdict for {task_id} "
+        f"(branch {branch} @ {head}): {dead.failure_class}. {dead.error_text}"
+    )
+
+
+def _park_review_no_verdict(conn: sqlite3.Connection, task_id: str, dead: "_DeadWorker") -> None:
+    """Turn the breaker's untyped park into an explicit Human escalation.
+
+    ``_record_task_failure`` blocks the card but deliberately leaves
+    ``block_kind`` alone (that policy is the supervisor's). For a review that
+    can never produce a verdict the Human must be told, so this attaches the
+    closed-vocabulary ``needs_input`` kind plus the review context — status is
+    NOT touched, so the failure evidence and terminal runs stay exactly as the
+    breaker left them.
+    """
+    row = conn.execute(
+        "SELECT status, block_kind, branch_name, workspace_path FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or _kb()._row_get(row, "status") != "blocked":
+        return
+    if _kb()._row_get(row, "block_kind") is not None:
+        return  # already typed by someone else; never re-type
+    branch = (_kb()._row_get(row, "branch_name") or "").strip() or "unspecified"
+    head = _review_head_for_task(
+        conn, task_id, (_kb()._row_get(row, "workspace_path") or "").strip() or None,
+    )
+    reason = (
+        f"Review of {task_id} (branch {branch} @ {head}) could not produce a verdict "
+        f"after the retry budget was exhausted — last failure class: {dead.failure_class}. "
+        + _REVIEW_HUMAN_ACTION.format(tid=task_id)
+    )
+    with _kb().write_txn(conn):
+        typed = conn.execute(
+            "UPDATE tasks SET block_kind = 'needs_input', block_recurrences = 1 "
+            "WHERE id = ? AND status = 'blocked' AND block_kind IS NULL",
+            (task_id,),
+        ).rowcount
+        if typed != 1:
+            return
+        _kb()._append_event(conn, task_id, "blocked", {
+            "kind": "needs_input",
+            "reason": reason,
+            "review_no_verdict": True,
+            "failure_class": dead.failure_class,
+            "branch": branch,
+            "head": head,
+        })
+
+
+# --- Failure classification shared with the breaker -------------------------
+
+def _kbd():
+    from hermes_cli import kanban_db_dispatch as kanban_db_dispatch
+    return kanban_db_dispatch
+
+
+def _error_fingerprint(error_text: str) -> str:
+    """Normalize an error message (strip PIDs, timestamps) so same-root-cause errors group."""
+    fp = re.sub(r'\bpid \d+\b', 'pid N', error_text[:80])
+    fp = re.sub(r'\b\d{10,}\b', '<TS>', fp)
+    return fp.lower().strip()
+
+
+# ~96% of "clean exit without a terminal tool call" tasks complete on a later
+# run, so a protocol violation gets a bounded retry before the breaker trips.
+# The budget is a violation-only STREAK (``_protocol_violation_streak``),
+# independent of ``consecutive_failures``: other failure kinds neither consume
+# nor extend it. Per-task ``max_retries`` overrides it.
+_PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
+
+# Closed runs to walk when counting the streak; it trips at a handful anyway.
+_PROTOCOL_VIOLATION_SCAN_LIMIT = 50
+
+
+def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
+    """Count the task's trailing run of clean-exit protocol violations.
+
+    Walks closed runs newest-first (including the one ``detect_crashed_workers``
+    just closed). ``rate_limited`` runs are neutral and skipped (a quota wall
+    says nothing about the task); any other closed run breaks the streak, so
+    the budget counts ONLY protocol violations. Violations are recognized by the
+    ``protocol_violation`` run-metadata marker, with the error text as fallback
+    for runs recorded before the marker existed.
+    """
+    streak = 0
+    rows = conn.execute(
+        "SELECT outcome, error, metadata FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY id DESC LIMIT ?",
+        (task_id, _PROTOCOL_VIOLATION_SCAN_LIMIT),
+    ).fetchall()
+    for row in rows:
+        outcome = row["outcome"] or ""
+        if outcome == "rate_limited":
+            continue
+        head = (row["error"] or "").partition(_kbd().WORKER_OUTPUT_SEP)[0]  # never the worker's own words
+        if outcome == "crashed" and (
+                _kb()._json_dict(row["metadata"]).get("protocol_violation") or "protocol violation" in head):
+            streak += 1
+            continue
+        break
+    return streak
+
+
+# --- Dead-worker booking (incl. the review no-verdict case) -------------------
+
+
+@dataclass
+class _DeadWorker:
+    """How ``detect_crashed_workers`` should book one dead worker."""
+
+    kind: str
+    code: Optional[int]
+    error_text: str
+    event_kind: str
+    event_payload: dict
+    protocol_violation: bool = False
+    rate_limited: bool = False
+    terminal_provider: bool = False
+    """``KANBAN_TERMINAL_PROVIDER_EXIT_CODE``: the provider rejected the worker's
+    credential/model — trips the breaker on this first occurrence."""
+    review_no_verdict: bool = False
+    """The dead run was a REVIEWER run that produced no verdict. Its failure is
+    charged to the existing breaker budget (a review lane that cannot produce a
+    verdict is a real defect, unlike a plain quota wall on implementation work)."""
+
+    @property
+    def run_outcome(self) -> str:
+        # A rate-limited requeue is recorded as ``rate_limited`` so board history
+        # doesn't show a phantom crash for a quota wall.
+        return "rate_limited" if self.rate_limited else "crashed"
+
+    @property
+    def failure_class(self) -> str:
+        """Terminal failure class, for the auto-block reason the Human reads."""
+        if self.rate_limited:
+            return "503/quota wall"
+        if self.protocol_violation:
+            return "no verdict (clean exit without a terminal kanban call)"
+        if self.terminal_provider:
+            return "provider rejected the credential/model"
+        if self.kind == "signaled":
+            return f"killed by signal {self.code} (timeout or OOM)"
+        return f"reviewer crashed (exit {self.code})" if self.code is not None else "reviewer died"
+
+
+def _classify_dead_worker(
+    pid: int, claimer: Optional[str], exit_code=None, *, task_id: Optional[str] = None,
+    board: Optional[str] = None, review_lane_pending: bool = False,
+) -> _DeadWorker:
+    """Map a dead worker's reaped exit status to its reclaim bookkeeping.
+
+    A clean exit or a crash carries the worker's own last output (``worker_output``
+    in the event payload, appended to the error text) so the board and the retry
+    worker see WHY instead of a bare label; a rate-limited requeue does not need it.
+
+    ``review_lane_pending`` marks the run as a REVIEWER that died without a
+    verdict: the sweep then charges that death to the breaker budget instead of
+    requeueing it forever (see ``_account_crashes``).
+    """
+    dead = _classify_dead_worker_exit(pid, claimer, exit_code, task_id=task_id, board=board)
+    dead.review_no_verdict = bool(review_lane_pending)
+    if dead.review_no_verdict:
+        dead.event_payload["review_no_verdict"] = True
+        dead.event_payload["failure_class"] = dead.failure_class
+    if task_id and not dead.rate_limited:
+        worker_output = _kbd()._worker_final_output(task_id, board=board)
+        if worker_output:
+            dead.error_text += f"{_kbd().WORKER_OUTPUT_SEP}{worker_output!r}"
+            dead.event_payload["worker_output"] = worker_output
+    return dead
+
+
+def _classify_dead_worker_exit(
+    pid: int,
+    claimer: Optional[str],
+    exit_code=None,
+    *,
+    task_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> _DeadWorker:
+    """Exit status -> reclaim bookkeeping, before the worker's own words are folded in.
+
+    ``exit_code`` is the authority's exact-run result for a managed worker (a child of the
+    profile owner, never of this dispatcher, so it cannot be reaped here). Otherwise the reap
+    registry only knows children of THIS process; a per-tick dispatcher reads the exit trailer
+    the worker left in its log instead, so the same death gets the same booking (protocol
+    violation / rate-limit requeue / crash) as under the gateway-embedded dispatcher. A worker
+    that never reached its exit epilogue (killed, OOM) leaves no trailer and stays a plain crash.
+    """
+    kind, code = _kbd()._classify_worker_exit(pid)
+    if exit_code is not None:
+        kind, code = _kbd()._exit_code_kind(int(exit_code))
+    elif kind == "unknown" and task_id:
+        logged = _kbd()._worker_log_exit_code(task_id, board=board)
+        if logged is not None:
+            kind, code = _kbd()._exit_code_kind(logged)
+    if kind == "clean_exit":
+        # rc=0 while still ``running``: usually the work succeeded and only the
+        # paperwork was skipped; the corrective sentence reaches the retry
+        # worker via ``build_worker_context``.
+        return _DeadWorker(
+            kind, code, _kbd()._PROTOCOL_VIOLATION_ERROR, "protocol_violation",
+            # ``protocol_violation`` is the durable marker for
+            # _protocol_violation_streak: _end_run copies this payload into the
+            # run metadata.
+            {"pid": pid, "claimer": claimer, "exit_code": code, "protocol_violation": True},
+            protocol_violation=True,
+        )
+    if kind == "rate_limited":
+        # Quota wall — NOT a task failure. Release to the source phase and do
+        # NOT count a failure so a long quota window can't trip the breaker.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited rate-limited (quota wall) — requeued without counting a failure",
+            "rate_limited",
+            {"pid": pid, "claimer": claimer, "exit_code": code},
+            rate_limited=True,
+        )
+    if kind == "terminal_provider":
+        # The worker classified its own provider failure as unhealable (credential
+        # revoked, model gone): every further spawn would hit the same wall, so
+        # ``_account_crashes`` trips the breaker now instead of after ``failure_limit``.
+        return _DeadWorker(
+            kind, code,
+            f"pid {pid} exited on a terminal provider error (exit {code}): the provider rejected "
+            "this profile's credential or model — fix the configuration, then unblock.",
+            "crashed",
+            {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
+            terminal_provider=True,
+        )
+    if kind == "nonzero_exit":
+        error_text = f"pid {pid} exited with code {code}"
+    elif kind == "signaled":
+        error_text = f"pid {pid} killed by signal {code}"
+    else:
+        error_text = f"pid {pid} not alive"
+    event_payload = {"pid": pid, "claimer": claimer}
+    if code is not None and kind != "unknown":
+        event_payload["exit_kind"] = kind
+        event_payload["exit_code"] = code
+    return _DeadWorker(kind, code, error_text, "crashed", event_payload)

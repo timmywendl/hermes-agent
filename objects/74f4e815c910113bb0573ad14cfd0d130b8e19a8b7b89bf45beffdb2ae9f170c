@@ -1,0 +1,329 @@
+from __future__ import annotations
+
+import asyncio
+from functools import wraps
+from pathlib import Path
+import sys
+import types
+
+import pytest
+
+from gateway.platforms.event import MessageEvent
+from gateway.config import Platform
+from gateway.run_busy import GatewayBusySessionMixin
+from gateway.run_inbound import GatewayInboundMixin
+from gateway.semantic_control import (
+    CURRENT_EXECUTOR,
+    HUMAN_ATTENTION,
+    PORTFOLIO_STATUS,
+    PROJECT_DETAIL,
+    build_control_projection_prompt,
+    normalize_control_text,
+    resolve_control_intent,
+    resolve_project_alias,
+    sanitize_control_response,
+)
+from gateway.session import SessionSource
+
+
+
+def _run_async(test_fn):
+    @wraps(test_fn)
+    def wrapper(*args, **kwargs):
+        return asyncio.run(test_fn(*args, **kwargs))
+    return wrapper
+
+
+def _stub_gateway_sentinel(monkeypatch: pytest.MonkeyPatch) -> None:
+    module = types.ModuleType("gateway.run")
+    module._AGENT_PENDING_SENTINEL = object()
+    monkeypatch.setitem(sys.modules, "gateway.run", module)
+
+
+REGISTRY = """\
+projects:
+  - name: ai-colleague
+    repository: spareribes/ai-colleague
+    authority: repository-and-github
+    default_executor: Codex executor
+  - name: petlibro-cloud-test-platform
+    repository: DesignLibro/petlibro-cloud-test-platform
+    authority: repository-and-github
+    default_executor: Codex executor
+  - name: petlibro-load-testing
+    repository: DesignLibro/petlibro-load-testing
+    authority: repository-and-github
+    default_executor: Codex executor
+  - name: codex_travel
+    repository: spareribes/codex_travel
+    authority: repository-and-github
+    default_executor: Codex executor
+"""
+
+
+@pytest.fixture
+def registry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    path = tmp_path / "portfolio-projects.yaml"
+    path.write_text(REGISTRY, encoding="utf-8")
+    monkeypatch.setenv("HERMES_PORTFOLIO_REGISTRY", str(path))
+    return path
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        ("现在几个项目什么状态？", PORTFOLIO_STATUS),
+        ("几个项目怎么样了", PORTFOLIO_STATUS),
+        ("项目进度呢", PORTFOLIO_STATUS),
+        ("帮我看看现在都在干嘛", PORTFOLIO_STATUS),
+        ("目前整体什么情况", PORTFOLIO_STATUS),
+        ("现在项目都咋样", PORTFOLIO_STATUS),
+        ("项目都咋样", PORTFOLIO_STATUS),
+        ("现在有什么需要我处理？", HUMAN_ATTENTION),
+        ("有啥要我决定的", HUMAN_ATTENTION),
+        ("目前需要我做什么", HUMAN_ATTENTION),
+        ("有什么卡我这里了吗", HUMAN_ATTENTION),
+        ("现在有什么是必须我处理的吗", HUMAN_ATTENTION),
+        ("有需要我拍板的吗", HUMAN_ATTENTION),
+        ("cloud-test 详细一点", PROJECT_DETAIL),
+        ("展开说下 cloud-test", PROJECT_DETAIL),
+        ("cloud test 现在具体什么情况", PROJECT_DETAIL),
+        ("接口自动化那个项目讲详细点", PROJECT_DETAIL),
+        ("cloud-test 最近在干嘛", PROJECT_DETAIL),
+        ("接口自动化现在进到哪了", PROJECT_DETAIL),
+    ],
+)
+def test_read_only_paraphrases_resolve(registry: Path, text: str, kind: str) -> None:
+    intent = resolve_control_intent(text, registry_path=registry)
+    assert intent is not None
+    assert intent.kind == kind
+
+
+def test_project_aliases_resolve_to_stable_identity(registry: Path) -> None:
+    cloud = {resolve_project_alias(value, registry_path=registry).project_id for value in (
+        "cloud-test", "cloud test", "petlibro cloud test", "接口自动化", "接口自动化功能开发",
+    )}
+    load = {resolve_project_alias(value, registry_path=registry).project_id for value in (
+        "load-testing", "load test", "压测", "压测平台",
+    )}
+    travel = {resolve_project_alias(value, registry_path=registry).project_id for value in (
+        "codex_travel", "travel", "旅游", "旅游 mainline",
+    )}
+    assert cloud == {"petlibro-cloud-test-platform"}
+    assert load == {"petlibro-load-testing"}
+    assert travel == {"codex_travel"}
+
+
+def test_current_executor_is_read_only_and_project_scoped(registry: Path) -> None:
+    intent = resolve_control_intent("cloud test 现在谁在做？", registry_path=registry)
+    assert intent is not None
+    assert intent.kind == CURRENT_EXECUTOR
+    assert intent.project is not None
+    assert intent.project.project_id == "petlibro-cloud-test-platform"
+
+
+def test_punctuation_spacing_and_case_are_normalized(registry: Path) -> None:
+    assert normalize_control_text("  CLOUD—TEST！  详细一点？ ") == "cloud-test 详细一点"
+    intent = resolve_control_intent("CLOUD—TEST！详细一点？", registry_path=registry)
+    assert intent is not None and intent.kind == PROJECT_DETAIL
+
+
+def test_mutation_and_unknown_phrasing_fall_back(registry: Path) -> None:
+    assert resolve_control_intent("cloud-test 搞一下", registry_path=registry) is None
+    assert resolve_control_intent("继续 cloud-test", registry_path=registry) is None
+    detail = resolve_control_intent("接口自动化功能开发现在进到哪了", registry_path=registry)
+    assert detail is not None and detail.kind == PROJECT_DETAIL
+    assert resolve_control_intent("天气怎么样", registry_path=registry) is None
+    assert resolve_control_intent("cloud-test", registry_path=registry) is None
+
+
+def test_prompt_is_canonical_and_read_only(registry: Path) -> None:
+    intent = resolve_control_intent("展开说下 cloud-test", registry_path=registry)
+    assert intent is not None
+    prompt = build_control_projection_prompt(intent, "展开说下 cloud-test")
+    assert "Canonical intent: PROJECT_DETAIL" in prompt
+    assert "petlibro-cloud-test-platform" in prompt
+    assert "Do not mutate" in prompt
+    assert "/Users/" not in prompt
+
+
+def test_response_sanitization_keeps_detail_but_hides_runtime_identity() -> None:
+    raw = """🟢 cloud-test · 正在推进
+session ID: agent:main:telegram:dm:123
+provider: secret-provider
+SHA: abcdef1234567890
+PR: #94
+worktree: <HOME>/private/cloud-test
+"""
+    compact = sanitize_control_response(raw, details=False)
+    detail = sanitize_control_response(raw, details=True)
+    assert "session" not in compact.lower()
+    assert "provider" not in compact.lower()
+    assert "SHA:" not in compact
+    assert "PR:" not in compact
+    assert "SHA: abcdef1234567890" in detail
+    assert "PR: #94" in detail
+    assert "/Users/" not in detail
+    assert "[PATH]" in detail
+    assert "provider" not in detail.lower()
+    raw_sha = "a" * 40
+    assert raw_sha not in sanitize_control_response(f"direction {raw_sha}", details=False)
+
+
+class _Adapter:
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append(str(content))
+
+
+class _SemanticHarness(GatewayInboundMixin):
+    def __init__(self, registry: Path) -> None:
+        self.adapter = _Adapter()
+        self.registry = registry
+        self.calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    def _delivery_adapter_for(self, source):
+        return self.adapter
+
+    def _thread_metadata_for_source(self, source, anchor=None):
+        return {"reply_to": anchor}
+
+    def _reply_anchor_for_event(self, event):
+        return str(event.message_id or "")
+
+    def _semantic_control_intent_for_event(self, event):
+        # Keep the production Telegram gate while making the test registry explicit.
+        if event.source.platform != Platform.TELEGRAM:
+            return None
+        from gateway.semantic_control import resolve_control_intent
+        return resolve_control_intent(event.text, registry_path=self.registry)
+
+    async def _run_readonly_control_projection(self, prompt, source, task_id, event_message_id=None):
+        self.calls += 1
+        self.started.set()
+        await self.release.wait()
+        return "总体：3 个项目正常推进。\nsession: hidden\nworktree: /private/worktree/cloud-test"
+
+
+def _event(text: str, message_id: str) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        chat_type="dm",
+        user_id="user-1",
+    )
+    return MessageEvent(text=text, source=source, message_id=message_id)
+
+
+@_run_async
+async def test_duplicate_inflight_queries_coalesce_and_later_query_is_fresh(registry: Path) -> None:
+    runner = _SemanticHarness(registry)
+    first = asyncio.create_task(runner._route_semantic_control_query(_event("几个项目怎么样了", "m1"), "session-1"))
+    await runner.started.wait()
+    second = asyncio.create_task(runner._route_semantic_control_query(_event("现在几个项目什么状态？", "m2"), "session-1"))
+    await asyncio.sleep(0)
+    assert runner.calls == 1
+    runner.release.set()
+    assert await first is True
+    assert await second is True
+    assert runner.calls == 1
+    assert len(runner.adapter.sent) == 1
+
+    runner.started = asyncio.Event()
+    runner.release = asyncio.Event()
+    fresh = asyncio.create_task(runner._route_semantic_control_query(_event("项目都咋样", "m3"), "session-1"))
+    await runner.started.wait()
+    runner.release.set()
+    assert await fresh is True
+    assert runner.calls == 2
+    assert len(runner.adapter.sent) == 2
+
+
+@_run_async
+async def test_semantic_projection_timeout_is_bounded(registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    runner = _SemanticHarness(registry)
+
+    async def slow_projection(*args, **kwargs):
+        await asyncio.sleep(1)
+        return "never delivered"
+
+    runner._run_readonly_control_projection = slow_projection
+    monkeypatch.setattr("gateway.run_inbound._SEMANTIC_CONTROL_TIMEOUT_SECONDS", 0.01)
+    result = await runner._route_semantic_control_query(_event("项目都咋样", "timeout-1"), "session-1")
+    assert result is True
+    assert runner.adapter.sent == ["当前无法读取最新项目状态，请稍后再试。"]
+
+
+class _BusyHarness(GatewayBusySessionMixin, _SemanticHarness):
+    def __init__(self, registry: Path) -> None:
+        _SemanticHarness.__init__(self, registry)
+        self._draining = False
+
+    def _is_user_authorized_for_source(self, source):
+        return True
+
+    def _admit_bot_message_for_source(self, source):
+        return True
+
+    def _effective_busy_input_mode(self, source):
+        return "interrupt"
+
+    async def _route_plaintext_approval_while_busy(self, event, session_key):
+        return False
+
+
+@_run_async
+async def test_busy_read_only_query_bypasses_redirect_path(registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_gateway_sentinel(monkeypatch)
+    runner = _BusyHarness(registry)
+    runner.release.set()
+    result = await runner._handle_active_session_busy_message(
+        _event("几个项目怎么样了", "busy-1"), "session-1"
+    )
+    assert result is True
+    assert runner.calls == 1
+    assert len(runner.adapter.sent) == 1
+    assert "redirect" not in runner.adapter.sent[0].lower()
+
+
+class _IdleHarness(_SemanticHarness):
+    async def _hm_admit_event(self, event):
+        return event, event.source, False
+
+    def _hm_estop_gate(self, event, source, is_internal):
+        return None
+
+    def _session_key_for_source(self, source):
+        return "session-1"
+
+    async def _hm_pending_reply_intercepts(self, event, source, session_key):
+        return None
+
+    def _hm_evict_idle_stale_agent(self, session_key):
+        return None
+
+    def _is_session_running(self, session_key):
+        return False
+
+
+@_run_async
+async def test_idle_read_only_query_uses_same_projection(registry: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_gateway_sentinel(monkeypatch)
+    runner = _IdleHarness(registry)
+    runner.release.set()
+    result = await runner._handle_message(_event("现在有什么需要我处理？", "idle-1"))
+    assert result is None
+    assert runner.calls == 1
+    assert len(runner.adapter.sent) == 1
+
+
+@_run_async
+async def test_non_telegram_messages_are_not_semantic_control() -> None:
+    runner = _SemanticHarness(Path("/does/not/exist"))
+    source = SessionSource(platform=Platform.DISCORD, chat_id="chat-1", user_id="user-1")
+    event = MessageEvent(text="几个项目怎么样了", source=source, message_id="discord-1")
+    assert runner._semantic_control_intent_for_event(event) is None

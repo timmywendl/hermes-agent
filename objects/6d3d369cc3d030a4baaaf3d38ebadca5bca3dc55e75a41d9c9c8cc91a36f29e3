@@ -1,0 +1,332 @@
+"""Origin resolution for ``kanban create`` — explicit args, then the turn bridge.
+
+Plan B (Issue #92). A real Telegram turn reaches the CLI through the
+``terminal`` tool, whose child env carries the bridged session source
+(``tools/environments/local.py::_inject_session_context_env``). The CLI used to
+ignore it, so a task created from a Telegram turn landed with no
+``kanban_notify_subs`` row and the notifier skipped the whole board.
+
+Priority:
+  1. explicit ``--origin-platform``/``--origin-chat-id``/``--origin-thread-id``
+  2. otherwise the trusted turn bridge (``gateway.session_context``)
+  3. otherwise plain CLI behaviour: ``subscribed=false`` + a visible reason
+
+The model never has to compose origin flags.
+
+These tests exercise the resolution rules and the DB effect. The bridge is
+simulated the way a child process really sees it: a FRESH interpreter with only
+``os.environ`` populated and no ContextVar bound, because that is exactly the
+state ``hermes kanban create`` runs in. A subprocess is therefore the only
+faithful harness for the env cases.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban as kc
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kn
+
+# Import the notifier's own terminal-kind filter so this test cannot drift from
+# the real claim path (gateway/kanban_watchers_notifier.py::_claim_for_sub).
+from gateway.kanban_watchers_notifier import TERMINAL_KINDS
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Every HERMES_SESSION_* the bridge can carry; cleared so a case never inherits
+# the developer's own interactive session.
+_SESSION_ENV = (
+    "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
+    "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_THREAD_ID", "HERMES_SESSION_KEY",
+    "HERMES_SESSION_ID", "HERMES_SESSION_PROFILE", "HERMES_SESSION_USER_ID",
+    "HERMES_SESSION_MESSAGE_ID", "HERMES_CRON_SESSION", "HERMES_KANBAN_TASK",
+)
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    for var in _SESSION_ENV:
+        monkeypatch.delenv(var, raising=False)
+    kb.init_db()
+    return home
+
+
+def _run(argv):
+    """Drive the real ``hermes kanban create`` parser into ``_cmd_create``."""
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers())
+    args = root.parse_args(["kanban", "create", *argv])
+    return kc._cmd_create(args)
+
+
+def _subs(task_id):
+    with kbc.connect_closing() as conn:
+        return kn.list_notify_subs(conn, task_id)
+
+
+def _run_in_subprocess(origin_env, argv, home):
+    """Run ``_cmd_create`` in a FRESH interpreter with only ``origin_env`` bridged.
+
+    This is the faithful harness for the turn-bridge cases: a real CLI child has
+    no ContextVar bound, so ``get_session_env`` falls back to ``os.environ``.
+    """
+    script = (
+        "import argparse, json, sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from hermes_cli import kanban as kc\n"
+        "root = argparse.ArgumentParser(prog='hermes')\n"
+        "kc.build_parser(root.add_subparsers())\n"
+        "args = root.parse_args(['kanban', 'create'] + sys.argv[2:])\n"
+        "rc = kc._cmd_create(args)\n"
+        "sys.stderr.write('RC=%d\\n' % rc)\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k not in _SESSION_ENV}
+    env.update(origin_env)
+    env["HERMES_HOME"] = str(home)
+    env["HERMES_KANBAN_HOME"] = str(home)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    proc = subprocess.run(
+        [sys.executable, "-c", script, str(REPO_ROOT), *argv],
+        capture_output=True, text=True, env=env, timeout=180,
+    )
+    rc = None
+    for line in proc.stderr.splitlines():
+        if line.startswith("RC="):
+            rc = int(line.split("=", 1)[1])
+    return rc, proc.stdout, proc.stderr, proc.returncode
+
+
+# ------------------------------------------- 1. the turn bridge (Telegram case)
+
+TELEGRAM_BRIDGE = {
+    "HERMES_SESSION_PLATFORM": "telegram",
+    "HERMES_SESSION_CHAT_ID": "5240161349",
+    "HERMES_SESSION_CHAT_TYPE": "dm",
+    "HERMES_SESSION_THREAD_ID": "",
+    "HERMES_SESSION_KEY": "agent:main:telegram:dm:5240161349",
+    "HERMES_SESSION_PROFILE": "default",
+}
+
+
+def test_turn_bridge_source_writes_subscription(kanban_home):
+    """A Telegram turn's bridged source subscribes without any explicit flag."""
+    rc, out, err, _ = _run_in_subprocess(TELEGRAM_BRIDGE, ["BRIDGED", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+
+    assert payload["subscribed"] is True
+    sub = payload["subscription"]
+    assert (sub["platform"], sub["chat_id"], sub["chat_type"]) == ("telegram", "5240161349", "dm")
+    assert sub["delivery_mode"] == "notify+wake"
+    assert sub["notifier_profile"] == "default"
+
+    rows = _subs(payload["id"])
+    assert len(rows) == 1
+    assert rows[0]["platform"] == "telegram"
+    assert rows[0]["chat_id"] == "5240161349"
+
+
+def test_turn_bridge_carries_thread_id_when_present(kanban_home):
+    env = dict(TELEGRAM_BRIDGE, HERMES_SESSION_THREAD_ID="77")
+    rc, out, err, _ = _run_in_subprocess(env, ["BRIDGED_THREAD", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["subscription"]["thread_id"] == "77"
+    assert _subs(payload["id"])[0]["thread_id"] == "77"
+
+
+def test_turn_bridge_report_names_origin_kind(kanban_home):
+    """The result distinguishes an explicit flag from a bridged source."""
+    rc, out, _, _ = _run_in_subprocess(TELEGRAM_BRIDGE, ["BRIDGED_KIND", "--json"], kanban_home)
+    assert rc == 0
+    assert json.loads(out)["origin_source"] == "turn_bridge"
+
+
+# ------------------------------------------------------------ 2. plain CLI
+
+def test_plain_cli_without_bridge_writes_no_subscription(kanban_home, capsys):
+    assert _run(["PLAIN", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["subscribed"] is False
+    assert payload["subscription"] is None
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+    assert payload["origin_source"] == "none"
+    assert _subs(payload["id"]) == []
+
+
+def test_bridge_without_chat_id_is_not_a_source(kanban_home):
+    """Half a bridged source must not produce a subscription."""
+    env = dict(TELEGRAM_BRIDGE)
+    env["HERMES_SESSION_CHAT_ID"] = ""
+    rc, out, err, _ = _run_in_subprocess(env, ["BRIDGE_NO_CHAT", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["subscribed"] is False
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+
+
+def test_cron_child_env_does_not_subscribe(kanban_home):
+    """A cron child carries an explicitly EMPTY platform — never a source."""
+    env = dict(TELEGRAM_BRIDGE)
+    env.update({"HERMES_SESSION_PLATFORM": "", "HERMES_SESSION_CHAT_ID": "",
+                "HERMES_CRON_SESSION": "1"})
+    rc, out, err, _ = _run_in_subprocess(env, ["CRON_CHILD", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["subscribed"] is False
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+
+
+def test_kanban_worker_child_env_does_not_subscribe(kanban_home):
+    """A dispatcher-spawned worker is a one-shot subprocess: no async delivery."""
+    env = dict(TELEGRAM_BRIDGE, HERMES_KANBAN_TASK="t_parent123")
+    rc, out, err, _ = _run_in_subprocess(env, ["WORKER_CHILD", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["subscribed"] is False
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+
+
+@pytest.mark.parametrize("platform", ["api_server", "cli", "tui", "kanban", "webhook"])
+def test_non_messaging_surface_does_not_subscribe(kanban_home, platform):
+    """A stateless/non-messaging surface must never get a subscription.
+
+    Regression guard: ``async_delivery_supported()`` is deliberately NOT bridged
+    into child envs (``_SESSION_ASYNC_DELIVERY`` is kept out of ``_VAR_MAP``), so
+    inside a fresh CLI child it reports "supported" even for ``api_server``. The
+    platform-based ``session_is_messaging_surface()`` check is what actually
+    rejects these — without it a row is written that can never deliver.
+    """
+    env = dict(TELEGRAM_BRIDGE, HERMES_SESSION_PLATFORM=platform)
+    rc, out, err, _ = _run_in_subprocess(env, [f"NONMSG_{platform}", "--json"], kanban_home)
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["subscribed"] is False, f"{platform} must not be subscribable"
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+    assert _subs(payload["id"]) == []
+
+
+# -------------------------------------------------------- 3. explicit flags
+
+def test_explicit_flags_still_work(kanban_home, capsys):
+    assert _run(["EXPLICIT", "--json", "--origin-platform", "telegram",
+                 "--origin-chat-id", "5240161349", "--origin-chat-type", "dm"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["subscribed"] is True
+    assert payload["origin_source"] == "explicit"
+    assert _subs(payload["id"])[0]["chat_id"] == "5240161349"
+
+
+def test_explicit_flags_override_the_bridge(kanban_home):
+    """Explicit arguments win over the bridged source."""
+    env = dict(TELEGRAM_BRIDGE)
+    rc, out, err, _ = _run_in_subprocess(
+        env,
+        ["OVERRIDE", "--json", "--origin-platform", "telegram",
+         "--origin-chat-id", "999000111", "--origin-chat-type", "group"],
+        kanban_home,
+    )
+    assert rc == 0, err
+    payload = json.loads(out)
+    assert payload["origin_source"] == "explicit"
+    sub = payload["subscription"]
+    assert sub["chat_id"] == "999000111"
+    assert sub["chat_type"] == "group"
+    assert len(_subs(payload["id"])) == 1
+
+
+# ------------------------------------------------- 4. partial is never silent
+
+@pytest.mark.parametrize("partial", [
+    ["--origin-platform", "telegram"],
+    ["--origin-chat-id", "5240161349"],
+])
+def test_partial_explicit_source_is_a_visible_error(kanban_home, capsys, partial):
+    rc = _run(["PARTIAL", *partial])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "--origin-platform" in err and "--origin-chat-id" in err
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_partial_explicit_beats_a_usable_bridge(kanban_home):
+    """An explicitly partial source is an error even when the bridge is complete."""
+    env = dict(TELEGRAM_BRIDGE)
+    rc, out, err, _ = _run_in_subprocess(
+        env, ["PARTIAL_BRIDGE", "--origin-platform", "telegram"], kanban_home
+    )
+    assert rc == 2, err
+    assert "--origin-chat-id" in err
+    assert out.strip() == ""
+
+
+# --------------------------------------------- 5. completion is discoverable
+
+def test_notifier_finds_bridged_subscription_for_completed_event(kanban_home):
+    rc, out, err, _ = _run_in_subprocess(TELEGRAM_BRIDGE, ["NOTIFY_BRIDGED", "--json"], kanban_home)
+    assert rc == 0, err
+    task_id = json.loads(out)["id"]
+
+    # The notifier's per-board gate (read-only, profile-scoped): mirrors
+    # KanbanNotifier._board_has_subs.
+    assert kn.count_notify_subs(notifier_profiles={"default"}) == 1
+
+    with kbc.connect_closing() as conn:
+        assert kb.complete_task(conn, task_id, result="done")
+        # Mirrors KanbanNotifier._claim_for_sub, including the terminal-kind filter.
+        old_cursor, new_cursor, events = kn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="5240161349",
+            thread_id="", kinds=TERMINAL_KINDS,
+        )
+        assert new_cursor > old_cursor
+        assert any(e.kind == "completed" for e in events)
+        # Cursor is claimed exactly once.
+        assert kn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="5240161349",
+            thread_id="", kinds=TERMINAL_KINDS,
+        )[2] == []
+
+
+# ------------------------------------------------------------- 6. idempotency
+
+def test_repeated_bridged_create_does_not_duplicate(kanban_home):
+    argv = ["IDEM_BRIDGE", "--json", "--idempotency-key", "bridge-key-v1"]
+    rc1, out1, err1, _ = _run_in_subprocess(TELEGRAM_BRIDGE, argv, kanban_home)
+    assert rc1 == 0, err1
+    first = json.loads(out1)
+    rc2, out2, err2, _ = _run_in_subprocess(TELEGRAM_BRIDGE, argv, kanban_home)
+    assert rc2 == 0, err2
+    second = json.loads(out2)
+
+    assert first["id"] == second["id"]
+    assert len(_subs(first["id"])) == 1
+
+
+def test_repeated_bridge_subscribe_is_idempotent(kanban_home):
+    rc, out, err, _ = _run_in_subprocess(TELEGRAM_BRIDGE, ["IDEM_ROWS", "--json"], kanban_home)
+    assert rc == 0, err
+    task_id = json.loads(out)["id"]
+    with kbc.connect_closing() as conn:
+        kn.add_notify_sub(conn, task_id=task_id, platform="telegram",
+                          chat_id="5240161349", delivery_mode="notify+wake")
+        kn.add_notify_sub(conn, task_id=task_id, platform="telegram",
+                          chat_id="5240161349", delivery_mode="notify+wake")
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+    assert rows == 1

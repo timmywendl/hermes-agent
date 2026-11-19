@@ -1,0 +1,284 @@
+"""`kanban create` writes an originating notification subscription only when the
+caller supplies an explicit source (Issue #92).
+
+A Telegram-originated turn creates tasks through the CLI. Without an explicit
+source the card lands with no ``kanban_notify_subs`` row, so the notifier skips
+the board entirely (``count_notify_subs == 0``) and the terminal ``completed``
+event never reaches the originating chat.
+
+Plan A: the CLI never guesses the origin from ambient environment. The caller
+must pass ``--origin-platform`` and ``--origin-chat-id``; ``--origin-chat-type``
+and ``--origin-thread-id`` are optional refinements. A missing source is a
+normal CLI create (``subscribed=false``), a *partial* source is a visible
+error, never a silent success.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban as kc
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kn
+
+# Import the notifier's own terminal-kind filter so this test cannot drift from
+# the real claim path (gateway/kanban_watchers_notifier.py::_claim_for_sub).
+from gateway.kanban_watchers_notifier import TERMINAL_KINDS
+
+
+@pytest.fixture
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    # Ambient origin must never be consulted: these are what the gateway/TUI
+    # export for the *tool* path, and the CLI path must ignore them.
+    for var in ("HERMES_SESSION_PLATFORM", "HERMES_SESSION_CHAT_ID",
+                "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_THREAD_ID",
+                "HERMES_SESSION_KEY", "HERMES_SESSION_ID"):
+        monkeypatch.delenv(var, raising=False)
+    kb.init_db()
+    return home
+
+
+def _run(argv):
+    """Drive the real ``hermes kanban create`` parser into ``_cmd_create``."""
+    root = argparse.ArgumentParser(prog="hermes")
+    kc.build_parser(root.add_subparsers())
+    args = root.parse_args(["kanban", "create", *argv])
+    return kc._cmd_create(args)
+
+
+def _subs(task_id):
+    with kbc.connect_closing() as conn:
+        return kn.list_notify_subs(conn, task_id)
+
+
+def _task(task_id):
+    with kbc.connect_closing() as conn:
+        return kb.get_task(conn, task_id)
+
+
+def _created_task_id(capsys):
+    return json.loads(capsys.readouterr().out)["id"]
+
+
+# ---------------------------------------------------------------- explicit source
+
+
+def test_telegram_source_writes_subscription(kanban_home, capsys):
+    """A full Telegram source persists exactly one subscribable row."""
+    assert _run([
+        "TELEGRAM_ORIGIN", "--json",
+        "--origin-platform", "telegram",
+        "--origin-chat-id", "5240161349",
+        "--origin-chat-type", "dm",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["subscribed"] is True
+    assert payload["subscription"]["platform"] == "telegram"
+    assert payload["subscription"]["chat_id"] == "5240161349"
+    # Non-tui origins ask for wake so the originating agent is resumed.
+    assert payload["subscription"]["delivery_mode"] == "notify+wake"
+
+    subs = _subs(payload["id"])
+    assert len(subs) == 1
+    sub = subs[0]
+    assert (sub["platform"], sub["chat_id"], sub["chat_type"]) == ("telegram", "5240161349", "dm")
+    assert sub["delivery_mode"] == "notify+wake"
+    assert sub["notifier_profile"] == "default"
+    # New subs start caught up at the creating task's latest event, so the
+    # notifier never replays history (add_notify_sub contract). The card's own
+    # `created` event is therefore already consumed; only later terminal events
+    # will be claimed.
+    with kbc.connect_closing() as conn:
+        max_event = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (payload["id"],)
+        ).fetchone()[0]
+    assert sub["last_event_id"] == max_event
+
+
+def test_optional_thread_id_is_recorded(kanban_home, capsys):
+    assert _run([
+        "THREADED", "--json",
+        "--origin-platform", "telegram",
+        "--origin-chat-id", "5240161349",
+        "--origin-chat-type", "dm",
+        "--origin-thread-id", "77",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["subscription"]["thread_id"] == "77"
+    assert _subs(payload["id"])[0]["thread_id"] == "77"
+
+
+# ------------------------------------------------------------------ no source
+
+
+def test_plain_cli_create_writes_no_subscription(kanban_home, capsys):
+    """The default CLI path stays a plain create — `subscribed=false` + reason."""
+    assert _run(["PLAIN", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["subscribed"] is False
+    assert payload["subscription"] is None
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+    assert _subs(payload["id"]) == []
+    # A missing source is NOT a failure.
+    assert _task(payload["id"]).status == "ready"
+
+
+def test_ambient_env_without_full_source_is_not_a_source(kanban_home, capsys, monkeypatch):
+    """Plan B supersedes plan A's blanket env ban — but only a COMPLETE, live
+    bridged source counts. A stray platform with no chat destination, or a
+    partial pair, must still produce a plain create.
+
+    (Under plan A this test banned the environment outright. Plan B reads the
+    bridge *because* the bridge is the canonical turn source; what must never
+    happen is treating a half-populated or destination-less env as an origin.)
+    """
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:dm:5240161349")
+
+    assert _run(["AMBIENT_PARTIAL", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["subscribed"] is False
+    assert payload["subscription_skipped_reason"] == "no_origin_source"
+    assert payload["origin_source"] == "none"
+    assert _subs(payload["id"]) == []
+
+
+def test_env_bridge_source_is_labelled_and_used(kanban_home, capsys, monkeypatch):
+    """The complement of the case above: with BOTH halves present the bridge is
+    used, and the result says so — it is never confused with an explicit flag.
+    """
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "5240161349")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "dm")
+
+    assert _run(["AMBIENT_FULL", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["subscribed"] is True
+    assert payload["origin_source"] == "turn_bridge"
+    assert _subs(payload["id"])[0]["chat_id"] == "5240161349"
+
+
+# ------------------------------------------------------- partial source is visible
+
+
+def test_human_output_reports_origin_source(kanban_home, capsys):
+    """Human (non-JSON) output must name origin_source too, not just --json."""
+    assert _run(["HUMAN_PLAIN"]) == 0
+    out = capsys.readouterr().out
+    assert "Not subscribed: no_origin_source" in out
+    assert "origin_source=none" in out
+
+    assert _run(["HUMAN_EXPLICIT", "--origin-platform", "telegram",
+                 "--origin-chat-id", "5240161349", "--origin-chat-type", "dm"]) == 0
+    out = capsys.readouterr().out
+    assert "Subscribed telegram:5240161349" in out
+    assert "origin_source=explicit" in out
+
+
+@pytest.mark.parametrize("partial", [
+    ["--origin-platform", "telegram"],
+    ["--origin-chat-id", "5240161349"],
+])
+def test_partial_source_is_a_visible_error(kanban_home, capsys, partial):
+    """Half a source must not silently succeed (issue requirement 3)."""
+    rc = _run(["PARTIAL", *partial])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "origin" in err.lower()
+    assert "--origin-platform" in err and "--origin-chat-id" in err
+    # Nothing was created, and nothing was subscribed.
+    with kbc.connect_closing() as conn:
+        assert kb.list_tasks(conn) == []
+
+
+def test_partial_source_reports_error_on_json_too(kanban_home, capsys):
+    assert _run(["PARTIAL_JSON", "--json", "--origin-platform", "telegram"]) == 2
+    captured = capsys.readouterr()
+    # Machine-readable callers get no bogus success payload.
+    assert captured.out.strip() == ""
+    assert "origin" in captured.err.lower()
+
+
+def test_blank_chat_id_is_not_a_source(kanban_home, capsys):
+    assert _run(["BLANK", "--json", "--origin-platform", "telegram",
+                 "--origin-chat-id", "   "]) == 2
+    assert capsys.readouterr().out.strip() == ""
+
+
+# -------------------------------------------------- notifier can find the sub
+
+
+def test_notifier_finds_subscription_for_completed_event(kanban_home, capsys):
+    """Completion on a subscribed task is claimable by the notifier."""
+    assert _run(["NOTIFY_ME", "--json", "--origin-platform", "telegram",
+                 "--origin-chat-id", "5240161349", "--origin-chat-type", "dm"]) == 0
+    task_id = _created_task_id(capsys)
+
+    # The notifier's per-board gate: a board with no subs is skipped entirely.
+    # Mirrors KanbanNotifier._board_has_subs (read-only, profile-scoped, no conn).
+    assert kn.count_notify_subs(notifier_profiles={"default"}) == 1
+
+    with kbc.connect_closing() as conn:
+        assert kb.complete_task(conn, task_id, result="done")
+        # Mirrors KanbanNotifier._claim_for_sub, including the terminal-kind filter.
+        old_cursor, new_cursor, events = kn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="5240161349",
+            thread_id="", kinds=TERMINAL_KINDS,
+        )
+        assert new_cursor > old_cursor
+        assert any(e.kind == "completed" for e in events)
+
+        # Cursor is claimed exactly once: a concurrent/second pass sees nothing new.
+        again = kn.claim_unseen_events_for_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="5240161349",
+            thread_id="", kinds=TERMINAL_KINDS,
+        )
+        assert again[2] == []
+
+
+# --------------------------------------------------------------- idempotency
+
+
+def test_recreate_with_same_key_does_not_duplicate_subscription(kanban_home, capsys):
+    """Idempotent create keeps exactly one sub, never a duplicate."""
+    argv = ["IDEMPOTENT", "--json", "--idempotency-key", "dup-key-v1",
+            "--origin-platform", "telegram", "--origin-chat-id", "5240161349",
+            "--origin-chat-type", "dm"]
+    assert _run(argv) == 0
+    first = json.loads(capsys.readouterr().out)
+    assert _run(argv) == 0
+    second = json.loads(capsys.readouterr().out)
+
+    assert first["id"] == second["id"]
+    assert len(_subs(first["id"])) == 1
+
+
+def test_repeated_explicit_source_is_idempotent(kanban_home, capsys):
+    """Re-subscribing the same (task, platform, chat, thread) never doubles rows."""
+    assert _run(["ONCE", "--json", "--origin-platform", "telegram",
+                 "--origin-chat-id", "5240161349", "--origin-chat-type", "dm"]) == 0
+    task_id = _created_task_id(capsys)
+
+    with kbc.connect_closing() as conn:
+        kn.add_notify_sub(conn, task_id=task_id, platform="telegram",
+                          chat_id="5240161349", delivery_mode="notify+wake")
+        kn.add_notify_sub(conn, task_id=task_id, platform="telegram",
+                          chat_id="5240161349", delivery_mode="notify+wake")
+        rows = conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+    assert rows == 1

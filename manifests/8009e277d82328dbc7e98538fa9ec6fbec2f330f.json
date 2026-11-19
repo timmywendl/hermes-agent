@@ -1,0 +1,37 @@
+{
+  "source_commit": "8009e277d82328dbc7e98538fa9ec6fbec2f330f",
+  "base_commit": "60344574963861ee5d50b980338878be4f5b73af",
+  "same_as_base_source_files": 17174,
+  "different_source_files": [
+    {
+      "path": "hermes_state_worker_context.py",
+      "source_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "archived_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "mode": "100644",
+      "origin": "git_blob:b132aa4137ecd96c9ba33c6bebc6d5ff257c1077",
+      "redacted": false
+    },
+    {
+      "path": "tests/agent/transports/test_hermes_tools_mcp_server.py",
+      "source_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "archived_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "mode": "100644",
+      "origin": "git_blob:30be55bc991b6e86eaa11afb837666aebdf0c83d",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_state/test_runtime_worker_context.py",
+      "source_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "archived_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "mode": "100644",
+      "origin": "git_blob:51b8cc96d5b131313534c08f4d72aea2baf39827",
+      "redacted": false
+    }
+  ],
+  "base_paths_absent_in_original_tree": [
+    "tests/gateway/test_guest_worker_boundary.py",
+    "tests/gateway/test_guest_worker_stop.py",
+    "tests/gateway/test_guest_worker_transport.py"
+  ],
+  "scope": "Non-sensitive UTF-8 engineering source only. Not a runtime release, full private environment backup, or assertion that old code was merged into main."
+}

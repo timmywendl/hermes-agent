@@ -1,0 +1,23 @@
+{
+  "source_commit": "725a51461f5d0089699fb9dc2aa3f2cfbf32f424",
+  "snapshot": "hermes-working-b95094268920",
+  "files": [
+    {
+      "path": "macos/dashboard-host/Sources/HermesDashboardHost/main.swift",
+      "source_sha256": "c35ff97fa53e3ddbb80211b52bec1982419afecd756a8428c191f8696d27308f",
+      "archived_sha256": "6bcaadf4fbaa5b1008589eb046bf94629b954cc8badcb3f95fa357db01245a14",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "tests/macos/test_foreground_probe.py",
+      "source_sha256": "79aabc9028bbeffae13f04ed8f0c1b9e324de01fe42615402da1649f94426209",
+      "archived_sha256": "93f96fffdbd90f339ac4234e9941393a4f9948d27c9cd47fe5a4e6ccbd15a078",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    }
+  ],
+  "scope": "Sanitized uncommitted engineering source; excludes raw memory, credentials, conversations, DBs, environment config, runtime data and binaries."
+}

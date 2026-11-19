@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+import plistlib
+import subprocess
+from pathlib import Path
+
+import pytest
+
+MODULE_PATH = Path(__file__).resolve().parents[2] / "macos" / "dashboard-host" / "build_host.py"
+
+
+def host_source() -> str:
+    return (
+        Path(__file__).resolve().parents[2]
+        / "macos/dashboard-host/Sources/HermesDashboardHost/main.swift"
+    ).read_text(encoding="utf-8")
+
+
+def test_probe_mode_is_documented_in_host_source():
+    source = host_source()
+    assert "--foreground-probe" in source
+    probe = source.split("func runForegroundProbe()", 1)[1].split("// MARK: - SMAppService", 1)[0]
+    assert "SMAppService" not in probe
+
+
+def test_probe_has_fixed_arity_and_no_free_form_path_or_command():
+    source = host_source()
+    probe = source.split("func runForegroundProbe()", 1)[1].split("// MARK: - SMAppService", 1)[0]
+    dispatch = source.split('case "--foreground-probe":', 1)[1].split('case "--status":', 1)[0]
+    assert "CommandLine.arguments" not in probe
+    assert "Process()" not in probe
+    assert "execv" not in probe
+    assert "FileHandle.standardInput" not in probe
+    assert "requireNoExtraArguments(arguments)" in dispatch
+    assert "DevToolsActivePort" in source
+
+
+def test_probe_uses_only_the_fixed_chrome_devtools_path():
+    source = host_source()
+    assert 'Library/Application Support/Google/Chrome/DevToolsActivePort' in source
+    assert 'appendingPathComponent("Library/Application Support/Google/Chrome/DevToolsActivePort")' in source
+
+
+def test_probe_reports_app_and_child_results_separately():
+    source = host_source()
+    probe = source.split("func runForegroundProbe()", 1)[1].split("// MARK: - SMAppService", 1)[0]
+    assert "APP_FILE_PROBE" in probe
+    assert "CHILD_FILE_PROBE=NOT_RUN" in probe
+    assert "CHILD_RESPONSIBLE_BUNDLE=NOT_RUN" in probe
+
+
+def test_probe_does_not_include_persistent_service_operations():
+    source = host_source()
+    probe = source.split("func runForegroundProbe()", 1)[1].split("// MARK: - SMAppService", 1)[0]
+    for forbidden in ("registerService", "unregisterService", "launchctl", "bootstrap", "bootout", "kickstart"):
+        assert forbidden not in probe
+
+
+def test_probe_success_exit_is_limited_to_non_permission_failure():
+    source = host_source()
+    probe = source.split("func runForegroundProbe()", 1)[1].split("// MARK: - SMAppService", 1)[0]
+    assert "exit(0)" in probe
+    assert "exit(2)" in probe
+    assert "errnoName" in probe
+    assert 'case EPERM: return "EPERM"' in source
+
+
+def test_probe_mode_is_in_usage_and_app_bundle_is_not_a_service_controller():
+    source = host_source()
+    assert 'case "--foreground-probe"' in source
+    assert 'try requireNoExtraArguments(arguments)' in source
+    assert 'case "--register"' in source
+    assert 'case "--unregister"' in source
+
+
+def test_foreground_mcp_uses_fixed_verified_command_and_arguments():
+    source = host_source()
+    mcp = source.split("func runForegroundMCP()", 1)[1].split("/// Refuse", 1)[0]
+    assert '"<HOME>/.hermes/cache/scratch/foreground-mcp-artifact-v1/install/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"' in source
+    assert '"--autoConnect", "--no-usage-statistics"]' in mcp
+    assert "CommandLine.arguments" not in mcp
+    assert "Process()" in mcp
+
+
+def test_foreground_mcp_has_no_shell_or_service_mutation():
+    source = host_source()
+    mcp = source.split("func runForegroundMCP()", 1)[1].split("/// Refuse", 1)[0]
+    for forbidden in ("/bin/sh", "/bin/bash", "launchctl", "registerService", "unregisterService"):
+        assert forbidden not in mcp
+    assert "waitUntilExit" in mcp
+
+
+def test_foreground_mcp_is_bounded_and_sends_initialize_request():
+    source = host_source()
+    mcp = source.split("func runForegroundMCP()", 1)[1].split("/// Refuse", 1)[0]
+    assert "Date().addingTimeInterval(30)" in mcp
+    assert '\\"method\\":\\"initialize\\"' in mcp
+    assert "fileHandleForWriting.closeFile()" in mcp
+    assert "process.terminate()" in mcp
+    assert "readDataToEndOfFile" in mcp
+    assert '\\"tools/call\\"' in mcp
+    assert '\\"list_pages\\"' in mcp
+    assert 'Data((initializeBody + "\\n").utf8)' in mcp
+    assert 'Content-Length' not in mcp
+    assert "JSONSerialization" not in source
+    assert "responses" not in source
+    assert "verifyMCPArtifact" in mcp
+    assert "sha256" in source
+    assert "resolvingSymlinksInPath" in source

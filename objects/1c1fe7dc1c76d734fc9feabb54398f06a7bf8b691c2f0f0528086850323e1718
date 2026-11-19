@@ -1,0 +1,374 @@
+"""Offline regression tests for the Hermes Dashboard host bundle build.
+
+These tests never sign, install, register, or execute anything against the live system: they cover
+the plist contract (which is the part launchd and SMAppService actually read), the argv validation
+grammar, and the build report. The signing path is exercised separately by the build script at the
+Human gate because it needs the operator's identity in the keychain.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import plistlib
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+MODULE_PATH = Path(__file__).resolve().parents[2] / "macos" / "dashboard-host" / "build_host.py"
+SOURCE_DIR = MODULE_PATH.parent / "Sources" / "HermesDashboardHost"
+_spec = importlib.util.spec_from_file_location("build_host", MODULE_PATH)
+assert _spec and _spec.loader
+build_host = importlib.util.module_from_spec(_spec)
+sys.modules["build_host"] = build_host
+_spec.loader.exec_module(build_host)
+
+HOST_EXECUTABLE = "<HOME>/.hermes/cache/scratch/host-build-20261016/HermesDashboardHost.app/Contents/MacOS/hermes-dashboard-host"
+
+
+def make_configuration(**overrides) -> build_host.AgentConfiguration:
+    values = {
+        "child_executable": "<HOME>/.hermes/hermes-agent/venv/bin/hermes",
+        "child_arguments": ("dashboard", "--port", "9119", "--host", "127.0.0.1", "--no-open"),
+        "stdout_path": "<HOME>/.hermes/logs/dashboard.log",
+        "stderr_path": "<HOME>/.hermes/logs/dashboard.error.log",
+        "working_directory": "<HOME>",
+        "environment": {
+            "PATH": "/usr/bin:/bin",
+            "VIRTUAL_ENV": "<HOME>/.hermes/hermes-agent/venv",
+            "HERMES_HOME": "<HOME>/.hermes",
+        },
+    }
+    values.update(overrides)
+    return build_host.AgentConfiguration(**values)
+
+
+class TestAgentPlistContract:
+    """The plist is what launchd reads; every field here is load-bearing for TCC attribution."""
+
+    def parsed(self, configuration=None) -> dict:
+        return plistlib.loads(build_host.render_agent_plist(configuration or make_configuration()))
+
+    def test_uses_bundle_program_so_launchd_runs_the_signed_app(self):
+        document = self.parsed()
+        assert document["BundleProgram"] == "Contents/MacOS/hermes-dashboard-host"
+        # BundleProgram is app-bundle-relative and SMAppService-only; an absolute path would not
+        # survive the app being relocated and would bypass the bundle identity.
+        assert not document["BundleProgram"].startswith("/")
+
+    def test_label_is_stable_and_matches_the_dashboard_job(self):
+        assert self.parsed()["Label"] == build_host.AGENT_LABEL
+
+    def test_launchd_arguments_route_through_child_exec_mode(self):
+        document = self.parsed()
+        argv = document["BundleProgramArguments"]
+        assert argv[:2] == ["--child-exec", "--"]
+        assert argv[2] == "<HOME>/.hermes/hermes-agent/venv/bin/hermes"
+        assert argv[3:] == ["dashboard", "--port", "9119", "--host", "127.0.0.1", "--no-open"]
+
+    def test_preserves_dashboard_log_destinations(self):
+        document = self.parsed()
+        assert document["StandardOutPath"] == "<HOME>/.hermes/logs/dashboard.log"
+        assert document["StandardErrorPath"] == "<HOME>/.hermes/logs/dashboard.error.log"
+
+    def test_carries_environment_needed_by_the_dashboard(self):
+        environment = self.parsed()["EnvironmentVariables"]
+        assert environment["VIRTUAL_ENV"].endswith("hermes-agent/venv")
+        assert environment["HERMES_HOME"].endswith(".hermes")
+        assert environment["HERMES_SUPERVISED_CHILD"] == "1"
+
+    def test_keeps_restart_semantics_of_a_supervised_service(self):
+        document = self.parsed()
+        assert document["RunAtLoad"] is True
+        # SuccessfulExit=false parks a clean stop instead of respawning forever.
+        assert document["KeepAlive"] == {"SuccessfulExit": False}
+        assert document["ThrottleInterval"] == 30
+        assert document["ExitTimeOut"] == 60
+
+    def test_does_not_declare_conflicting_program_keys(self):
+        document = self.parsed()
+        # ProgramArguments/Program alongside BundleProgram would let launchd run an unbundled
+        # executable, which is exactly the identity the host exists to replace.
+        assert "Program" not in document
+        assert "ProgramArguments" not in document
+        assert "EnableGlobbing" not in document
+
+    def test_rejects_an_empty_child_command(self):
+        with pytest.raises(build_host.BundleBuildError):
+            build_host.render_agent_plist(make_configuration(child_executable=""))
+
+    def test_has_no_hardcoded_user_paths_in_the_template(self):
+        """A source plist with placeholders must never ship a real username."""
+        source = MODULE_PATH.parent / "Resources" / "ai.hermes.dashboard.host.plist"
+        text = source.read_text(encoding="utf-8")
+        assert "timmywen" not in text
+        assert "__HERMES_DASHBOARD_CHILD_EXECUTABLE__" in text
+
+
+class TestInfoPlist:
+    def test_declares_the_stable_bundle_identifier(self):
+        document = plistlib.loads(build_host.render_info_plist())
+        assert document["CFBundleIdentifier"] == "ai.hermes.dashboard.host"
+        assert document["CFBundleExecutable"] == "hermes-dashboard-host"
+
+    def test_is_a_background_agent_not_a_docked_app(self):
+        document = plistlib.loads(build_host.render_info_plist())
+        assert document["LSUIElement"] is True
+        assert document["CFBundlePackageType"] == "APPL"
+
+
+class TestBuildReport:
+    def test_reports_agent_plist_inside_the_bundle(self, tmp_path):
+        app = tmp_path / "HermesDashboardHost.app"
+        agent_plist = app / "Contents" / "Library" / "LaunchAgents" / build_host.AGENT_PLIST_NAME
+        agent_plist.parent.mkdir(parents=True)
+        agent_plist.write_bytes(build_host.render_agent_plist(make_configuration()))
+        assert plistlib.loads(agent_plist.read_bytes())["BundleProgramArguments"][2].endswith("hermes")
+
+    def test_build_module_never_calls_a_lifecycle_command(self):
+        """The build tool produces an artifact; lifecycle belongs to the activation scripts.
+
+        Mentions in prose are fine; what must not exist is an actual invocation. Each forbidden
+        name is checked against the parsed source rather than the raw text so a docstring cannot
+        satisfy or break the contract.
+        """
+
+        import ast
+
+        tree = ast.parse(MODULE_PATH.read_text(encoding="utf-8"))
+        called: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call):
+                called.add(ast.unparse(node.func))
+            elif isinstance(node, ast.Attribute):
+                called.add(ast.unparse(node))
+        forbidden = {"launchctl", "bootout", "bootstrap", "kickstart"}
+        offending = {name for name in called if any(part in forbidden for part in name.split("."))}
+        assert not offending, f"build tool must not invoke lifecycle commands: {offending}"
+
+
+class TestArgumentParsing:
+    def test_splits_env_pairs(self):
+        args = build_host._parse_args([
+            "--output", "/tmp/x.app",
+            "--child-executable", "/usr/bin/true",
+            "--stdout-path", "/tmp/o", "--stderr-path", "/tmp/e",
+            "--working-directory", "/tmp",
+            "--env", "A=1", "--env", "B=two",
+        ])
+        assert args.env == ["A=1", "B=two"]
+
+    def test_requires_absolute_child_executable(self, tmp_path, capsys):
+        with pytest.raises(build_host.BundleBuildError) as excinfo:
+            build_host.main([
+                "--output", str(tmp_path / "x.app"),
+                "--child-executable", "relative/hermes",
+                "--stdout-path", "/tmp/o", "--stderr-path", "/tmp/e",
+                "--working-directory", "/tmp",
+            ])
+        assert "absolute path" in str(excinfo.value)
+
+
+class TestBundleSignatureVerifiability:
+    """A validation build must be verifiable, not merely assemblable.
+
+    ``swiftc`` leaves a linker-signed ad-hoc signature on the executable. If the bundle itself
+    carries no outer signature, ``codesign --verify --deep --strict`` fails with "code has no
+    resources but signature indicates they must be present" — so the no-sign path must still ad-hoc
+    sign the bundle. Without this the offline build looks fine while being unverifiable.
+    """
+
+    def test_no_sign_build_verifies_strictly(self, tmp_path):
+        app = tmp_path / "validation.app"
+        report = build_host.build_bundle(
+            source_dir=SOURCE_DIR,
+            output_app=app,
+            agent=make_configuration(),
+            sign=False,
+        )
+        assert report["signed"] is False
+        assert report["authority"] == "ad-hoc"
+        verified = subprocess.run(
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)],
+            capture_output=True, text=True, check=False,
+        )
+        assert verified.returncode == 0, verified.stderr
+
+    def test_replaces_a_stale_bundle_at_the_output_path(self, tmp_path):
+        """A pre-existing bundle is removed, so a stale artifact cannot be mistaken for a new build."""
+
+        app = tmp_path / "reused.app"
+        app.mkdir()
+        (app / "STALE_MARKER").write_text("old")
+        build_host.build_bundle(
+            source_dir=SOURCE_DIR,
+            output_app=app,
+            agent=make_configuration(),
+            sign=False,
+        )
+        assert not (app / "STALE_MARKER").exists()
+
+    def test_sealed_resources_directory_is_non_empty(self, tmp_path):
+        """`--deep --strict` rejects a bundle whose sealed Resources/ directory is empty."""
+
+        app = tmp_path / "resources.app"
+        build_host.build_bundle(
+            source_dir=SOURCE_DIR,
+            output_app=app,
+            agent=make_configuration(),
+            sign=False,
+        )
+        resources = app / "Contents" / "Resources"
+        assert resources.is_dir()
+        assert any(resources.iterdir())
+
+    def test_failed_signing_leaves_no_partial_bundle(self, tmp_path):
+        """A failed build must not leave an installable-looking artifact at the output path."""
+
+        app = tmp_path / "broken.app"
+        with pytest.raises(build_host.BundleBuildError):
+            build_host.build_bundle(
+                source_dir=SOURCE_DIR,
+                output_app=app,
+                agent=make_configuration(),
+                identity="Definitely Not A Real Signing Identity",
+                sign=True,
+            )
+        assert not app.exists()
+
+
+class TestHostBinaryValidation:
+    """Drive the compiled host directly when a build artifact is present.
+
+    The validation grammar is security-relevant (it is what keeps the signed app from becoming a
+    general-purpose launcher), so it is worth an end-to-end check rather than a unit-only claim.
+    """
+
+    @pytest.fixture()
+    def host_executable(self) -> Path:
+        path = Path(HOST_EXECUTABLE)
+        if not path.exists():
+            pytest.skip("host bundle not built yet")
+        return path
+
+    def run_host(self, path: Path, *arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(path), *arguments], capture_output=True, text=True, check=False)
+
+    @pytest.mark.parametrize("child", ["/bin/echo", "/bin/sh", "/usr/bin/osascript", "/usr/bin/true"])
+    def test_refuses_non_hermes_child(self, host_executable, child):
+        result = self.run_host(host_executable, "--child-exec", "--", child, "dashboard")
+        assert result.returncode == 2
+        assert "refusing" in result.stderr
+
+    def test_refuses_relative_child(self, host_executable):
+        result = self.run_host(host_executable, "--child-exec", "--", "relative/hermes", "dashboard")
+        assert result.returncode == 2
+
+    def test_refuses_missing_separator(self, host_executable):
+        result = self.run_host(host_executable, "--child-exec")
+        assert result.returncode == 2
+        assert "missing child command" in result.stderr
+
+    def test_reports_status_without_registering(self, host_executable):
+        result = self.run_host(host_executable, "--status")
+        assert result.returncode == 0
+        assert "BUNDLE_ID=ai.hermes.dashboard.host" in result.stdout
+        assert "SERVICE_STATUS=" in result.stdout
+
+    def test_resolves_embedded_agent_plist(self, host_executable):
+        result = self.run_host(host_executable, "--show-agent")
+        assert result.returncode == 0
+        assert result.stdout.strip().endswith(build_host.AGENT_PLIST_NAME)
+        assert "Library/LaunchAgents" in result.stdout
+
+    # --- identity binding, not filename trust ------------------------------------------------
+    #
+    # A basename-only check ("is it called hermes?") would let any executable of that name run in
+    # this signed app's identity, which IS the app's entire value. These tests pin the stricter
+    # contract: the child must be a real Hermes install, not a look-alike.
+
+    def test_refuses_arbitrary_executable_named_hermes(self, host_executable, tmp_path):
+        attacker = tmp_path / "attacker" / "bin" / "hermes"
+        attacker.parent.mkdir(parents=True)
+        attacker.write_text("#!/bin/sh\necho ATTACKER_RAN\n")
+        attacker.chmod(0o755)
+        result = self.run_host(host_executable, "--child-exec", "--", str(attacker), "dashboard")
+        assert result.returncode == 2
+        assert "ATTACKER_RAN" not in result.stdout
+        assert "venv" in result.stderr
+
+    def test_refuses_hermes_entrypoint_without_install_beside_it(self, host_executable, tmp_path):
+        fake = tmp_path / "venv" / "bin" / "hermes"
+        fake.parent.mkdir(parents=True)
+        fake.write_text("#!/bin/sh\necho ATTACKER_RAN\n")
+        fake.chmod(0o755)
+        result = self.run_host(host_executable, "--child-exec", "--", str(fake), "dashboard")
+        assert result.returncode == 2
+        assert "hermes_cli/main.py" in result.stderr
+
+    def test_accepts_a_real_hermes_layout(self, host_executable, tmp_path):
+        root = tmp_path / "install"
+        entry = root / "venv" / "bin" / "hermes"
+        entry.parent.mkdir(parents=True)
+        (root / "hermes_cli").mkdir()
+        (root / "hermes_cli" / "main.py").write_text("")
+        entry.write_text("#!/bin/sh\necho STANDIN_EXECVED\n")
+        entry.chmod(0o755)
+        result = self.run_host(
+            host_executable, "--child-exec", "--", str(entry),
+            "dashboard", "--port", "9119", "--host", "127.0.0.1", "--no-open",
+        )
+        assert result.returncode == 0
+        assert "STANDIN_EXECVED" in result.stdout
+
+    # --- profile selector grammar -------------------------------------------------------------
+
+    @pytest.mark.parametrize("profile", ["\u00df", "\u1e9e", "\uFB03", "", " ", "-lead", "a" * 65])
+    def test_refuses_invalid_profile_selectors(self, host_executable, tmp_path, profile):
+        root = tmp_path / "install"
+        entry = root / "venv" / "bin" / "hermes"
+        entry.parent.mkdir(parents=True)
+        (root / "hermes_cli").mkdir()
+        (root / "hermes_cli" / "main.py").write_text("")
+        entry.write_text("#!/bin/sh\necho BYPASS\n")
+        entry.chmod(0o755)
+        result = self.run_host(
+            host_executable, "--child-exec", "--", str(entry), "--profile", profile, "dashboard"
+        )
+        assert result.returncode == 2, f"{profile!r} was accepted"
+        assert "BYPASS" not in result.stdout
+
+    def test_accepts_a_valid_profile_selector(self, host_executable, tmp_path):
+        root = tmp_path / "install"
+        entry = root / "venv" / "bin" / "hermes"
+        entry.parent.mkdir(parents=True)
+        (root / "hermes_cli").mkdir()
+        (root / "hermes_cli" / "main.py").write_text("")
+        entry.write_text("#!/bin/sh\necho STANDIN_EXECVED\n")
+        entry.chmod(0o755)
+        result = self.run_host(
+            host_executable, "--child-exec", "--", str(entry), "--profile", "work-2", "dashboard"
+        )
+        assert result.returncode == 0
+
+    # --- fixed-arity modes -------------------------------------------------------------------
+
+    @pytest.mark.parametrize("mode", ["--status", "--register", "--unregister", "--show-agent"])
+    def test_refuses_extra_arguments_on_fixed_arity_modes(self, host_executable, mode):
+        result = self.run_host(host_executable, mode, "unexpected")
+        assert result.returncode == 2
+        assert "unexpected extra arguments" in result.stderr
+
+    @pytest.mark.parametrize("flag", ["--stop", "--status", "--help"])
+    def test_refuses_lifecycle_flags(self, host_executable, tmp_path, flag):
+        root = tmp_path / "install"
+        entry = root / "venv" / "bin" / "hermes"
+        entry.parent.mkdir(parents=True)
+        (root / "hermes_cli").mkdir()
+        (root / "hermes_cli" / "main.py").write_text("")
+        entry.write_text("#!/bin/sh\necho BYPASS\n")
+        entry.chmod(0o755)
+        result = self.run_host(host_executable, "--child-exec", "--", str(entry), "dashboard", flag)
+        assert result.returncode == 2
+        assert "BYPASS" not in result.stdout

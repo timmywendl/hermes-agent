@@ -1,0 +1,256 @@
+{
+  "source_commit": "11ac50d56d0280f5ca50a40c25524a0563a12cbb",
+  "snapshot": "hermes-working-4163e56283d0",
+  "files": [
+    {
+      "path": "gateway/kanban_watchers_notifier.py",
+      "source_sha256": "756c7f618e1b818d45d4bc9ef2597fda8269fee182a03fad45a145692bf15e7c",
+      "archived_sha256": "756c7f618e1b818d45d4bc9ef2597fda8269fee182a03fad45a145692bf15e7c",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "gateway/semantic_control.py",
+      "source_sha256": "28fa83c55bf91689e6da0a7def3b3b2451e40d8e8da299a985fe8ff48da9ca6b",
+      "archived_sha256": "28fa83c55bf91689e6da0a7def3b3b2451e40d8e8da299a985fe8ff48da9ca6b",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/dashboard_tcc_repair.py",
+      "source_sha256": "8532d96f24fa0e460f86caed009ff6d08c3519bb64a7b8f0606c9263d16f2bb0",
+      "archived_sha256": "8532d96f24fa0e460f86caed009ff6d08c3519bb64a7b8f0606c9263d16f2bb0",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban.py",
+      "source_sha256": "e3a75d06461fa38f763488a5666be206b1094256f55d3d393a25d2ac07e172c2",
+      "archived_sha256": "e3a75d06461fa38f763488a5666be206b1094256f55d3d393a25d2ac07e172c2",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "source_sha256": "b4e7832b8e0982000d4e7bfd78c9a113ef8ac0393945675155261a06ae3e14b7",
+      "archived_sha256": "b4e7832b8e0982000d4e7bfd78c9a113ef8ac0393945675155261a06ae3e14b7",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_parser.py",
+      "source_sha256": "e7000829d5b073e4ebbfaa73df9e102d94e449e61147fb185e6f8126662312ec",
+      "archived_sha256": "e7000829d5b073e4ebbfaa73df9e102d94e449e61147fb185e6f8126662312ec",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_swarm.py",
+      "source_sha256": "cd265f779fc1c0dedac553d7454d753e4b0f075f69a6f39a43de80b1b15319fa",
+      "archived_sha256": "cd265f779fc1c0dedac553d7454d753e4b0f075f69a6f39a43de80b1b15319fa",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/main.py",
+      "source_sha256": "670ddb127e15e2a34d6355f20aa07d6267f126d20bf5e2465f20c9035914b1b7",
+      "archived_sha256": "2b90115616bffc5fd7bef621b2ca710f0cdb53f86323b72ead796717eb7cb16e",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "hermes_cli/pty_session.py",
+      "source_sha256": "9478deafba1efe8bd4d0f17983e18c5d606c0f21c4686fecf734b32b1777edbf",
+      "archived_sha256": "9478deafba1efe8bd4d0f17983e18c5d606c0f21c4686fecf734b32b1777edbf",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/subcommands/dashboard.py",
+      "source_sha256": "29530437d8b15c658dbd069869c1a0fc7a4a61167967e4da389c669579187c13",
+      "archived_sha256": "29530437d8b15c658dbd069869c1a0fc7a4a61167967e4da389c669579187c13",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/web_routers/chat_ws.py",
+      "source_sha256": "0689022feb7845249cb360006ed94d25f6ad67c962668575c754efb04e7ec1fa",
+      "archived_sha256": "0689022feb7845249cb360006ed94d25f6ad67c962668575c754efb04e7ec1fa",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "reviewtree/macos/dashboard-host/Package.swift",
+      "source_sha256": "beae269d498440390b0ef3a090ac57822787805cdc201589f8f86dedf179ed2f",
+      "archived_sha256": "beae269d498440390b0ef3a090ac57822787805cdc201589f8f86dedf179ed2f",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "reviewtree/macos/dashboard-host/README.md",
+      "source_sha256": "366ba19b011991952bf00a9350be2e5bf511d88e1d7744911dbf38b6db1497ff",
+      "archived_sha256": "6de9593c9695185ec28c9f83c7602d946944d161b91fd4889f9cfa4513d4e25d",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "reviewtree/macos/dashboard-host/Resources/ai.hermes.dashboard.host.plist",
+      "source_sha256": "275b89bbb5e520d8f8855d67006061e743129429afd2e23d364af2c3f9111da2",
+      "archived_sha256": "275b89bbb5e520d8f8855d67006061e743129429afd2e23d364af2c3f9111da2",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "reviewtree/macos/dashboard-host/Sources/HermesDashboardHost/main.swift",
+      "source_sha256": "7d9d73d14c2746cd595c0bbc454d8f417d1f2461ab81ab9e9be03142b60ce15e",
+      "archived_sha256": "0c2c5402ff16defde4b5e6a4e66488d26d18cf3e7abdf916a462f93eda83c478",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "reviewtree/macos/dashboard-host/build_host.py",
+      "source_sha256": "226acee7a828a76329f50f30da29ea15117185fd6a8929f627d490b5432b3a36",
+      "archived_sha256": "10988f04bc40549e580b07c2f0959aa02a626f5b119e70dd5b2f8bbabf5caf9f",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "reviewtree/tests/macos/test_dashboard_host_bundle.py",
+      "source_sha256": "280009b909d7d6c5ef556b85cb0b762239a3e65149a078ff3b6950eb78b962f4",
+      "archived_sha256": "7878bfbe33705677bc072e255c1c7c161c9b61dc3722f17db0af125dfd28159e",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "reviewtree/tests/macos/test_foreground_probe.py",
+      "source_sha256": "4021b284cda8b1ccd14540fc9c76f7aecc3727b4fbede23d585779b5268c39ac",
+      "archived_sha256": "c2387d87c212af17e61961b45fd17fe7e3a063c87278f2f96399d33dc6420dee",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "tests/gateway/test_kanban_notifier.py",
+      "source_sha256": "cd4920232fffb30724f383370b8d38844e7b4287a13d7d27d322aaea8c48d6fc",
+      "archived_sha256": "f350a3278691de467ced7590f95e4e499a1d1620f4247039781a87258c828c77",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "tests/gateway/test_kanban_notifier_apiserver_wake.py",
+      "source_sha256": "4ddd096262cca059b157b4dbaa3528bb1fa323f7b6dcf88127f680d27a4d07dd",
+      "archived_sha256": "4ddd096262cca059b157b4dbaa3528bb1fa323f7b6dcf88127f680d27a4d07dd",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/gateway/test_kanban_notifier_served_apiserver_wake.py",
+      "source_sha256": "cfbbaf96cb3589cc98c016ebd1dc66da4fbca3a4c881e37501459e9fb74d4671",
+      "archived_sha256": "cfbbaf96cb3589cc98c016ebd1dc66da4fbca3a4c881e37501459e9fb74d4671",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/gateway/test_semantic_control_router.py",
+      "source_sha256": "46f412513ea0188a80f4faba5be53b113788dc7c750f7d9d6a686f9eda903ee8",
+      "archived_sha256": "09b4225d46bf7b09c16c3c4853af1d1ca88b31028e45aec1808fb0e7abc3379b",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_cli/test_completion_handoff_contract_v1.py",
+      "source_sha256": "006988fdedcf3817a8c6b480b1b70e3692bf2fe13d6ddd4c57341e6f2bcd4776",
+      "archived_sha256": "70762ad721d8442bc7330776f3d78cfb8bbbb0af64365a81ee5c3aa9acfeab42",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true,
+      "credential_like_literal_redaction": true
+    },
+    {
+      "path": "tests/hermes_cli/test_dashboard_tcc_repair.py",
+      "source_sha256": "66a6e4178ac58cb3eb51802ab14c554ae6d7352382f5b7ed25ea0c912a43ed93",
+      "archived_sha256": "33037d15c45c14e89a42020f9ef7c761ac4565f6f2b15179c19ff8cf30f95f63",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_create_origin_bridge.py",
+      "source_sha256": "6d3d369cc3d030a4baaaf3d38ebadca5bca3dc55e75a41d9c9c8cc91a36f29e3",
+      "archived_sha256": "6d3d369cc3d030a4baaaf3d38ebadca5bca3dc55e75a41d9c9c8cc91a36f29e3",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_create_origin_subscription.py",
+      "source_sha256": "a51fe37c392f3e1c38384af9cf13346f75a9e2238cf380d148d8aba8f229587a",
+      "archived_sha256": "a51fe37c392f3e1c38384af9cf13346f75a9e2238cf380d148d8aba8f229587a",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_pty_session.py",
+      "source_sha256": "f444b4ff73d649c5471c1de013c000f03227ed7dac4aac74b6695dedc1e6d927",
+      "archived_sha256": "f444b4ff73d649c5471c1de013c000f03227ed7dac4aac74b6695dedc1e6d927",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_web_server_pty_reconnect.py",
+      "source_sha256": "7d69db27b85bafb70347aef5331e1394e87c671785069f714e3f9c60888f2d06",
+      "archived_sha256": "7d69db27b85bafb70347aef5331e1394e87c671785069f714e3f9c60888f2d06",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tests/tui_gateway/test_auto_continue.py",
+      "source_sha256": "b1929571b56ffc4c69051ecb9071add18b33c8814c00cde6f117cb3a41d33b62",
+      "archived_sha256": "b1929571b56ffc4c69051ecb9071add18b33c8814c00cde6f117cb3a41d33b62",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tools/kanban_tools_schemas.py",
+      "source_sha256": "97ef11f3303fc5039fb19d3659633ac62e8e71a9b50549d2fd8af4dc978757b2",
+      "archived_sha256": "97ef11f3303fc5039fb19d3659633ac62e8e71a9b50549d2fd8af4dc978757b2",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    },
+    {
+      "path": "tui_gateway/turn_marker.py",
+      "source_sha256": "a6c4396af54a603903a4bebf2aa19249e577bf7a73aa6df39b6e45e5b5c84858",
+      "archived_sha256": "a6c4396af54a603903a4bebf2aa19249e577bf7a73aa6df39b6e45e5b5c84858",
+      "mode": "100644",
+      "origin": "working_file",
+      "redacted": false
+    }
+  ],
+  "scope": "Sanitized uncommitted engineering source; excludes raw memory, credentials, conversations, DBs, environment config, runtime data and binaries."
+}

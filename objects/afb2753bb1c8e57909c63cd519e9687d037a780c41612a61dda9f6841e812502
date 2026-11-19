@@ -1,0 +1,334 @@
+"""Build the code-signed Hermes Dashboard host app bundle.
+
+Why a host app exists at all (macOS 27, Apple issue 184660124): a process with no bundle identifier
+cannot hold a Files & Folders grant for another developer's App Data container.  The Dashboard's MCP
+`node` process could not read Chrome's `DevToolsActivePort` because its TCC responsible host was
+uv's `python3.11`, and then `/usr/bin/osascript` — both bundle-less, both unable to persist the
+Google Chrome toggle.
+
+This module assembles a minimal `.app` whose only job is to own that identity:
+
+    HermesDashboardHost.app/Contents/
+        Info.plist                              stable CFBundleIdentifier + LSUIElement
+        MacOS/hermes-dashboard-host             signed executable (execs the Dashboard)
+        Library/LaunchAgents/<label>.plist      SMAppService-embedded LaunchAgent
+        Resources/...                           license/provenance copies
+
+The build is deliberately dependency-free (stdlib + `/usr/bin/codesign` + `swiftc`) and never
+installs, registers or restarts anything: it produces a bundle in a target directory and reports
+what it wrote, so the caller decides when the signed artifact touches the live system.
+"""
+
+from __future__ import annotations
+
+import argparse
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+BUNDLE_IDENTIFIER = "ai.hermes.dashboard.host"
+BUNDLE_NAME = "Hermes Dashboard Host"
+EXECUTABLE_NAME = "hermes-dashboard-host"
+DEFAULT_APP_NAME = "HermesDashboardHost.app"
+AGENT_LABEL = "ai.hermes.dashboard"
+AGENT_PLIST_NAME = "ai.hermes.dashboard.host.plist"
+BUNDLE_VERSION = "1.0.0"
+BUNDLE_BUILD = "1"
+MINIMUM_SYSTEM_VERSION = "13.0"
+DEFAULT_SIGN_IDENTITY = "Apple Development: <REDACTED_EMAIL> (55H59PZG2Z)"
+
+
+class BundleBuildError(RuntimeError):
+    """The host bundle could not be assembled."""
+
+
+@dataclass(frozen=True)
+class AgentConfiguration:
+    """The Dashboard command the embedded LaunchAgent runs, via the signed host."""
+
+    child_executable: str
+    child_arguments: tuple[str, ...]
+    stdout_path: str
+    stderr_path: str
+    working_directory: str
+    environment: dict[str, str]
+
+    def child_argv(self) -> list[str]:
+        return [self.child_executable, *self.child_arguments]
+
+
+def _require_absolute(path: str, what: str) -> str:
+    if not path or not path.startswith("/"):
+        raise BundleBuildError(f"{what} must be an absolute path: {path!r}")
+    return path
+
+
+def render_agent_plist(configuration: AgentConfiguration) -> bytes:
+    """Render the SMAppService LaunchAgent plist for the host app.
+
+    ``BundleProgram`` (app-relative, SMAppService-only) plus ``BundleProgramArguments`` is what
+    makes the signed app the executable launchd spawns; the argv carries the host's ``--child-exec``
+    mode and the Dashboard command after a ``--`` separator, so the host can validate it before it
+    execs.
+    """
+
+    child = configuration.child_argv()
+    if not child or not child[0]:
+        raise BundleBuildError("agent configuration has an empty child command")
+    environment = dict(configuration.environment)
+    # Marks the Dashboard as supervised for the same reason the osascript-era definition did: the
+    # process must know a supervisor owns its lifecycle so it does not install its own.
+    environment.setdefault("HERMES_SUPERVISED_CHILD", "1")
+    program_arguments = ["--child-exec", "--", *child]
+    document = {
+        "Label": AGENT_LABEL,
+        "BundleProgram": f"Contents/MacOS/{EXECUTABLE_NAME}",
+        "BundleProgramArguments": program_arguments,
+        "RunAtLoad": True,
+        "KeepAlive": {"SuccessfulExit": False},
+        "ProcessType": "Interactive",
+        "ThrottleInterval": 30,
+        "ExitTimeOut": 60,
+        "WorkingDirectory": configuration.working_directory,
+        "EnvironmentVariables": environment,
+        "StandardOutPath": configuration.stdout_path,
+        "StandardErrorPath": configuration.stderr_path,
+    }
+    return plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+
+def render_info_plist(*, bundle_id: str = BUNDLE_IDENTIFIER) -> bytes:
+    """Render the host's ``Info.plist``.
+
+    ``LSUIElement`` keeps the host out of the Dock and app switcher: it is a background launch
+    identity, not a new user-facing product surface.
+    """
+
+    document = {
+        "CFBundleIdentifier": bundle_id,
+        "CFBundleName": BUNDLE_NAME,
+        "CFBundleDisplayName": BUNDLE_NAME,
+        "CFBundleExecutable": EXECUTABLE_NAME,
+        "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": BUNDLE_VERSION,
+        "CFBundleVersion": BUNDLE_BUILD,
+        "LSMinimumSystemVersion": MINIMUM_SYSTEM_VERSION,
+        "LSUIElement": True,
+        "NSHumanReadableCopyright": "Hermes Agent",
+    }
+    return plistlib.dumps(document, fmt=plistlib.FMT_XML, sort_keys=False)
+
+
+def _run(command: list[str], *, what: str, merge_stderr: bool = False) -> str:
+    """Run a command and return its stdout.
+
+    ``merge_stderr=True`` is required for tools that report on stderr — `codesign -dv` prints its
+    entire diagnostic (including `Authority=`, which the caller must parse) to stderr, so capturing
+    stdout alone silently yields an empty string and the authority check fails on a valid signature.
+    """
+
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, check=False)
+    except OSError as exc:  # pragma: no cover - exercised only on a broken toolchain
+        raise BundleBuildError(f"{what} could not run ({command[0]}): {exc}") from exc
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise BundleBuildError(f"{what} failed (exit {completed.returncode}): {detail}")
+    if merge_stderr:
+        return completed.stdout + completed.stderr
+    return completed.stdout
+
+
+def compile_host(source_dir: Path, output: Path) -> None:
+    """Compile the Swift host into ``output`` with the macOS SDK."""
+
+    sdk = _run(["/usr/bin/xcrun", "--show-sdk-path"], what="xcrun --show-sdk-path").strip()
+    if not sdk:
+        raise BundleBuildError("xcrun returned an empty SDK path")
+    sources = sorted(str(path) for path in source_dir.glob("*.swift"))
+    if not sources:
+        raise BundleBuildError(f"no Swift sources found in {source_dir}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    _run(
+        [
+            "/usr/bin/xcrun", "swiftc",
+            "-O",
+            "-target", f"arm64-apple-macosx{MINIMUM_SYSTEM_VERSION}",
+            "-sdk", sdk,
+            "-framework", "ServiceManagement",
+            "-framework", "Foundation",
+            "-o", str(output),
+            *sources,
+        ],
+        what="swiftc",
+    )
+    output.chmod(0o755)
+
+
+def sign_bundle(app: Path, identity: str = "", *, ad_hoc: bool = False) -> str:
+    """Code-sign the bundle and return the signing authority that was actually applied.
+
+    The signature is verified immediately afterwards, because "codesign exited 0" and "the bundle
+    carries the expected stable identity" are different facts — the second is the one the TCC
+    attribution depends on.
+
+    `ad_hoc=True` applies `--sign -`. A validation build still needs an OUTER signature: `swiftc`
+    leaves a linker-signed ad-hoc signature on the executable, and `codesign --verify --deep` then
+    reports "code has no resources but signature indicates they must be present" because that nested
+    signature seals a bundle whose own signature is absent. Ad-hoc signing the bundle once resolves
+    it, so validation builds verify strictly without burning a real signing identity.
+    """
+
+    sign_with = "-" if ad_hoc else identity
+    _run(["/usr/bin/codesign", "--force", "--deep", "--options", "runtime",
+          "--sign", sign_with, str(app)], what="codesign")
+    # `codesign -dv` reports on stderr, so the diagnostic must be read with merge_stderr=True.
+    info = _run(["/usr/bin/codesign", "-dv", "--verbose=4", str(app)],
+                what="codesign -dv", merge_stderr=True)
+    _run(["/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)], what="codesign --verify")
+    if ad_hoc:
+        return "ad-hoc"
+    for line in info.splitlines():
+        if line.startswith("Authority="):
+            return line.split("=", 1)[1].strip()
+    raise BundleBuildError("signed bundle reports no signing Authority")
+
+
+def build_bundle(
+    *,
+    source_dir: Path,
+    output_app: Path,
+    agent: AgentConfiguration,
+    identity: str = DEFAULT_SIGN_IDENTITY,
+    sign: bool = True,
+) -> dict[str, object]:
+    """Assemble (and optionally sign) the host app bundle. Returns a non-secret build report."""
+
+    if output_app.exists():
+        shutil.rmtree(output_app)
+    contents = output_app / "Contents"
+    macos_dir = contents / "MacOS"
+    launch_agents = contents / "Library" / "LaunchAgents"
+    resources = contents / "Resources"
+    for directory in (macos_dir, launch_agents, resources):
+        directory.mkdir(parents=True, exist_ok=True)
+
+    # `codesign --verify --deep --strict` fails an app whose CodeResources seals an EMPTY Resources
+    # directory ("code has no resources but signature indicates they must be present"), so the
+    # directory must either carry a file or not be sealed. A provenance note keeps it non-empty and
+    # documents what the bundle is.
+    provenance = resources / "PROVENANCE.txt"
+    provenance.write_text(
+        "\n".join([
+            f"bundle_id: {BUNDLE_IDENTIFIER}",
+            f"executable: Contents/MacOS/{EXECUTABLE_NAME}",
+            "purpose: stable, code-signed TCC responsible identity for the Hermes Dashboard",
+            "built_by: macos/dashboard-host/build_host.py",
+            "",
+        ]),
+        encoding="utf-8",
+    )
+
+    executable = macos_dir / EXECUTABLE_NAME
+    compile_host(source_dir, executable)
+
+    info_plist = contents / "Info.plist"
+    info_plist.write_bytes(render_info_plist())
+    agent_path = launch_agents / AGENT_PLIST_NAME
+    agent_path.write_bytes(render_agent_plist(agent))
+
+    authority: str | None = None
+    try:
+        if sign:
+            authority = sign_bundle(output_app, identity)
+        else:
+            # Still sign ad-hoc: an unsigned bundle is not verifiable at all, and swiftc's
+            # linker-signed executable makes `codesign --verify --deep --strict` fail on a bundle
+            # with no outer signature. Validation builds must be verifiable, just not under a real
+            # identity.
+            authority = sign_bundle(output_app, ad_hoc=True)
+    except BundleBuildError:
+        # A half-built bundle left at the output path is dangerous: it looks installable, carries no
+        # valid signature, and the next run would have to notice and delete it. Remove it here so a
+        # failed build cannot leave an artifact that appears usable.
+        shutil.rmtree(output_app, ignore_errors=True)
+        raise
+
+    return {
+        "app": str(output_app),
+        "executable": str(executable),
+        "info_plist": str(info_plist),
+        "agent_plist": str(agent_path),
+        "bundle_id": BUNDLE_IDENTIFIER,
+        "signed": sign,
+        "authority": authority,
+        "child_argv": agent.child_argv(),
+    }
+
+
+def default_source_dir() -> Path:
+    """Swift sources live beside this script in ``Sources/HermesDashboardHost``."""
+
+    return Path(__file__).resolve().parent / "Sources" / "HermesDashboardHost"
+
+
+def _parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build the signed Hermes Dashboard host app bundle.")
+    parser.add_argument("--output", required=True, help="destination .app path")
+    parser.add_argument("--source-dir", default=None, help="Swift source directory")
+    parser.add_argument("--identity", default=DEFAULT_SIGN_IDENTITY, help="codesign identity")
+    parser.add_argument("--no-sign", action="store_true", help="assemble without signing (offline only)")
+    parser.add_argument("--child-executable", required=True, help="absolute path to the Dashboard entrypoint")
+    parser.add_argument("--child-arg", action="append", default=[], help="Dashboard argument (repeatable)")
+    parser.add_argument("--stdout-path", required=True)
+    parser.add_argument("--stderr-path", required=True)
+    parser.add_argument("--working-directory", required=True)
+    parser.add_argument("--env", action="append", default=[], metavar="KEY=VALUE")
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(list(sys.argv[1:] if argv is None else argv))
+    environment: dict[str, str] = {}
+    for item in args.env:
+        key, separator, value = item.partition("=")
+        if not separator or not key:
+            raise SystemExit(f"ERROR: --env expects KEY=VALUE, got {item!r}")
+        environment[key] = value
+    configuration = AgentConfiguration(
+        child_executable=_require_absolute(args.child_executable, "child executable"),
+        child_arguments=tuple(args.child_arg),
+        stdout_path=_require_absolute(args.stdout_path, "stdout path"),
+        stderr_path=_require_absolute(args.stderr_path, "stderr path"),
+        working_directory=_require_absolute(args.working_directory, "working directory"),
+        environment=environment,
+    )
+    source_dir = Path(args.source_dir) if args.source_dir else default_source_dir()
+    try:
+        report = build_bundle(
+            source_dir=source_dir,
+            output_app=Path(args.output),
+            agent=configuration,
+            identity=args.identity,
+            sign=not args.no_sign,
+        )
+    except BundleBuildError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+    print(f"APP={report['app']}")
+    print(f"BUNDLE_ID={report['bundle_id']}")
+    print(f"EXECUTABLE={report['executable']}")
+    print(f"AGENT_PLIST={report['agent_plist']}")
+    print(f"SIGNED={'YES' if report['signed'] else 'NO'}")
+    if report["authority"]:
+        print(f"AUTHORITY={report['authority']}")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

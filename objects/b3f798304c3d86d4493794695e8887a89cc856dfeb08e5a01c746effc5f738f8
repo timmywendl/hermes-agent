@@ -1,0 +1,599 @@
+"""Issue #92: completed-event serialization must preserve the completion contract.
+
+Root cause (real Telegram task t_220017aa, run 17):
+
+``task_runs.summary`` held a correct 7-line ``KEY=value`` completion contract, but
+``_completed_event_payload`` stored it through ``_first_line(event_summary, 400)``.
+That is a *first-line-only* projection, so the event payload kept only ``SUMMARY=``
+and dropped ``NEXT_STEP``. The notifier requires BOTH an outcome field and a
+next-step field, so projection returned ``[]`` and Telegram showed
+``RESULT_UNAVAILABLE`` even though the agent (which reads ``task_runs.summary``
+directly) could render the full result.
+
+These tests pin the event-serialization contract: line structure survives, the
+required fields survive, the payload stays bounded, and the result still projects
+through the REAL notifier projector.
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from gateway.kanban_watchers_notifier import _completed_summary_lines
+
+# The verbatim run-17 summary that failed in production (t_220017aa run 17).
+REAL_RUN_SUMMARY = (
+    "SUMMARY=Read-only offline verification passed in the exact worktree; "
+    "required starting head held unchanged, worktree stayed clean, "
+    "documentation and the single safety regression test both present and the "
+    "targeted test run passed with zero network or device activity.\n"
+    "NEXT_STEP=done\n"
+    "KANBAN_STATUS=PASS\n"
+    "PYTEST_STATUS=PASSED\n"
+    "REVIEW_RESULT=CLEAN\n"
+    "COMMIT=5cb85df\n"
+    "BLOCKERS=none"
+)
+
+# A summary that DOES satisfy the consumer allowlist end to end.
+PROJECTABLE_SUMMARY = (
+    "SUMMARY=local tests passed\n"
+    "NEXT_STEP=done\n"
+    "KANBAN_STATUS=PASS\n"
+    "PYTEST_STATUS=PASSED\n"
+    "REVIEW_RESULT=CLEAN"
+)
+
+
+def _open(tmp_path):
+    return kb.connect(tmp_path / "board.db")
+
+
+def _create_and_complete(conn, *, summary: str, result=None):
+    task_id = kb.create_task(conn, title="contract", body="b", created_by="tester")
+    assert kb.claim_task(conn, task_id, claimer="tester") is not None
+    run_row = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    run_id = run_row["current_run_id"]
+    assert run_id is not None, "run was not created by claim_task"
+    ok = kb.complete_task(
+        conn, task_id, summary=summary, result=result, expected_run_id=run_id,
+    )
+    assert ok is True
+    return task_id
+
+
+def _completed_event_summary(conn, task_id):
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'completed'"
+        " ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert row is not None, "no completed event was written"
+    payload = json.loads(row["payload"])
+    return payload, payload.get("summary")
+
+
+# --------------------------------------------------------------------------
+# A. real run summary -> event serialization -> notifier projection
+# --------------------------------------------------------------------------
+
+
+def test_real_run_summary_survives_event_serialization(tmp_path):
+    """Run-17's unsafe prose is withheld without emitting an empty required field.
+
+    The original bug kept the unusable first-line SUMMARY and dropped NEXT_STEP.
+    The fixed serializer fails closed for this non-contract-compliant value:
+    it emits no partial contract that would deterministically render as
+    RESULT_UNAVAILABLE. The contract-compliant path is covered below.
+    """
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=REAL_RUN_SUMMARY)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    assert event_summary is None
+    assert _completed_summary_lines(event_summary) == []
+
+
+def test_event_summary_round_trips_through_real_notifier(tmp_path):
+    """A projectable contract must still project after the event round-trip."""
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=PROJECTABLE_SUMMARY)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    assert event_summary is not None
+    lines = _completed_summary_lines(event_summary)
+    assert lines, "projectable contract produced empty projection after round-trip"
+    assert any("NEXT_STEP" in ln or "done" in ln for ln in lines)
+
+
+def test_real_run_summary_reaches_notifier_projection_contract(tmp_path):
+    """An unsafe production summary is withheld, not partially projected."""
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=REAL_RUN_SUMMARY)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    assert event_summary is None
+    assert _completed_summary_lines(event_summary) == []
+
+
+# --------------------------------------------------------------------------
+# B. long summary truncation must not drop SUMMARY / NEXT_STEP
+# --------------------------------------------------------------------------
+
+
+def test_long_contract_keeps_required_fields_when_bounded(tmp_path):
+    """Bounded payload must still carry SUMMARY and NEXT_STEP."""
+    long_contract = (
+        "SUMMARY=" + ("local tests passed " * 200) + "\n"
+        "NEXT_STEP=done\n"
+        "KANBAN_STATUS=PASS"
+    )
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=long_contract)
+    payload, event_summary = _completed_event_summary(conn, task_id)
+
+    assert event_summary is not None
+    keys = {
+        line.split("=", 1)[0].strip().upper()
+        for line in event_summary.splitlines()
+        if "=" in line
+    }
+    assert "SUMMARY" in keys
+    assert "NEXT_STEP" in keys
+
+
+def test_event_payload_stays_bounded(tmp_path):
+    """Bounded, but generous enough for a full contract."""
+    huge = "SUMMARY=" + ("x" * 20000) + "\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=huge)
+    payload, event_summary = _completed_event_summary(conn, task_id)
+    encoded = json.dumps(payload)
+    assert len(encoded) < 8000, f"event payload unbounded: {len(encoded)} bytes"
+
+
+def test_truncation_preserves_field_order_and_next_step_after_long_summary(tmp_path):
+    """A long SUMMARY must not push NEXT_STEP out of the payload entirely."""
+    long_contract = (
+        "SUMMARY=" + ("local tests passed " * 60) + "\n"
+        "NEXT_STEP=done\n"
+        "KANBAN_STATUS=PASS\n"
+        "PYTEST_STATUS=PASSED"
+    )
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=long_contract)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    parsed = {
+        line.split("=", 1)[0].strip().upper(): line.split("=", 1)[1].strip()
+        for line in (event_summary or "").splitlines()
+        if "=" in line
+    }
+    assert parsed.get("NEXT_STEP"), "long SUMMARY evicted NEXT_STEP"
+    assert parsed.get("KANBAN_STATUS") == "PASS"
+
+
+# --------------------------------------------------------------------------
+# C. free prose must not bypass the allowlist
+# --------------------------------------------------------------------------
+
+
+def test_free_prose_still_fails_closed(tmp_path):
+    """Prose that the allowlist rejects must NOT project, even via the event."""
+    prose = (
+        "SUMMARY=I refactored the authentication middleware and wired the new\n"
+        "NEXT_STEP=done\n"
+        "KANBAN_STATUS=PASS"
+    )
+    # Sanity: the unsafe value is still refused by the real projector.
+    assert _completed_summary_lines(prose) == []
+
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=prose)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    assert _completed_summary_lines(event_summary) == [], (
+        "non-allowlisted prose projected — allowlist was widened"
+    )
+
+
+def test_real_run_summary_value_is_not_silently_allowlisted(tmp_path):
+    """The production SUMMARY value is not allowlist-clean; pin that reality.
+
+    This documents WHY the contract text must instruct short allowlisted values:
+    serializer fixes alone cannot make this value project.
+    """
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=REAL_RUN_SUMMARY)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    # Shape is now correct (NEXT_STEP survives) but the long prose VALUE is still
+    # refused by design — fail-closed, never a widened allowlist.
+    assert _completed_summary_lines(event_summary) == []
+
+
+# --------------------------------------------------------------------------
+# D. sensitive content still fails closed
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    [
+        "SUMMARY=see <HOME>/Documents/secret/file.txt\nNEXT_STEP=done",
+        "SUMMARY=token ghp_" + "a" * 36 + "\nNEXT_STEP=done",
+        "SUMMARY=password hunter2 accepted\nNEXT_STEP=done",
+        "SUMMARY=Authorization: Bearer abcdefghijklmnop\nNEXT_STEP=done",
+    ],
+)
+def test_hostile_summary_fails_closed_through_event(tmp_path, hostile):
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=hostile)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    assert _completed_summary_lines(event_summary) == [], (
+        f"sensitive content projected: {hostile!r}"
+    )
+
+
+def test_local_path_never_appears_in_event_payload(tmp_path):
+    hostile = "SUMMARY=read <HOME>/.ssh/id_rsa now\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=hostile)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    lines = _completed_summary_lines(event_summary)
+    assert lines == []
+    assert all("/Users/" not in ln for ln in lines)
+
+
+# --------------------------------------------------------------------------
+# E. event payload <-> task_runs.summary consistency
+# --------------------------------------------------------------------------
+
+
+def test_event_summary_matches_run_summary_fields(tmp_path):
+    """The event must carry every *usable* field from the run summary.
+
+    A field whose value the consumer would reject at every budget is dropped
+    deliberately (an honest payload), but nothing consumer-valid may be lost —
+    and the required outcome/next-step pair must survive.
+    """
+    from gateway.kanban_watchers_notifier import (
+        _COMPLETION_TEXT_FIELDS,
+        _safe_completion_value,
+    )
+
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=REAL_RUN_SUMMARY)
+
+    run = conn.execute(
+        "SELECT summary FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    assert run is not None and run["summary"] == REAL_RUN_SUMMARY
+
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    run_fields = {
+        line.split("=", 1)[0].strip().upper()
+        for line in run["summary"].splitlines()
+        if "=" in line
+    }
+    event_fields = {
+        line.split("=", 1)[0].strip().upper()
+        for line in (event_summary or "").splitlines()
+        if "=" in line
+    }
+    # Every emitted text value must be acceptable to the consumer.
+    for line in (event_summary or "").splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip().upper() in _COMPLETION_TEXT_FIELDS and value:
+            assert _safe_completion_value(value) is not None, (
+                f"event carries a text value the consumer rejects: {key}"
+            )
+    # This run's SUMMARY value is unusable at every safe budget, so the
+    # serializer must withhold the whole partial contract rather than emit an
+    # empty required field or a deterministic RESULT_UNAVAILABLE payload.
+    assert event_summary is None
+    assert not event_fields
+
+
+def test_swarm_completion_event_preserves_contract(tmp_path):
+    """The swarm root path serializes separately — same requirement.
+
+    Reviewer finding on the first revision: the previous version of this test
+    called ``complete_task``, so it never exercised ``_activate_root_inline``
+    (the swarm root's own event write). This drives that REAL function.
+
+    The summary is deliberately longer than the old ``summary[:400]`` slice so
+    the test discriminates: it fails if the swarm path truncates by characters
+    instead of preserving field structure.
+    """
+    from hermes_cli import kanban_swarm as ks
+
+    contract = (
+        "SUMMARY=" + ("local tests passed " * 30) + "\nNEXT_STEP=done\n"
+        "KANBAN_STATUS=PASS\nPYTEST_STATUS=PASSED\nREVIEW_RESULT=CLEAN"
+    )
+    conn = _open(tmp_path)
+    created = ks.create_swarm(
+        conn,
+        goal="swarm goal",
+        workers=[ks.SwarmWorkerSpec(profile="researcher-a", title="Scan", body="b")],
+        verifier_assignee="reviewer",
+        synthesizer_assignee="writer",
+        created_by="orchestrator",
+    )
+    # The root is built blocked; the activator flips it to done and writes the
+    # completed event through the swarm path.
+    conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (created.root_id,))
+    ok = ks._activate_root_inline(conn, created.root_id, summary=contract, metadata={})
+    assert ok is True, "swarm root activation did not run"
+
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='completed'"
+        " ORDER BY id DESC LIMIT 1",
+        (created.root_id,),
+    ).fetchone()
+    assert row is not None, "swarm root completion event missing"
+    event_summary = json.loads(row["payload"]).get("summary")
+    assert event_summary is not None, "swarm path dropped the summary"
+    keys = {
+        line.split("=", 1)[0].strip().upper()
+        for line in event_summary.splitlines()
+        if "=" in line
+    }
+    assert "NEXT_STEP" in keys, "swarm path dropped the required NEXT_STEP field"
+    assert "SUMMARY" in keys
+    assert _completed_summary_lines(event_summary) != [], (
+        "swarm root completion does not project"
+    )
+
+
+# --------------------------------------------------------------------------
+# F. adversarial bounds discovered in independent review of f3d5300
+# --------------------------------------------------------------------------
+
+
+def test_required_pair_survives_when_many_optional_fields_precede_it(tmp_path):
+    """The required pair must be kept BEFORE any field-count cap is applied.
+
+    Reviewer finding: the unconditional 8-field slice ran first, so a contract
+    with 8 leading optional fields dropped both SUMMARY and NEXT_STEP.
+    """
+    summary = "\n".join([
+        "PROJECT_ID=proj",
+        "REPOSITORY=owner/repo",
+        "RELATED_TASK_ID=t_12345678",
+        "COMMIT=abcdef1",
+        "OUTCOME=passed",
+        "RESULT=passed",
+        "CHECKS=passed",
+        "REVIEW_RESULT=CLEAN",
+        "SUMMARY=local tests passed",
+        "NEXT_STEP=done",
+    ])
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    keys = {
+        line.split("=", 1)[0].strip().upper()
+        for line in (event_summary or "").splitlines()
+        if "=" in line
+    }
+    assert "NEXT_STEP" in keys, "required NEXT_STEP dropped by the field cap"
+    assert keys & {"OUTCOME", "RESULT", "SUMMARY"}, "required outcome dropped"
+
+
+def test_oversized_required_values_are_still_bounded(tmp_path):
+    """Two long required values must not blow the payload bound."""
+    summary = "SUMMARY=" + ("x" * 280) + "\nNEXT_STEP=" + ("y" * 280)
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    payload, _event_summary = _completed_event_summary(conn, task_id)
+
+    assert len(json.dumps(payload)) < 8000, "event payload unbounded"
+
+
+def test_mixed_prose_and_field_follows_legacy_first_line(tmp_path):
+    """Prose-first text is legacy-shaped and must keep the old projection."""
+    summary = "First line of prose.\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    # Legacy rows/prose keep the historical first-line behaviour.
+    assert event_summary == "First line of prose."
+
+
+def test_oversized_single_optional_field_is_bounded(tmp_path):
+    """A single huge optional value must not exceed the payload bound."""
+    summary = "KANBAN_STATUS=" + ("x" * 1000)
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    payload, _event_summary = _completed_event_summary(conn, task_id)
+    assert len(json.dumps(payload)) < 8000
+
+
+def test_structured_contract_prefers_fields_over_prose_prefix(tmp_path):
+    """A real contract (fields first) must keep every declared field."""
+    summary = (
+        "SUMMARY=local tests passed\nNEXT_STEP=done\nKANBAN_STATUS=PASS\n"
+        "PYTEST_STATUS=PASSED\nREVIEW_RESULT=CLEAN\nCOMMIT=5cb85df\nBLOCKERS=none\n"
+        "OUTCOME=passed\nRESULT=passed\nCHECKS=passed"
+    )
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    keys = {
+        line.split("=", 1)[0].strip().upper()
+        for line in (event_summary or "").splitlines()
+        if "=" in line
+    }
+    for required in ("SUMMARY", "NEXT_STEP"):
+        assert required in keys
+
+
+def test_prose_summary_after_leading_blank_lines_is_legacy(tmp_path):
+    """Leading blank lines must not turn prose into a 'structured' contract."""
+    summary = "\n\n  Just some prose about the work.\nAnd more."
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    assert event_summary == "Just some prose about the work."
+
+
+# --------------------------------------------------------------------------
+# G. reviewer-flagged edge cases from the repair review
+# --------------------------------------------------------------------------
+
+
+def test_unbreakable_long_token_stays_bounded_and_fails_closed(tmp_path):
+    """A single huge token has no allowlisted word; stay bounded, stay safe.
+
+    Word-boundary truncation cannot produce a valid value here, so the correct
+    outcome is a bounded payload that fails closed — never an over-long payload
+    and never a widened allowlist.
+    """
+    summary = "SUMMARY=" + ("x" * 3000) + "\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    payload, event_summary = _completed_event_summary(conn, task_id)
+
+    assert len(json.dumps(payload)) < 8000, "event payload unbounded"
+    assert event_summary is None
+    assert _completed_summary_lines(event_summary) == []
+
+
+def test_long_value_with_spaces_is_truncated_on_word_boundary(tmp_path):
+    """Truncation must not leave a partial trailing word."""
+    summary = "SUMMARY=" + ("local tests passed " * 30) + "\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+
+    for line in event_summary.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.upper() != "SUMMARY":
+            continue
+        assert len(value) <= 280, "value exceeds the consumer's own limit"
+        assert not value.endswith(" "), "trailing whitespace"
+        # No partial trailing word: every token must be a whole allowlisted word.
+        from gateway.kanban_watchers_notifier import _safe_completion_value
+
+        assert _safe_completion_value(value) is not None, (
+            "word-boundary truncation produced a value the consumer rejects"
+        )
+
+
+def test_equals_sign_and_whitespace_values_do_not_break_serialization(tmp_path):
+    """Values containing '=' or padding must still round-trip as fields."""
+    summary = "SUMMARY=  local tests passed  \nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    keys = {
+        line.split("=", 1)[0].strip().upper()
+        for line in event_summary.splitlines()
+        if "=" in line
+    }
+    assert {"SUMMARY", "NEXT_STEP"} <= keys
+    assert _completed_summary_lines(event_summary) != []
+
+
+def test_duplicate_keys_keep_first_occurrence(tmp_path):
+    """Duplicate fields must not corrupt the serialized contract."""
+    summary = "SUMMARY=local tests passed\nSUMMARY=other\nNEXT_STEP=done"
+    conn = _open(tmp_path)
+    task_id = _create_and_complete(conn, summary=summary)
+    _payload, event_summary = _completed_event_summary(conn, task_id)
+    assert event_summary.count("SUMMARY=") == 1
+    assert _completed_summary_lines(event_summary) != []
+
+
+def test_empty_required_values_fail_closed_without_partial_payload():
+    """Never emit OUTCOME= or NEXT_STEP= alone; both must be non-empty."""
+    from hermes_cli import kanban_db as kb
+
+    for summary in (
+        "OUTCOME=\nNEXT_STEP=done",
+        "OUTCOME=passed\nNEXT_STEP=",
+        "SUMMARY=\nHUMAN_ACTION=done",
+    ):
+        out = kb._completion_event_summary(summary)
+        assert out == ""
+
+
+def test_structured_serialization_does_not_crash_without_gateway(monkeypatch):
+    """The gateway is an OPTIONAL dependency of the producer module.
+
+    Reviewer finding: _rendered_values_acceptable imported the gateway
+    unconditionally, so a CLI-only install raised ImportError for any
+    structured summary — on the very code path that must never fail.
+    """
+    import builtins
+
+    from hermes_cli import kanban_db as kb
+
+    real_import = builtins.__import__
+
+    def blocked(name, *args, **kwargs):
+        if str(name).startswith("gateway"):
+            raise ImportError("gateway unavailable")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+    out = kb._completion_event_summary("SUMMARY=local tests passed\nNEXT_STEP=done")
+    assert out == "SUMMARY=local tests passed\nNEXT_STEP=done"
+
+
+def test_unbreakable_token_is_emptied_not_emitted_invalid(monkeypatch):
+    """Never emit a truncated fragment the consumer will reject.
+
+    Reviewer finding: a single long token with no space to break on was
+    truncated mid-token, producing a value the allowlist refuses. The value
+    must be emptied instead (fail closed) rather than emitted invalid.
+    """
+    from gateway.kanban_watchers_notifier import _safe_completion_value
+    from hermes_cli import kanban_db as kb
+
+    out = kb._completion_event_summary("SUMMARY=" + ("x" * 3000) + "\nNEXT_STEP=done")
+    for line in out.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        if key.strip().upper() in ("SUMMARY", "NEXT_STEP", "BLOCKERS"):
+            assert value == "" or _safe_completion_value(value) is not None, (
+                f"emitted a text value the consumer rejects: {key}"
+            )
+
+
+def test_all_emitted_text_values_are_consumer_valid(tmp_path):
+    """Every text value we emit must be acceptable to the real allowlist."""
+    from gateway.kanban_watchers_notifier import _safe_completion_value
+    from hermes_cli import kanban_db as kb
+
+    cases = [
+        "SUMMARY=local tests passed\nNEXT_STEP=done",
+        "SUMMARY=" + ("local tests passed " * 40) + "\nNEXT_STEP=done\nKANBAN_STATUS=PASS",
+        "SUMMARY=" + ("安全 " * 200) + "\nNEXT_STEP=done",
+        "SUMMARY=" + ("x" * 900) + "\nNEXT_STEP=" + ("y" * 900),
+    ]
+    for case in cases:
+        out = kb._completion_event_summary(case, 400)
+        assert len(out) <= 400
+        for line in out.splitlines():
+            if "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip().upper() in ("SUMMARY", "NEXT_STEP", "BLOCKERS"):
+                assert value == "" or _safe_completion_value(value) is not None, (
+                    f"invalid text value emitted for {key} in case {case[:40]!r}"
+                )

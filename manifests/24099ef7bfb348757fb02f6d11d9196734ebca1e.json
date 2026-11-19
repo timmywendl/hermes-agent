@@ -1,0 +1,117 @@
+{
+  "source_commit": "24099ef7bfb348757fb02f6d11d9196734ebca1e",
+  "base_commit": "60344574963861ee5d50b980338878be4f5b73af",
+  "same_as_base_source_files": 17164,
+  "different_source_files": [
+    {
+      "path": "hermes_cli/kanban.py",
+      "source_sha256": "14131a7111cf9d30b735cdbc9c44f979228a8b1311b67c8c00c0f92cc33bc72d",
+      "archived_sha256": "14131a7111cf9d30b735cdbc9c44f979228a8b1311b67c8c00c0f92cc33bc72d",
+      "mode": "100644",
+      "origin": "git_blob:e1c36a8111989198caa488fddb68bff30684e428",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "source_sha256": "2ccf8698869975e335b4f302d6ed38bd37cec01959540e79fa5be88cfd6517b2",
+      "archived_sha256": "2ccf8698869975e335b4f302d6ed38bd37cec01959540e79fa5be88cfd6517b2",
+      "mode": "100644",
+      "origin": "git_blob:0e2b4e51d1b9648d440e59c00fec721cc9399160",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_dispatch.py",
+      "source_sha256": "eaad8bf5e59335c1413db1afab83f87e3a1d7df1ffca1bd834e20c755feac447",
+      "archived_sha256": "eaad8bf5e59335c1413db1afab83f87e3a1d7df1ffca1bd834e20c755feac447",
+      "mode": "100644",
+      "origin": "git_blob:1e01999a2f103f8451faabaf2ebef05d6f81703f",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_workspace.py",
+      "source_sha256": "b7ea2b55439aee4e64384c42af9755f95c9bc85374af8843dedd6128a854e970",
+      "archived_sha256": "b7ea2b55439aee4e64384c42af9755f95c9bc85374af8843dedd6128a854e970",
+      "mode": "100644",
+      "origin": "git_blob:bf5d878fc0ce46e6a36f676eba2c7c1d3fa8b1ec",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_ops.py",
+      "source_sha256": "b8169b47b10d0ce5878fbc55dcac7b3b23735763955d1806f8026e9386dd7058",
+      "archived_sha256": "b8169b47b10d0ce5878fbc55dcac7b3b23735763955d1806f8026e9386dd7058",
+      "mode": "100644",
+      "origin": "git_blob:37acd1872ec47309bbb92f35f36826d673c88cf1",
+      "redacted": false
+    },
+    {
+      "path": "hermes_state_worker_context.py",
+      "source_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "archived_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "mode": "100644",
+      "origin": "git_blob:b132aa4137ecd96c9ba33c6bebc6d5ff257c1077",
+      "redacted": false
+    },
+    {
+      "path": "tests/agent/transports/test_hermes_tools_mcp_server.py",
+      "source_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "archived_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "mode": "100644",
+      "origin": "git_blob:30be55bc991b6e86eaa11afb837666aebdf0c83d",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_creator_origin.py",
+      "source_sha256": "840ffdac42d995d05b1027bff19da1332dd4407347bb6e2ec1c1cc453e6c1106",
+      "archived_sha256": "840ffdac42d995d05b1027bff19da1332dd4407347bb6e2ec1c1cc453e6c1106",
+      "mode": "100644",
+      "origin": "git_blob:4402b201a804430b47e36d7f147870839100e760",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_gc_retention.py",
+      "source_sha256": "eba984b5328e4dc4c762f596aeb8940bb434de1c242b9632df50606f14af4ea3",
+      "archived_sha256": "eba984b5328e4dc4c762f596aeb8940bb434de1c242b9632df50606f14af4ea3",
+      "mode": "100644",
+      "origin": "git_blob:9e8c923c73c835903d080c051ce76f949332c309",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_graph_identity.py",
+      "source_sha256": "f3b4d861b3480938dfe1e886b214e3bc64c9412bab07e689dd9262f2a917072b",
+      "archived_sha256": "f3b4d861b3480938dfe1e886b214e3bc64c9412bab07e689dd9262f2a917072b",
+      "mode": "100644",
+      "origin": "git_blob:29c434caf5bad3c328f0a76d40460376e3ec9b98",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worktree_isolation.py",
+      "source_sha256": "a77a137fa8bb3716406e07dbefd269fedfbaabc6f368af9b4d3e33d98faaf61d",
+      "archived_sha256": "0a671a98e8ae3be8d6d2127808d9126496c19a75ecc49297efb57844b2836ac7",
+      "mode": "100644",
+      "origin": "git_blob:10a9ab1afff13a9d6fb1b1e6b27dd75917031ad9",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worktree_teardown.py",
+      "source_sha256": "dddf6b50d82e43e41f268b6d4694054fc6cb842d106c07a72d05b88d31bd1544",
+      "archived_sha256": "cf7a7736c7a9c6c8814624511edfa815b626c624a9b78aafb83b1b1d2ef7e08c",
+      "mode": "100644",
+      "origin": "git_blob:1d9458940d736c79d967a9a277b67f1a663f4faf",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_state/test_runtime_worker_context.py",
+      "source_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "archived_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "mode": "100644",
+      "origin": "git_blob:51b8cc96d5b131313534c08f4d72aea2baf39827",
+      "redacted": false
+    }
+  ],
+  "base_paths_absent_in_original_tree": [
+    "tests/gateway/test_guest_worker_boundary.py",
+    "tests/gateway/test_guest_worker_stop.py",
+    "tests/gateway/test_guest_worker_transport.py"
+  ],
+  "scope": "Non-sensitive UTF-8 engineering source only. Not a runtime release, full private environment backup, or assertion that old code was merged into main."
+}

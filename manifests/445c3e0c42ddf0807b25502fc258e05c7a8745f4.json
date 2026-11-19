@@ -1,0 +1,8 @@
+{
+  "source_commit": "445c3e0c42ddf0807b25502fc258e05c7a8745f4",
+  "base_commit": "60344574963861ee5d50b980338878be4f5b73af",
+  "same_as_base_source_files": 17180,
+  "different_source_files": [],
+  "base_paths_absent_in_original_tree": [],
+  "scope": "Non-sensitive UTF-8 engineering source only. Not a runtime release, full private environment backup, or assertion that old code was merged into main."
+}

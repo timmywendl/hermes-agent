@@ -1,0 +1,585 @@
+"""Native WAIT -> bound decision -> same-card resume (#92 decision B).
+
+The gap this file pins down, on ``main`` before the fix:
+
+* A worker that has to *wait for an external, bound decision* (a reviewer /
+  operator verdict that arrives as a **new event** on the same card) has no
+  legal native state. ``kanban_block`` is sticky by design (#28712): the
+  dispatcher's ``recompute_ready`` will never lift it, and a goal-mode worker
+  may only block ``dependency``/``needs_input``, so "wait for instruction"
+  collapses into "dead card needing an operator".
+* The only exits from that state were an operator ``unblock``, or a *clock*
+  (``schedule`` + a cron unblock). Both are outside the event that actually
+  unblocked the work, which is exactly the polling the decision forbids.
+
+The contract added here: a block may **declare** the one ``bound_decision``
+it is waiting for (``kind`` + optional ``ref``). Such a block still ends the
+current run and still stops the dispatcher from promoting the card on a
+timer, but the arrival of a *matching, later* event on the same card is a
+legal wake: the card returns through ``unblock_task`` to the phase that
+stalled (``review`` when it stalled in review), and the ordinary dispatcher
+lane loop respawns it. No new scheduler, no second database, no polling loop,
+and a decision that never arrives leaves the card blocked exactly as today.
+
+Everything here runs against a throwaway SQLite board; no live board, no
+installed-runtime state.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+
+
+@pytest.fixture
+def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _row(conn, tid):
+    return conn.execute(
+        "SELECT status, block_kind, current_run_id, assignee FROM tasks WHERE id = ?",
+        (tid,),
+    ).fetchone()
+
+
+def _events(conn, tid, kind=None):
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (tid,)
+    ).fetchall()
+    out = [(r["kind"], json.loads(r["payload"]) if r["payload"] else None) for r in rows]
+    if kind is not None:
+        out = [e for e in out if e[0] == kind]
+    return out
+
+
+def _block_for_decision(conn, tid, *, run_id=None, kind="review_verdict", ref=None):
+    """The block a worker issues when it must wait for a bound decision."""
+    return kb.block_task(
+        conn,
+        tid,
+        reason="waiting for the bound review verdict",
+        expected_run_id=run_id,
+        bound_decision={"kind": kind, "ref": ref},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 1. The wait state is real, and it is still a block
+# ---------------------------------------------------------------------------
+
+
+def test_block_with_bound_decision_records_the_wait(kanban_home: Path) -> None:
+    """``block`` stays a block (run closed, sticky, not dispatchable) but the
+    card now records *what* it is waiting for, durably, on the event."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wait for verdict", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert _block_for_decision(
+            conn, tid, run_id=claimed.current_run_id, kind="commented", ref="PR-7"
+        )
+
+        row = _row(conn, tid)
+        assert row["status"] == "blocked"
+        assert row["current_run_id"] is None  # the run really ended
+
+        blocked = _events(conn, tid, kind="blocked")
+        assert len(blocked) == 1
+        payload = blocked[0][1]
+        assert payload["bound_decision"] == {"kind": "commented", "ref": "PR-7"}
+
+        # Still sticky: a timer tick must not promote it.
+        assert kb.recompute_ready(conn) == 0
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+def test_block_without_bound_decision_keeps_the_old_shape(kanban_home: Path) -> None:
+    """An ordinary block records no bound decision — the wait contract is
+    explicit opt-in, not a reinterpretation of every block."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="plain block")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="needs a human")
+        payload = _events(conn, tid, kind="blocked")[0][1]
+        assert "bound_decision" not in (payload or {})
+
+
+# ---------------------------------------------------------------------------
+# 2. The wake is the event, not a clock
+# ---------------------------------------------------------------------------
+
+
+def test_matching_decision_event_resumes_the_card_to_review(kanban_home: Path) -> None:
+    """The bound decision arrives as a new event on the same card -> the card
+    leaves the wait state through ``unblock_task`` and lands in the phase it
+    stalled in, ready for the normal review lane to respawn it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="resume me", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="impl done", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        rclaim = kb.claim_review_task(conn, tid)
+        assert rclaim is not None
+        assert _block_for_decision(
+            conn, tid, run_id=rclaim.current_run_id, kind="commented", ref="PR-7"
+        )
+        assert _row(conn, tid)["status"] == "blocked"
+
+        # The decision arrives as a real event on the same card, naming
+        # the bound ref. The wake happens at the write — no later call.
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE PR-7")
+
+        row = _row(conn, tid)
+        assert row["status"] == "review", "must resume to the phase that stalled"
+        kinds = [k for k, _ in _events(conn, tid)]
+        assert "resumed" in kinds
+        # The wake is attributable to the event that caused it.
+        assert kinds.index("resumed") > kinds.index("blocked")
+
+
+def test_resume_requires_a_later_matching_event(kanban_home: Path) -> None:
+    """Nothing arrives -> nothing wakes. And an unwired/unknown decision kind is
+    refused outright rather than parking the card on a wake that never fires."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no wake", assignee="worker")
+        kb.claim_task(conn, tid)
+        # A kind with no wired wake site cannot be waited on.
+        ok, reason = kb.block_task(
+            conn, tid, reason="wait", bound_decision={"kind": "review_verdict"},
+            with_reason=True,
+        )
+        assert ok is False and "wake site" in (reason or "")
+        assert _row(conn, tid)["status"] == "running"
+
+        assert _block_for_decision(conn, tid, kind="commented")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+def test_one_bound_decision_wakes_once(kanban_home: Path) -> None:
+    """A second event cannot wake the same wait (and a resumed card cannot be
+    woken again by a stale decision), so there is no re-entrant loop."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="wake once", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert _block_for_decision(conn, tid, kind="commented")
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE")
+        assert _row(conn, tid)["status"] == "ready"
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE again")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert len(_events(conn, tid, kind="resumed")) == 1
+
+
+def test_decision_arriving_before_the_block_logically_does_not_wake(kanban_home: Path) -> None:
+    """Causality: only an event strictly newer than the wait can wake it. A
+    verdict that was already on the card when the worker blocked is the
+    reason the worker blocked, not the answer to it."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="stale verdict", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=reject")
+        time.sleep(0.01)
+        assert _block_for_decision(conn, tid, kind="commented")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+def test_plain_block_is_never_woken_by_an_event(kanban_home: Path) -> None:
+    """Sticky blocks that declared no bound decision keep their human-only
+    semantics — this feature must not become a general auto-unblocker."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="human only")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="review-required: eyes please")
+        assert kb.pending_bound_decision(conn, tid) is None
+        kb.add_comment(conn, tid, author="worker", body="anything at all")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+def test_corrupted_or_unsatisfiable_binding_never_wakes(kanban_home: Path) -> None:
+    """A persisted binding is re-validated on read: a hand-edited/corrupt
+    ``bound_decision`` must not degrade an ordinary block into one that any
+    later comment resumes."""
+    from hermes_cli import kanban_db as _kb
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="corrupt binding")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(conn, tid, reason="wait")
+        # Rewrite the block event's payload as if it had been tampered with.
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE task_id = ? AND kind = 'blocked'",
+                ('{"reason": "wait", "bound_decision": {"kind": 42}}', tid),
+            )
+        assert kb.pending_bound_decision(conn, tid) is None
+        kb.add_comment(conn, tid, author="worker", body="does this wake it?")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+# ---------------------------------------------------------------------------
+# 3. The ref binds the *specific* decision, when one is declared
+# ---------------------------------------------------------------------------
+
+
+def test_ref_binds_the_specific_decision(kanban_home: Path) -> None:
+    """When the wait names a ref, only a decision carrying that ref wakes it —
+    the PR #107 shape: a verdict for a different head must not resume the card."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="bound to a head", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert _block_for_decision(
+            conn, tid, kind="commented", ref="head-9dfce6a"
+        )
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE for head-aaaaaaaa")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE for head-9dfce6a")
+        # Never entered review, so the resume restores the ready phase.
+        assert _row(conn, tid)["status"] == "ready"
+
+
+# ---------------------------------------------------------------------------
+# 4. Dispatch integration: the resumed card is picked up by the same lane loop
+# ---------------------------------------------------------------------------
+
+
+def test_resumed_review_card_is_respawned_by_the_review_lane(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End of the chain: the wake returns the card to ``review`` and the
+    existing dispatcher review lane (no new scheduler) claims and spawns it."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _n: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config", lambda *a, **k: {"kanban": {"review_dispatch": True}}
+    )
+    spawned: list[str] = []
+
+    def spawn(task, workspace):
+        spawned.append(task.id)
+        return None
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="lane resume", assignee="worker")
+        claimed = kb.claim_task(conn, tid)
+        assert kb.request_review(
+            conn, tid, summary="impl", reviewer="reviewer",
+            expected_run_id=claimed.current_run_id,
+        )
+        # The reviewer run stalls waiting for the bound verdict.
+        rclaim = kb.claim_review_task(conn, tid)
+        assert rclaim is not None
+        assert _block_for_decision(conn, tid, run_id=rclaim.current_run_id, kind="commented")
+
+        # A tick alone never wakes it (that would be the polling design).
+        assert kbd.dispatch_once(conn, spawn_fn=spawn, dry_run=True).spawned == []
+
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE")
+        assert _row(conn, tid)["status"] == "review"
+
+        res = kbd.dispatch_once(conn, spawn_fn=spawn, dry_run=False)
+        assert tid in [s[0] for s in res.spawned]
+        assert spawned == [tid]
+
+
+def test_comment_written_inside_a_nested_txn_does_not_lose_or_deadlock(
+    kanban_home: Path,
+) -> None:
+    """Graph builders compose comments under an outer ``write_txn``.
+
+    The wake must not run inside that outer transaction (its durability is not
+    decided yet, and ``unblock_task`` opens its own IMMEDIATE txn), and it must
+    not cost the caller the comment either. The nested path therefore writes
+    only; the backstop sweep performs the wake.
+    """
+    from hermes_cli import kanban_db as _kb
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="nested composer", assignee="w")
+        kb.claim_task(conn, tid)
+        assert _block_for_decision(conn, tid, kind="commented")
+
+        with _kb.write_txn(conn, allow_nested=True):
+            kb.add_comment(conn, tid, author="mc", body="VERDICT=APPROVE")
+
+        assert _row(conn, tid)["status"] == "blocked"
+        assert len(kb.list_comments(conn, tid)) == 1  # comment survived
+
+        # The backstop sweep is what a nested composer relies on.
+        assert kb.resume_pending_bound_decisions(conn) == [tid]
+        assert _row(conn, tid)["status"] == "ready"
+
+
+def test_backstop_sweep_is_idempotent_and_skips_cards_without_a_decision(
+    kanban_home: Path,
+) -> None:
+    with kbc.connect() as conn:
+        waiting = kb.create_task(conn, title="waiting")
+        kb.claim_task(conn, waiting)
+        assert _block_for_decision(conn, waiting, kind="commented")
+        kb.add_comment(conn, waiting, author="mc", body="APPROVE")
+
+        silent = kb.create_task(conn, title="no decision yet")
+        kb.claim_task(conn, silent)
+        assert _block_for_decision(conn, silent, kind="commented")
+
+        plain = kb.create_task(conn, title="plain block")
+        kb.claim_task(conn, plain)
+        assert kb.block_task(conn, plain, reason="human please")
+
+        # The waiting card was already resumed by its own comment write.
+        assert kb.resume_pending_bound_decisions(conn) == []
+        assert _row(conn, waiting)["status"] == "ready"
+        assert _row(conn, silent)["status"] == "blocked"
+        assert _row(conn, plain)["status"] == "blocked"
+
+
+def test_pre_block_comment_naming_the_ref_cannot_wake_later_chatter(
+    kanban_home: Path,
+) -> None:
+    """Regression (independent review, BLOCKER).
+
+    The ref must be checked against the comment that PRODUCED the triggering
+    event, not against a window of recent comments. A worker's own pre-block
+    "reviewing head-9dfce6a now" is the realistic shape, and with a window any
+    later "lunch?" would resume the card.
+    """
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="pre-block ref", assignee="worker")
+        kb.claim_task(conn, tid)
+        kb.add_comment(conn, tid, author="worker", body="reviewing head-9dfce6a now; hold please")
+        assert _block_for_decision(conn, tid, kind="commented", ref="head-9dfce6a")
+
+        kb.add_comment(conn, tid, author="someone", body="unrelated chatter about lunch")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] == "blocked"
+
+        # The decision is the comment that produced the event — a chatter
+        # comment AFTER a ref-naming verdict must not resurrect it either.
+        kb.add_comment(conn, tid, author="main-control", body="VERDICT=APPROVE head-9dfce6a")
+        assert _row(conn, tid)["status"] == "ready"
+
+    # Now the discriminating case: the ref-naming comment is OLD, the waking
+    # comment is the newest one and says nothing about the ref.
+    with kbc.connect() as conn:
+        tid2 = kb.create_task(conn, title="old ref", assignee="worker")
+        kb.claim_task(conn, tid2)
+        kb.add_comment(conn, tid2, author="worker", body="head-9dfce6a is under review")
+        assert _block_for_decision(conn, tid2, kind="commented", ref="head-9dfce6a")
+        kb.add_comment(conn, tid2, author="someone", body="any update? lunch?")
+        assert _row(conn, tid2)["status"] == "blocked", (
+            "a matching ref in an OLDER comment must not wake the card; only the "
+            "comment that produced this event may satisfy the binding"
+        )
+
+    # Third shape, the discriminating one. The bound event's own comment is the
+    # CHATTER one ("lunch?"), and a ref-naming verdict sits on the card as a
+    # NEWER comment. A fetch-the-latest implementation reads the verdict for
+    # the chatter event and wakes the card on small talk — the BLOCKER again,
+    # one layer down.
+    with kbc.connect() as conn:
+        tid3 = kb.create_task(conn, title="event is not newest", assignee="worker")
+        kb.claim_task(conn, tid3)
+        assert _block_for_decision(conn, tid3, kind="commented", ref="head-feed")
+        # The chatter event, written through the nested path so its own wake is
+        # deferred (this is the event the resume below must judge).
+        with kb.write_txn(conn, allow_nested=True):
+            kb.add_comment(conn, tid3, author="someone", body="any update? lunch?")
+        # A ref-naming verdict becomes the NEWEST comment, without being the
+        # event under test.
+        with kb.write_txn(conn):
+            import time as _time
+            cur = conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'main-control', 'unrelated: head-feed was discussed', ?)",
+                (tid3, int(_time.time()) + 1),
+            )
+            newest_comment_id = int(cur.lastrowid or 0)
+        assert newest_comment_id > 0
+        assert kb.resume_on_bound_decision(conn, tid3) is False, (
+            "the event under test is the chatter comment; a ref-naming comment "
+            "elsewhere on the card must not satisfy it"
+        )
+        assert _row(conn, tid3)["status"] == "blocked"
+
+
+def test_waiter_cannot_answer_its_own_wait(kanban_home: Path) -> None:
+    """Regression (independent review, MAJOR): a blocked worker can still post
+    comments, so ``await_from`` must bind the decision to another author."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="self answer", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="waiting on reviewer",
+            bound_decision={"kind": "commented", "await_from": ["main-control"]},
+        )
+        # The waiter comments on its own card: not a decision.
+        kb.add_comment(conn, tid, author="worker", body="ok I approve myself")
+        assert _row(conn, tid)["status"] == "blocked"
+
+        kb.add_comment(conn, tid, author="main-control", body="APPROVE")
+        assert _row(conn, tid)["status"] == "ready"
+
+
+def test_classify_in_place_path_keeps_the_binding(kanban_home: Path) -> None:
+    """Regression (independent review, MAJOR): classifying a breaker-parked
+    card in place used to drop a valid binding while reporting success."""
+    from hermes_cli import kanban_db as _kb
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="untyped parked", assignee="worker")
+        kb.claim_task(conn, tid)
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind=NULL, current_run_id=NULL "
+                "WHERE id = ?", (tid,),
+            )
+        assert kb.block_task(
+            conn, tid, kind="needs_input", bound_decision={"kind": "commented"},
+        )
+        pending = kb.pending_bound_decision(conn, tid)
+        assert pending is not None and pending["kind"] == "commented"
+
+
+def test_ref_matches_the_natural_head_sha_shapes(kanban_home: Path) -> None:
+    """Regression (R2 MAJOR): ``-``/``_`` must not block a ref match, or the
+    advertised "head SHA" binding strands the card on a normal verdict."""
+    cases = [
+        ("9dfce6a", "VERDICT=APPROVE head-9dfce6a"),              # dash prefix
+        ("9dfce6a", "reviewed 9dfce6a — approve"),                # bare
+        ("PR-7", "APPROVE PR-7"),                                 # exact
+        ("9dfce6ab", "approved 9dfce6ab"),                        # longer sha
+    ]
+    for ref, body in cases:
+        with kbc.connect() as conn:
+            tid = kb.create_task(conn, title=f"ref {ref}")
+            kb.claim_task(conn, tid)
+            assert _block_for_decision(conn, tid, kind="commented", ref=ref)
+            kb.add_comment(conn, tid, author="main-control", body=body)
+            assert _row(conn, tid)["status"] == "ready", f"{ref!r} should match {body!r}"
+
+    # Extension must NOT match: PR-7 is not decided by PR-70.
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="no extension")
+        kb.claim_task(conn, tid)
+        assert _block_for_decision(conn, tid, kind="commented", ref="PR-7")
+        kb.add_comment(conn, tid, author="main-control", body="APPROVE PR-70")
+        assert _row(conn, tid)["status"] == "blocked"
+
+
+def test_classify_in_place_carries_an_existing_wait_forward(kanban_home: Path) -> None:
+    """Regression (R2 MAJOR): classifying a card that ALREADY waits on a bound
+    decision must not strand it by replacing the newest blocked event."""
+    from hermes_cli import kanban_db as _kb
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="already waiting", assignee="worker")
+        kb.claim_task(conn, tid)
+        # A kind-less worker block stores block_kind=NULL, indistinguishable
+        # from a breaker-parked card to the operator path.
+        assert kb.block_task(conn, tid, reason="wait", bound_decision={"kind": "commented"})
+        with _kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (tid,))
+        assert kb.block_task(conn, tid, kind="needs_input") is True
+        pending = kb.pending_bound_decision(conn, tid)
+        assert pending is not None and pending["kind"] == "commented", (
+            "classifying in place must carry the pending wait forward"
+        )
+
+
+def test_dispatch_tick_resumes_a_decision_written_inside_a_nested_txn(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The dispatcher's sweep is the backstop for a nested composer; without it
+    the card would strand (reviewer MINOR: the hookup was untested)."""
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+    from hermes_cli import kanban_db as _kb
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda _n: True)
+    monkeypatch.setattr(cfgmod, "load_config", lambda *a, **k: {"kanban": {}})
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="nested decision", assignee="worker")
+        kb.claim_task(conn, tid)
+        assert _block_for_decision(conn, tid, kind="commented")
+        with _kb.write_txn(conn, allow_nested=True):
+            kb.add_comment(conn, tid, author="main-control", body="APPROVE")
+        assert _row(conn, tid)["status"] == "blocked"
+
+        kbd.dispatch_once(conn, spawn_fn=lambda t, w: None, dry_run=True)
+        assert _row(conn, tid)["status"] in ("ready", "running")
+
+
+def test_with_reason_returns_a_consistent_tuple(kanban_home: Path) -> None:
+    """Regression (R2 MINOR): every with_reason outcome is a 2-tuple, so a
+    refusal is never truthy."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="tuple shape")
+        kb.claim_task(conn, tid)
+        ok, why = kb.block_task(conn, tid, reason="wait", with_reason=True)
+        assert ok is True and why is None
+        ok2, why2 = kb.block_task(conn, tid, reason="again", with_reason=True)
+        assert ok2 is False and isinstance(why2, str)
+        assert kb.block_task(conn, "t_missing", with_reason=True)[0] is False
+
+
+# ---------------------------------------------------------------------------
+# 5. Fail-closed inputs
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "review_verdict",                      # not a mapping
+        {},                                    # no kind
+        {"kind": ""},                          # blank kind
+        {"kind": 42},                          # non-string kind
+        {"kind": "custom_verdict"},            # no wired wake site
+        {"kind": "commented", "ref": 7},       # non-string ref
+        {"kind": "commented", "await_from": "mc"},   # not a list
+        {"kind": "commented", "await_from": [""]},   # blank author
+    ],
+)
+def test_malformed_bound_decision_is_refused(kanban_home: Path, bad) -> None:
+    """A malformed binding must fail the block loudly rather than record a
+    wait that can never be satisfied (or, worse, one satisfied by anything)."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="bad binding")
+        kclaim = kb.claim_task(conn, tid)
+        ok, reason = kb.block_task(
+            conn, tid, reason="wait", expected_run_id=kclaim.current_run_id,
+            bound_decision=bad, with_reason=True,
+        )
+        assert ok is False
+        assert "bound_decision" in (reason or "")
+        assert _row(conn, tid)["status"] == "running"
+
+
+def test_resume_is_a_noop_for_unknown_and_unblocked_cards(kanban_home: Path) -> None:
+    with kbc.connect() as conn:
+        assert kb.resume_on_bound_decision(conn, "t_deadbeefcafe") is False
+        tid = kb.create_task(conn, title="never blocked")
+        assert kb.resume_on_bound_decision(conn, tid) is False
+        assert _row(conn, tid)["status"] in ("todo", "ready")

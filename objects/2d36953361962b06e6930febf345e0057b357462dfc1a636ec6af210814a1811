@@ -1,0 +1,394 @@
+"""One Human notification per terminal Kanban success.
+
+The notifier's two legs serve different masters: the passive ping is the Human
+notification, the wake exists for mission CONTINUATION. When the ping has
+already landed — positively checkpointed in ``kanban_notify_subs.last_ping_event_id``
+— waking the creator anyway produced a second, contentless Telegram reply that
+restated the completion (issue #92, ``t_aedf5621``: one ``completed`` event, two
+assistant messages).
+
+These tests bind the suppression to native evidence only, and pin the directions
+where it must NOT fire — unknown delivery, missing projection, and every
+attention/failure/handoff kind.
+"""
+
+import asyncio
+
+import pytest
+
+from gateway.config import Platform
+from gateway.run import GatewayRunner
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
+
+
+SUMMARY = "OUTCOME=任务已完成。\nNEXT_STEP=等待。"
+
+
+class RecordingAdapter:
+    def __init__(self, fail_send=False):
+        self.sent = []
+        self.handled = []
+        self.fail_send = fail_send
+
+    async def send(self, chat_id, text, metadata=None):
+        if self.fail_send:
+            from gateway.platforms.base import SendResult
+            return SendResult(success=False, error="simulated provider rejection")
+        self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+        event._gateway_accepted = True
+
+
+async def _run_one_notifier_tick(monkeypatch, runner):
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    await runner._kanban_notifier_watcher(interval=1)
+
+
+def _make_runner(adapter):
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    return runner
+
+
+def _completed_task(*, summary=SUMMARY, mode="notify+wake", kind_tail=""):
+    """Create + claim a task, subscribe it, then drive it to one terminal event."""
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="duplicate completion", assignee="worker")
+        kb.claim_task(conn, tid, claimer="worker")
+        kbn.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1",
+                           delivery_mode=mode)
+        if kind_tail == "blocked":
+            kb.block_task(conn, tid, reason="needs a human decision", kind="needs_input")
+        else:
+            kb.complete_task(conn, tid, summary=summary)
+        return tid
+    finally:
+        conn.close()
+
+
+def _sub_row(tid):
+    conn = kbc.connect()
+    try:
+        return dict(conn.execute(
+            "SELECT * FROM kanban_notify_subs WHERE task_id = ?", (tid,)).fetchone())
+    finally:
+        conn.close()
+
+
+def test_checkpointed_completion_sends_one_ping_and_no_wake(tmp_path, monkeypatch):
+    """The incident shape: notify+wake + a delivered, checkpointed completion."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "one-notification.db"))
+    kb.init_db()
+    tid = _completed_task()
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, "the Human still gets exactly one notification"
+    assert "已完成" in adapter.sent[0]["text"]
+    assert "下一步" in adapter.sent[0]["text"], "the ping must carry a next step to stand alone"
+    assert adapter.handled == [], "a checkpointed completion must not wake the creator again"
+    sub = _sub_row(tid)
+    assert sub["last_ping_event_id"] > 0, "delivery checkpoint is the suppression evidence"
+    assert sub["last_event_id"] >= sub["last_ping_event_id"], "cursor still settles"
+
+
+def test_zero_checkpoint_recomputed_from_a_real_tick_keeps_the_wake(tmp_path, monkeypatch):
+    """A defensively zeroed checkpoint must not be read as delivered."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "unknown-delivery.db"))
+    kb.init_db()
+    tid = _completed_task()
+    conn = kbc.connect()
+    try:
+        conn.execute("UPDATE kanban_notify_subs SET last_ping_event_id = 0 WHERE task_id = ?", (tid,))
+        conn.commit()
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, "the real tick re-delivers the ping"
+    assert adapter.handled == [], "the re-delivered ping is now checkpointed, so no second report"
+    assert _sub_row(tid)["last_ping_event_id"] > 0, "the re-delivery is recorded durably"
+
+
+def test_failed_ping_send_is_never_treated_as_delivered(tmp_path, monkeypatch):
+    """A rejected send leaves no checkpoint, so nothing may be suppressed on it."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "failed-send.db"))
+    kb.init_db()
+    tid = _completed_task()
+    adapter = RecordingAdapter(fail_send=True)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == [], "the adapter rejected the ping"
+    sub = _sub_row(tid)
+    assert sub["last_ping_event_id"] == 0, "a rejected send must not checkpoint delivery"
+    # The claim is rewound, so the next tick still owns the undelivered notification.
+    conn = kbc.connect()
+    try:
+        _, pending = kbn.unseen_events_for_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1")
+    finally:
+        conn.close()
+    assert [e.kind for e in pending] == ["completed"], (
+        "the completion stays undelivered, not swallowed")
+
+
+def test_unknowable_checkpoint_keeps_the_wake():
+    """A subscription with no positive ping record must never be read as delivered."""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    class _Task:
+        title = "t"
+        assignee = "worker"
+        session_id = "s"
+
+    class _Ev:
+        id = 10
+        kind = "completed"
+        run_id = 1
+        payload = {"summary": SUMMARY}
+
+    for checkpoint in (-1, 0, "not-a-number", None):
+        n = _KanbanNotification.__new__(_KanbanNotification)
+        n.d = {
+            "sub": {"task_id": "t_0123abcd", "platform": "telegram", "chat_id": "c",
+                    "delivery_mode": "notify+wake", "last_ping_event_id": checkpoint},
+            "task": _Task(), "board": "b", "events": [_Ev()],
+            "run_summaries": {10: SUMMARY},
+        }
+        n.sub = n.d["sub"]
+        n.task = _Task()
+        n.board_slug = "b"
+        n.platform_str = "telegram"
+        n.task_id = "t_0123abcd"
+        n.sub_profile = ""
+        n.title = "t"
+        n.board_tag = "[b] "
+        n.head = "h"
+        n.sub_key = ("t_0123abcd", "telegram", "c", "")
+        n.wake_agent = True
+        n.send_passive = True
+        n.wake_handoff = n.wake_review_detail = n.session_key = n.synth = ""
+        n.pinged_event_ids = set()
+        n.plat = n.adapter = None
+        n.is_push_adapter = True
+        n.wake_kinds = set()
+        assert n._passive_notification_already_delivered() is False, checkpoint
+
+
+def test_the_reported_duplicate_payload_notifies_exactly_once(tmp_path, monkeypatch):
+    """The literal issue #92 payload: the Human gets ONE message and no second report.
+
+    ``t_aedf5621`` completed with ``SUMMARY=local fallback check complete with one test run
+    passed``. That prose is rejected by the projection allowlist, so the ping renders
+    ``RESULT_UNAVAILABLE`` — an unhelpful but real notice. The wake must still not fire: the
+    duplicate reply it produced was the reported symptom, and it carried no more information
+    than the ping it repeated.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "reported-payload.db"))
+    kb.init_db()
+    tid = _completed_task(summary="SUMMARY=local fallback check complete with one test run passed")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1, "exactly one Human notification"
+    assert "RESULT_UNAVAILABLE" in adapter.sent[0]["text"]
+    assert adapter.handled == [], "no wake: the delivered ping already told the Human it finished"
+    assert _sub_row(tid)["last_ping_event_id"] > 0, "delivery is checkpointed before suppression"
+
+
+def test_wake_only_subscription_still_wakes(tmp_path, monkeypatch):
+    """wake-only has no passive leg: the wake IS the only delivery."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "wake-only.db"))
+    kb.init_db()
+    _completed_task(mode="wake")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == [], "wake-only never sends a passive ping"
+    assert len(adapter.handled) == 1
+
+
+@pytest.mark.parametrize("mode", ["notify+wake"])
+def test_human_block_still_wakes_despite_a_delivered_ping(tmp_path, monkeypatch, mode):
+    """A needs_input block is attention, never a duplicate of a completion."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "blocked.db"))
+    kb.init_db()
+    tid = _completed_task(mode=mode, kind_tail="blocked")
+    adapter = RecordingAdapter()
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert _sub_row(tid)["last_ping_event_id"] > 0, "the block ping was delivered"
+    assert len(adapter.sent) == 1, "the block itself is notified exactly once"
+    assert len(adapter.handled) == 1, "a Human block must still wake the creator"
+
+
+def test_wake_kinds_cleared_so_the_wake_leg_never_runs():
+    """Clearing the projection is not enough: the wake legs key off ``wake_kinds``."""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    n = _make_note_for_batch()
+    n.build_wake_text()
+
+    assert n.wake_kinds == set(), "no wake kind may survive a confirmed completion"
+    assert n.synth == "", "no synthetic wake text may be built"
+    assert n.session_key == "", "no wake target may be resolved"
+
+
+def test_a_suppressed_wake_still_leaves_wake_diagnostic_defined():
+    """``wake_diagnostic`` is read by the wake paths; a suppressed batch must not leave it unset."""
+    n = _make_note_for_batch()
+    n.pinged_event_ids = {10}
+    n.build_wake_text()
+
+    assert n.wake_kinds == set(), "suppressed"
+    assert n.wake_diagnostic is False, "defined even though no wake will run"
+
+
+def test_a_silent_kind_in_the_batch_blocks_suppression():
+    """Every kind in the batch must actually render a Human notice."""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    n = _make_note_for_batch(kind="archived")
+    assert n._passive_notification_already_delivered() is False
+
+
+def _make_note_for_batch(*, kind="completed"):
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    class _Task:
+        title = "t"
+        assignee = "worker"
+        session_id = "s"
+
+    class _Ev:
+        id = 10
+        run_id = 1
+        payload = {"summary": SUMMARY}
+
+    ev = _Ev()
+    ev.kind = kind
+    n = _KanbanNotification.__new__(_KanbanNotification)
+    n.d = {
+        "sub": {"task_id": "t_0123abcd", "platform": "telegram", "chat_id": "c",
+                "delivery_mode": "notify+wake", "last_ping_event_id": 10},
+        "task": _Task(), "board": "b", "events": [ev], "run_summaries": {10: SUMMARY},
+    }
+    n.runner = None
+    n.platform_cls = None
+    n.sub_fail_counts = {}
+    n.sub = n.d["sub"]
+    n.task = _Task()
+    n.board_slug = "b"
+    n.platform_str = "telegram"
+    n.task_id = "t_0123abcd"
+    n.sub_profile = ""
+    n.title = "t"
+    n.board_tag = "[b] "
+    n.head = "h"
+    n.sub_key = ("t_0123abcd", "telegram", "c", "")
+    n.wake_agent = True
+    n.send_passive = True
+    n.wake_handoff = n.wake_review_detail = n.session_key = n.synth = ""
+    n.pinged_event_ids = set()
+    n.plat = n.adapter = None
+    n.is_push_adapter = True
+    n.wake_kinds = set()
+    n.wake_diagnostic = False  # mirrors __init__
+    return n
+
+
+def test_suppression_requires_every_event_in_the_batch_to_be_confirmable():
+    """Mixed batches keep the wake: one unconvertible event re-opens delivery."""
+    from gateway.kanban_watchers_notifier import _KanbanNotification
+
+    class _Task:
+        title = "t"
+        assignee = "worker"
+        session_id = "s"
+
+    def _note(events, checkpoint, pinged=()):
+        n = _KanbanNotification.__new__(_KanbanNotification)
+        n.runner = None
+        n.d = {
+            "sub": {"task_id": "t_0123abcd", "platform": "telegram", "chat_id": "c",
+                    "delivery_mode": "notify+wake", "last_ping_event_id": checkpoint},
+            "task": _Task(), "board": "b", "events": events, "run_summaries": {},
+        }
+        n.platform_cls = None
+        n.sub_fail_counts = {}
+        n.sub = n.d["sub"]
+        n.task = _Task()
+        n.board_slug = "b"
+        n.platform_str = "telegram"
+        n.task_id = "t_0123abcd"
+        n.sub_profile = ""
+        n.title = "t"
+        n.board_tag = "[b] "
+        n.head = "[b] @worker Kanban t_0123abcd"
+        n.sub_key = ("t_0123abcd", "telegram", "c", "")
+        n.wake_agent = True
+        n.send_passive = True
+        n.wake_handoff = n.wake_review_detail = n.session_key = n.synth = ""
+        n.pinged_event_ids = set(pinged)
+        n.plat = n.adapter = None
+        n.is_push_adapter = True
+        n.wake_kinds = set()
+        return n
+
+    class _Ev:
+        def __init__(self, ident, kind):
+            self.id = ident
+            self.kind = kind
+            self.payload = {"reason": "r", "summary": SUMMARY}
+            self.run_id = 1
+
+    def _note_with(events, checkpoint, pinged=()):
+        note = _note(events, checkpoint, pinged=pinged)
+        # The completed projection reads the exact run's summary from the claim dict, never the
+        # event payload.
+        note.d["run_summaries"] = {ev.id: SUMMARY for ev in events}
+        return note
+
+    completed = _Ev(10, "completed")
+    n = _note_with([completed], checkpoint=10)
+    assert n._passive_notification_already_delivered() is True
+
+    # A completion whose ping THIS tick sent and checkpointed is the fresh-claim evidence.
+    fresh = _note_with([completed], checkpoint=0, pinged={10})
+    assert fresh._passive_notification_already_delivered() is True
+
+    # completed is confirmed, but a sibling blocked event in the same batch is not.
+    mixed = _note_with([completed, _Ev(11, "blocked")], checkpoint=11, pinged={10})
+    assert mixed._passive_notification_already_delivered() is False
+
+    # Checkpoint behind the event AND no ping recorded by this tick: delivery is UNKNOWN.
+    behind = _note_with([completed], checkpoint=9)
+    assert behind._passive_notification_already_delivered() is False
+
+    # A completion whose summary cannot be projected is not a sufficient notification.
+    unprojectable = _note_with([_Ev(12, "completed")], checkpoint=12, pinged={12})
+    unprojectable.d["run_summaries"] = {12: "free text with no declared fields"}
+    assert unprojectable._passive_notification_already_delivered() is True  # a delivered ping stands

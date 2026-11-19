@@ -1,0 +1,121 @@
+"""Tool-level integration for bound-decision waits.
+
+The kernel primitives live in ``hermes_cli.kanban_db`` (covered by
+``tests/hermes_cli/test_kanban_bound_decision_resume.py``). What matters here
+is that a real worker can actually reach them: the ``kanban_block`` schema
+accepts ``bound_decision``, the handler forwards it, and a goal-mode worker —
+which may otherwise only block on ``dependency``/``needs_input`` — is allowed
+to park on a bound decision because that wait cannot be used as an escape
+hatch around the completion judge.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+
+def _goal_mode_worker(monkeypatch, tmp_path: Path) -> str:
+    """Isolated HERMES_HOME + one claimed goal_mode task (worker env pinned)."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "test-worker")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn, title="goal-mode bound wait", assignee="test-worker",
+            body="Must achieve X.", goal_mode=True,
+        )
+        kb.claim_task(conn, tid)
+        run_id = kb._current_run_id(conn, tid)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
+    return tid
+
+
+def test_block_schema_exposes_bound_decision() -> None:
+    from tools.kanban_tools_schemas import KANBAN_BLOCK_SCHEMA
+
+    prop = KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["bound_decision"]
+    assert prop["type"] == "object"
+    assert prop["required"] == ["kind"]
+    # The description must warn that a ref-less binding wakes on the first
+    # matching event, or a worker will under-specify and wake on stale input.
+    assert "ref" in prop["description"]
+
+
+def test_goal_mode_worker_may_park_on_a_bound_decision(monkeypatch, tmp_path) -> None:
+    """goal_mode + a bound decision naming ANOTHER profile is a genuine blocker."""
+    from tools import kanban_tools as kt
+
+    tid = _goal_mode_worker(monkeypatch, tmp_path)
+    d = json.loads(kt._handle_block({
+        "reason": "waiting for the review verdict",
+        "bound_decision": {"kind": "commented", "ref": "head-abc",
+                           "await_from": ["main-control"]},
+    }))
+    assert d.get("ok") is True, d
+    assert d.get("bound_decision", {}).get("ref") == "head-abc"
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "blocked"
+        pending = kb.pending_bound_decision(conn, tid)
+        assert pending and pending["kind"] == "commented" and pending["ref"] == "head-abc"
+
+
+def test_goal_mode_worker_cannot_self_answer_a_bound_decision(monkeypatch, tmp_path) -> None:
+    """Regression (R2 BLOCKER): a goal_mode worker can comment on its own card,
+    so a binding it could satisfy itself is not an external blocker."""
+    from tools import kanban_tools as kt
+
+    tid = _goal_mode_worker(monkeypatch, tmp_path)   # HERMES_PROFILE=test-worker
+    # No await_from at all -> refused.
+    d = json.loads(kt._handle_block({
+        "reason": "waiting", "bound_decision": {"kind": "commented"},
+    }))
+    assert "error" in d and "await_from" in d["error"]
+    # await_from naming the worker itself -> refused.
+    d2 = json.loads(kt._handle_block({
+        "reason": "waiting",
+        "bound_decision": {"kind": "commented", "await_from": ["test-worker"]},
+    }))
+    assert "error" in d2
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_goal_mode_worker_still_cannot_plain_block(monkeypatch, tmp_path) -> None:
+    """Control: without a bound decision the goal-mode escape hatch stays shut."""
+    from tools import kanban_tools as kt
+
+    tid = _goal_mode_worker(monkeypatch, tmp_path)
+    d = json.loads(kt._handle_block({"reason": "just stopping"}))
+    assert "error" in d
+    assert "goal_mode" in d["error"]
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+
+
+def test_goal_mode_worker_still_cannot_block_on_a_made_up_kind(monkeypatch, tmp_path) -> None:
+    """A binding is not a licence to use an arbitrary block kind."""
+    from tools import kanban_tools as kt
+
+    tid = _goal_mode_worker(monkeypatch, tmp_path)
+    # ``kind`` is validated against VALID_BLOCK_KINDS before the goal gate.
+    d = json.loads(kt._handle_block({"reason": "x", "kind": "made_up"}))
+    assert "error" in d
+
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"

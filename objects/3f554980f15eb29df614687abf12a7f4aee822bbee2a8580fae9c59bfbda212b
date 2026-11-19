@@ -1,0 +1,285 @@
+"""COMPLETION_HANDOFF_CONTRACT_V1 — producer/consumer agreement tests.
+
+Baseline: integration of the two reviewed branches
+(``e657519`` Telegram status/result delivery + ``adebb5eb`` Kanban create origin).
+
+The contract is DEFINED BY THE CONSUMER, which already exists and must not be
+loosened: ``gateway/kanban_watchers_notifier._COMPLETION_FIELDS`` plus its text
+allowlist and typed enums. These tests bind the producer to that existing
+vocabulary and pin the empirically verified shape.
+
+Verified shape (probed against the real projector, not inferred):
+
+    SUMMARY=checks passed       text allowlist — doubles as the outcome line
+    NEXT_STEP=done              text allowlist — REQUIRED by the projector
+    KANBAN_STATUS=PASS          typed enum, display line
+    PYTEST_STATUS=PASSED        typed enum, display line
+    REVIEW_RESULT=CLEAN         typed enum, display line
+    COMMIT=<sha>                typed [0-9a-f]{7,12}
+
+Two hard consumer invariants a naive contract gets wrong:
+
+1. ``_completed_summary_lines`` returns ``[]`` (=> RESULT_UNAVAILABLE) unless the
+   handoff carries BOTH an outcome (``OUTCOME``/``RESULT``/``SUMMARY``) AND a
+   next step (``NEXT_STEP``/``HUMAN_ACTION``). ``KANBAN_STATUS``/``PYTEST_STATUS``/
+   ``REVIEW_RESULT`` alone are display-only and project NOTHING.
+2. The text allowlist is narrow: ``none``/``nothing``/``further``/``action`` are
+   NOT allowlisted, so the intuitive ``NEXT_STEP=none`` silently degrades to
+   RESULT_UNAVAILABLE. ``done`` IS allowlisted. The contract must therefore name
+   a value the consumer actually accepts instead of leaving the model to guess —
+   guessing is what produced the original RESULT_UNAVAILABLE notification.
+
+The consumer, its allowlist and the sanitizer are NOT modified by this change.
+"""
+from __future__ import annotations
+
+import pytest
+
+from gateway.kanban_watchers_notifier import (
+    _COMPLETION_FIELDS,
+    _COMPLETION_TYPED_CHOICES,
+    _completed_summary_lines,
+)
+from hermes_cli import kanban_db as kb
+from tools.kanban_tools_schemas import KANBAN_COMPLETE_SCHEMA
+
+
+# The consumer's own vocabulary — reused, never redefined.
+REQUIRED = ("SUMMARY", "NEXT_STEP")
+DISPLAY_OPTIONAL = ("KANBAN_STATUS", "PYTEST_STATUS", "REVIEW_RESULT", "COMMIT", "BLOCKERS")
+
+CONFORMING = (
+    "SUMMARY=checks passed\n"
+    "NEXT_STEP=done\n"
+    "KANBAN_STATUS=PASS\n"
+    "PYTEST_STATUS=PASSED\n"
+    "REVIEW_RESULT=CLEAN\n"
+)
+
+
+def _text(schema):
+    return (
+        schema["description"]
+        + "\n"
+        + schema["parameters"]["properties"]["summary"]["description"]
+    )
+
+
+# ---------------------------------------------------------------- vocabulary
+
+def test_contract_reuses_existing_consumer_vocabulary():
+    for field in REQUIRED + DISPLAY_OPTIONAL:
+        assert field in _COMPLETION_FIELDS, f"{field} is not consumer-known"
+    # The invented aliases from the earlier draft must NOT be used.
+    for bogus in ("STATUS", "TESTS", "REVIEW"):
+        assert bogus not in _COMPLETION_FIELDS
+
+
+def test_typed_display_fields_have_consumer_enums():
+    assert "PASSED" in _COMPLETION_TYPED_CHOICES["PYTEST_STATUS"]
+    assert "CLEAN" in _COMPLETION_TYPED_CHOICES["REVIEW_RESULT"]
+    assert "PASS" in _COMPLETION_TYPED_CHOICES["KANBAN_STATUS"]
+
+
+# ---------------------------------------------------------------- projection
+
+def test_conforming_handoff_projects_safely():
+    lines = _completed_summary_lines(CONFORMING)
+    assert lines, "a conforming handoff must not degrade to RESULT_UNAVAILABLE"
+    rendered = "\n".join(lines)
+    assert "RESULT_UNAVAILABLE" not in rendered
+    assert "checks passed" in rendered
+    assert "done" in rendered
+
+
+def test_display_fields_alone_are_not_sufficient():
+    """KANBAN_STATUS/PYTEST_STATUS/REVIEW_RESULT alone project NOTHING.
+
+    This is the trap behind the real RESULT_UNAVAILABLE notification: a producer
+    emitting only status lines gets no message body at all.
+    """
+    only_display = (
+        "KANBAN_STATUS=PASS\n"
+        "PYTEST_STATUS=PASSED\n"
+        "REVIEW_RESULT=CLEAN\n"
+    )
+    assert _completed_summary_lines(only_display) == []
+
+
+def test_missing_next_step_fails_closed():
+    assert _completed_summary_lines("SUMMARY=checks passed") == []
+
+
+def test_missing_outcome_fails_closed():
+    assert _completed_summary_lines("NEXT_STEP=done") == []
+
+
+def test_free_prose_still_fails_closed():
+    """Legacy prose must NOT be projected — consumer stays fail-closed."""
+    prose = (
+        "Read-only offline verification passed in the exact worktree. HEAD held at "
+        "5cb85df646ce1bb3db802e120aee3324551bcfb4 before and after."
+    )
+    assert _completed_summary_lines(prose) == []
+
+
+# ------------------------------------------------------------- typed enums
+
+def test_typed_enum_values_are_enforced():
+    ok = "SUMMARY=checks passed\nNEXT_STEP=done\nPYTEST_STATUS=PASSED"
+    bad = "SUMMARY=checks passed\nNEXT_STEP=done\nPYTEST_STATUS=1 passed"
+    assert _completed_summary_lines(ok)
+    # An invalid typed value is dropped; the remaining valid pair still projects.
+    assert "1 passed" not in "\n".join(_completed_summary_lines(bad))
+
+
+def test_verified_ok_is_not_a_kanban_status_member():
+    """VERIFIED_OK is not a KANBAN_STATUS choice — the contract must not use it."""
+    assert "VERIFIED_OK" not in _COMPLETION_TYPED_CHOICES["KANBAN_STATUS"]
+    payload = "SUMMARY=checks passed\nNEXT_STEP=done\nKANBAN_STATUS=VERIFIED_OK"
+    assert "VERIFIED_OK" not in "\n".join(_completed_summary_lines(payload))
+
+
+@pytest.mark.parametrize("bad_next", ["none", "nothing required", "no further action"])
+def test_intuitive_next_step_values_are_rejected_by_the_allowlist(bad_next):
+    """Documents WHY the contract prescribes ``done`` and not ``none``.
+
+    If this ever starts passing, the allowlist widened — exactly the change this
+    task forbids — so fail loudly and re-decide the contract.
+    """
+    assert _completed_summary_lines(f"SUMMARY=checks passed\nNEXT_STEP={bad_next}") == []
+
+
+# ------------------------------------------------------------- safety
+
+@pytest.mark.parametrize("payload", [
+    "SUMMARY=<HOME>/private/result.txt\nNEXT_STEP=done",
+    "SUMMARY=token REDACTED_CREDENTIAL_LITERAL\nNEXT_STEP=done",
+    "SUMMARY=Traceback most recent call last\nNEXT_STEP=done",
+    "SUMMARY=raw log ERROR unexpected failure\nNEXT_STEP=done",
+])
+def test_sensitive_or_raw_content_is_blocked(payload):
+    rendered = "\n".join(_completed_summary_lines(payload))
+    assert "ghp_" not in rendered
+    assert "<HOME>" not in rendered
+    assert "Traceback" not in rendered
+    # A blocked payload must not leak through as a partially rendered line.
+    assert rendered == ""
+
+
+# ------------------------------------------------------------- producer
+
+def test_kanban_complete_schema_documents_contract_shape():
+    text = _text(KANBAN_COMPLETE_SCHEMA)
+    for field in REQUIRED + ("KANBAN_STATUS", "PYTEST_STATUS", "REVIEW_RESULT"):
+        assert field in text, f"kanban_complete must document {field}"
+    # The old prose instruction is what produced the opaque handoffs.
+    assert "Human-readable handoff, 1-3 sentences" not in text
+
+
+def test_contract_example_projects_through_the_real_consumer(tmp_path):
+    """THE round-trip guard: the contract's own example must be projectable.
+
+    A worker copies the example verbatim. If the example uses a field name or
+    value the notifier rejects, the contract silently teaches the exact failure
+    it exists to prevent. This test caught a real instance of that (an
+    allowlisted-word violation in the example prose) during development.
+    """
+    from hermes_cli.kanban_db import completion_handoff_contract_lines
+
+    block = completion_handoff_contract_lines()
+    start = block.index("```")
+    example = "\n".join(block[start + 1 : block.index("```", start + 1)])
+
+    projected = _completed_summary_lines(example)
+    assert projected, (
+        "the contract's own example does not project — the worker would copy "
+        "a handoff that degrades to RESULT_UNAVAILABLE"
+    )
+    assert "RESULT_UNAVAILABLE" not in "\n".join(projected)
+
+    # Every field named in the example must be consumer-known.
+    for line in example.splitlines():
+        if "=" in line:
+            key = line.split("=", 1)[0].strip()
+            assert key in _COMPLETION_FIELDS, f"example names unknown field {key}"
+
+
+def test_worker_context_carries_contract_block(tmp_path):
+    conn = kb.connect(tmp_path / "board.db")
+    try:
+        task_id = kb.create_task(conn, title="contract task", assignee="default")
+        context = kb.build_worker_context(conn, task_id)
+        for field in REQUIRED:
+            assert field in context
+        assert "COMPLETION_HANDOFF_CONTRACT_V1" in context
+    finally:
+        conn.close()
+
+
+def test_contract_tells_worker_to_keep_summary_short_and_plain():
+    """The contract must warn that a long/technical SUMMARY is withheld.
+
+    t_220017aa run 17 supplied a 258-char technical SUMMARY whose words fell
+    outside the notifier's narrow allowlist, so the value was dropped even after
+    the field survived serialization. The contract has to steer the worker away
+    from that shape, and point the detail at ``result`` instead.
+    """
+    from hermes_cli.kanban_db import completion_handoff_contract_lines
+
+    text = "\n".join(completion_handoff_contract_lines())
+    assert "result" in text, "contract must route detail to the free-text result"
+    lowered = text.lower()
+    for phrase in ("short", "allowlist"):
+        assert phrase in lowered, f"contract must mention {phrase!r}"
+
+
+def test_contract_example_value_is_allowlist_clean():
+    """Every text value in the example must survive the REAL value allowlist.
+
+    Field-level projection (the round-trip test) only proves the SHAPE. This
+    proves the VALUES, which is the second half of the t_220017aa failure.
+    """
+    from gateway.kanban_watchers_notifier import _safe_completion_value
+    from hermes_cli.kanban_db import completion_handoff_contract_lines
+
+    block = completion_handoff_contract_lines()
+    start = block.index("```")
+    example = "\n".join(block[start + 1 : block.index("```", start + 1)])
+
+    for line in example.splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key, value = key.strip(), value.strip()
+        if key in ("SUMMARY", "NEXT_STEP", "BLOCKERS"):
+            assert _safe_completion_value(value) is not None, (
+                f"contract example value for {key} is rejected by the value "
+                f"allowlist — a worker copying it degrades to RESULT_UNAVAILABLE"
+            )
+
+
+# ------------------------------------------------------------- binding
+
+def test_task_run_event_binding_unchanged(tmp_path):
+    """Contract-shaped completion must not disturb task/run/event binding."""
+    conn = kb.connect(tmp_path / "board.db")
+    try:
+        task_id = kb.create_task(conn, title="binding", assignee="default")
+        assert kb.claim_task(conn, task_id, claimer="tester") is not None
+        run_row = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        run_id = run_row["current_run_id"]
+        assert run_id is not None
+        assert kb.complete_task(
+            conn, task_id, summary=CONFORMING, expected_run_id=run_id,
+        )
+        ev = conn.execute(
+            "SELECT task_id, run_id, kind FROM task_events "
+            "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        assert tuple(ev) == (task_id, run_id, "completed")
+    finally:
+        conn.close()

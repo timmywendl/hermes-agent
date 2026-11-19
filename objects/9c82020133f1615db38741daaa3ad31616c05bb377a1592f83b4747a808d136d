@@ -1,0 +1,82 @@
+# Hermes Dashboard TCC Host (macOS 27)
+
+A minimal, code-signed macOS app bundle whose only job is to give the Hermes Dashboard a **stable
+bundle identity**, so macOS can attribute a TCC *Files & Folders* grant to an app instead of to a
+bare interpreter.
+
+## Why this exists
+
+Apple's macOS 27 release notes (issue 184660124) state that a process **without a bundle ID** cannot
+be granted App Data access belonging to another developer's application. That is exactly the
+Dashboard's Chrome DevTools MCP path:
+
+```
+launchd -> Hermes Dashboard -> chrome-devtools-mcp (node) -> existing Chrome
+```
+
+The MCP `node` process must read `~/Library/Application Support/Google/Chrome/DevToolsActivePort`.
+Its TCC responsible host was first uv's `python3.11`, then `/usr/bin/osascript` after the wrapper
+repair. Both are bundle-less, so the **Google Chrome toggle in System Settings appears and then
+silently reverts**, and `list_pages` keeps failing with `EPERM` presented as a missing file.
+
+This bundle is the fix: a real bundle identifier plus a real code signature, registered through
+Apple's own `SMAppService` LaunchAgent API.
+
+## Layout
+
+```
+HermesDashboardHost.app/Contents/
+    Info.plist                              CFBundleIdentifier + LSUIElement
+    MacOS/hermes-dashboard-host             signed executable
+    Library/LaunchAgents/
+        ai.hermes.dashboard.host.plist      SMAppService-embedded LaunchAgent
+```
+
+The LaunchAgent uses `BundleProgram` (app-relative, SMAppService-only) plus
+`BundleProgramArguments`, so launchd spawns the **signed app**, and the app `execv`s the Dashboard in
+place. The chain stays `app -> Dashboard python -> node (MCP)`, and the app remains the responsible
+process for every descendant through daemonization and restarts.
+
+## Build
+
+```bash
+$HERMES_PYTHON macos/dashboard-host/build_host.py \
+  --output /path/to/HermesDashboardHost.app \
+  --identity "Apple Development: <REDACTED_EMAIL> (55H59PZG2Z)" \
+  --child-executable "$HERMES_ROOT/venv/bin/hermes" \
+  --child-arg dashboard --child-arg=--port --child-arg 9119 \
+  --child-arg=--host --child-arg 127.0.0.1 --child-arg=--no-open \
+  --stdout-path "$HERMES_HOME/logs/dashboard.log" \
+  --stderr-path "$HERMES_HOME/logs/dashboard.error.log" \
+  --working-directory "$HOME" \
+  --env PATH=/usr/bin:/bin --env VIRTUAL_ENV="$HERMES_ROOT/venv" --env HERMES_HOME="$HERMES_HOME"
+```
+
+## Boundaries
+
+- **Does not** implement a second Dashboard, Hermes, Gateway or browser framework.
+- **Does not** touch `TCC.db`, Full Disk Access, Chrome, profiles/cookies, or the Gateway.
+- **Does not** call `launchctl`. Building produces an artifact; lifecycle is the activation script's
+  job, and the two are reviewed as separate units.
+- **Does not** register itself on build. `--register` / `--unregister` / `--status` are explicit modes.
+
+## Modes
+
+| Mode | Purpose |
+|---|---|
+| `--status` | Report bundle id and service status (verifiable fields only) |
+| `--register` | Register the embedded agent with `SMAppService` |
+| `--unregister` | Unregister it |
+| `--show-agent` | Print the resolved embedded plist path |
+| `--child-exec -- <argv>` | What launchd runs: validate then `execv` the Dashboard |
+
+`--child-exec` accepts only a Hermes entrypoint (`venv/bin/hermes`, or `python -m hermes_cli.main`)
+followed by `dashboard`/`serve` and an explicit option allowlist. Unknown options, lifecycle flags,
+positional arguments, relative paths and non-Hermes executables are refused, so an edited plist
+cannot turn the signed app into a general-purpose launcher.
+
+## Status honesty
+
+`SMAppService.status` is **not** sufficient evidence of registration — an unindexed bundle can report
+a non-`NotFound` status with nothing registered. Verify with `sfltool dumpbtm`, the launchd job's
+program path, and the live TCC responsible process instead.

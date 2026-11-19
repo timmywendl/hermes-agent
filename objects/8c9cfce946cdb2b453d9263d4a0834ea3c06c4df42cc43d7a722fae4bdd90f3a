@@ -1,0 +1,209 @@
+"""COMPLETION_HANDOFF_CONTRACT_V1 — the worker-side completion handoff contract.
+
+Issue #92 follow-up. The Telegram completion notification for a real task
+(t_9af856de, run 16) arrived as ``RESULT_UNAVAILABLE`` even though
+``task_runs.summary`` held a real result. Root cause is a producer/consumer
+contract gap, not a data gap:
+
+* the consumer (``gateway/kanban_watchers_notifier._completed_summary_lines``)
+  accepts ONLY field-shaped lines (``KEY=value`` / ``KEY: value``) whose key is
+  in ``_COMPLETION_FIELDS``, and fails closed to ``RESULT_UNAVAILABLE`` otherwise;
+* the producer side (``kanban_complete`` tool schema + worker context) tells the
+  worker to submit FREE PROSE ("human-readable 1-3 sentence description"),
+  and nothing ever tells it the field shape exists.
+
+So every real completion notification fell back to RESULT_UNAVAILABLE. These
+tests pin the contract on the PRODUCER side:
+
+1. the worker context renders an explicit completion-handoff contract block;
+2. the ``kanban_complete`` tool schema documents the same field shape;
+3. a structured handoff written per that contract is safely projectable by the
+   REAL notifier projector (imported, not reimplemented);
+4. non-conforming prose stays an explicit safe failure, never a silent guess;
+5. sensitive content still fails closed;
+6. the contract does not disturb task/run/event binding.
+
+The consumer's fail-closed behaviour, allowlist, and Telegram sanitizer are
+deliberately NOT modified by this change.
+"""
+from __future__ import annotations
+
+import json
+import sqlite3
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from gateway.kanban_watchers_notifier import _completed_summary_lines
+
+
+@pytest.fixture()
+def conn(tmp_path):
+    db = tmp_path / "kanban.db"
+    c = kb.connect(str(db))
+    kb.init_db(c)
+    yield c
+    c.close()
+
+
+# --------------------------------------------------------------------------
+# 1. Worker context carries the contract
+# --------------------------------------------------------------------------
+
+def test_worker_context_renders_completion_handoff_contract(conn):
+    """A dispatched worker must be TOLD the handoff shape, not left to guess it."""
+    tid = kb.create_task(conn, title="Offline verify docs", assignee="default")
+    ctx = kb.build_worker_context(conn, tid)
+
+    assert "COMPLETION_HANDOFF_CONTRACT_V1" in ctx
+    # The four required fields, verbatim, so the worker can copy the shape.
+    for field in ("STATUS", "SUMMARY", "TESTS", "NEXT_STEP"):
+        assert field in ctx, f"worker context must name required field {field}"
+
+
+def test_worker_context_contract_fields_are_consumer_known(conn):
+    """Every field the context advertises must be one the notifier can project.
+
+    This is the actual regression guard: if either side renames a field, the
+    notification silently degrades to RESULT_UNAVAILABLE. Fail loudly here.
+    """
+    from gateway.kanban_watchers_notifier import _COMPLETION_FIELDS
+
+    tid = kb.create_task(conn, title="Field agreement", assignee="default")
+    ctx = kb.build_worker_context(conn, tid)
+
+    for field in ("STATUS", "SUMMARY", "TESTS", "NEXT_STEP", "COMMIT", "REVIEW", "BLOCKERS"):
+        assert field in _COMPLETION_FIELDS, (
+            f"contract field {field} is not projectable by the notifier "
+            f"(not in _COMPLETION_FIELDS) — the two sides have drifted"
+        )
+        assert field in ctx
+
+
+# --------------------------------------------------------------------------
+# 2. The tool schema documents the same shape
+# --------------------------------------------------------------------------
+
+def test_kanban_complete_schema_documents_contract():
+    """The tool description is the producer prompt; it must state the contract."""
+    from tools.kanban_tools_schemas import KANBAN_COMPLETE_SCHEMA
+
+    description = KANBAN_COMPLETE_SCHEMA["function"]["description"]
+    assert "STATUS" in description and "NEXT_STEP" in description, (
+        "kanban_complete description must document the field-shaped handoff "
+        "so the worker does not emit free prose"
+    )
+    # The field shape must also be spelled out on the summary property itself,
+    # which is what the model actually reads when filling the parameter.
+    summary_desc = KANBAN_COMPLETE_SCHEMA["function"]["parameters"]["properties"]["summary"]["description"]
+    assert "STATUS" in summary_desc and "NEXT_STEP" in summary_desc, (
+        "the summary parameter description must carry the contract shape"
+    )
+
+
+# --------------------------------------------------------------------------
+# 3. A conforming handoff IS projectable by the real consumer
+# --------------------------------------------------------------------------
+
+def test_structured_handoff_is_projectable_by_real_notifier():
+    """STATUS/SUMMARY/TESTS/NEXT_STEP must survive the real projector."""
+    summary = (
+        "STATUS=VERIFIED_OK\n"
+        "SUMMARY=completion handoff contract verified\n"
+        "TESTS=1 passed\n"
+        "NEXT_STEP=none\n"
+    )
+    lines = _completed_summary_lines(summary)
+    joined = "\n".join(lines)
+
+    assert lines, "a contract-conforming handoff must not fall back to RESULT_UNAVAILABLE"
+    assert "RESULT_UNAVAILABLE" not in joined
+    assert "VERIFIED_OK" in joined or "STATUS" in joined
+
+
+# --------------------------------------------------------------------------
+# 4. Non-conforming prose stays an explicit, visible failure
+# --------------------------------------------------------------------------
+
+def test_free_prose_does_not_silently_project():
+    """Legacy free prose must fail closed — unchanged consumer behaviour."""
+    prose = (
+        "Read-only offline verification passed in the exact worktree. HEAD held at "
+        "5cb85df646ce1bb3db802e120aee3324551bcfb4 before and after."
+    )
+    assert _completed_summary_lines(prose) == [], (
+        "free prose must NOT be projected; the consumer stays fail-closed"
+    )
+
+
+def test_legacy_prose_summary_still_recorded_by_kernel(conn):
+    """Prose is still accepted as a run handoff (no new requirement, no breakage).
+
+    The contract changes what we TELL the worker, not what the kernel accepts:
+    a legacy prose summary must still complete the task and land on the run.
+    """
+    tid = kb.create_task(conn, title="Legacy prose", assignee="default")
+    run_id = kb.claim_task(conn, tid, "tester")
+    ok = kb.complete_task(
+        conn, tid, summary="legacy prose handoff, kept for compatibility",
+        expected_run_id=run_id,
+    )
+    assert ok is True
+    run = conn.execute(
+        "SELECT summary FROM task_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    assert run["summary"]
+
+
+# --------------------------------------------------------------------------
+# 5. Sensitive content still fails closed
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("secret", [
+    "STATUS=VERIFIED_OK\nSUMMARY=<HOME>/.hermes/hermes-agent/hermes_cli/kanban.py\nNEXT_STEP=none",
+    "STATUS=VERIFIED_OK\nSUMMARY=token REDACTED_CREDENTIAL_LITERAL\nNEXT_STEP=none",
+    "STATUS=VERIFIED_OK\nSUMMARY=Authorization: Bearer sk-abcdefghijklmnopqrstuvwxyz012345\nNEXT_STEP=none",
+    "STATUS=VERIFIED_OK\nSUMMARY=raw log ERROR Traceback most recent call last\nNEXT_STEP=none",
+])
+def test_sensitive_handoff_content_fails_closed(secret):
+    """Field shape must never become a bypass for the safety projection."""
+    joined = "\n".join(_completed_summary_lines(secret))
+    assert "ghp_" not in joined
+    assert "sk-abcdefghijklmnopqrstuvwxyz012345" not in joined
+    assert "<HOME>" not in joined
+    assert "Traceback" not in joined
+
+
+# --------------------------------------------------------------------------
+# 6. Real task path: contract does not disturb binding
+# --------------------------------------------------------------------------
+
+def test_contract_does_not_alter_task_run_event_binding(conn):
+    """The completion path (task -> run -> completed event) stays intact."""
+    tid = kb.create_task(conn, title="Binding intact", assignee="default")
+    run_id = kb.claim_task(conn, tid, "tester")
+    kb.complete_task(
+        conn, tid,
+        summary="STATUS=VERIFIED_OK\nSUMMARY=handoff contract\nTESTS=1 passed\nNEXT_STEP=none",
+        expected_run_id=run_id,
+    )
+
+    task = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert task["status"] == "done"
+
+    run = conn.execute(
+        "SELECT id, task_id, outcome FROM task_runs WHERE id=?", (run_id,)
+    ).fetchone()
+    assert run["task_id"] == tid
+    assert run["outcome"] == "completed"
+
+    ev = conn.execute(
+        "SELECT id, task_id, run_id, kind FROM task_events "
+        "WHERE task_id=? AND kind='completed' ORDER BY id DESC LIMIT 1",
+        (tid,),
+    ).fetchone()
+    assert ev is not None
+    assert ev["task_id"] == tid
+    assert ev["run_id"] == run_id

@@ -1,0 +1,430 @@
+"""Regressions: a review that cannot produce a verdict must never read as PASS.
+
+The reproduced gap (offline, synthetic rows only): a reviewer run claimed out of
+the review lane is stored ``running``; every failure path recomputed the lane
+from that run row and returned ``ready``, so a reviewer that died without a
+verdict silently demoted the card into the IMPLEMENTATION lane, where the next
+``kanban_complete`` was an unqualified approval. A provider 503 / quota wall was
+classified ``rate_limited`` and exempted from the failure budget, so it
+requeued the same reviewer forever, and no diagnostic kind existed to tell the
+Human.
+
+Contracts pinned here:
+
+1. A reviewer terminating with no verdict (clean exit / crash / timeout /
+   rate-limit exit) leaves the card in the REVIEW lane, not ``ready``.
+2. Repeated no-verdict terminations consume the existing bounded budget and
+   then auto-block ``needs_input`` with the review context in the reason; the
+   card is not respawned forever.
+3. A review run cannot reach ``done`` without an explicit ``approved`` verdict;
+   a verdictless ``kanban_complete`` is refused and the card is untouched.
+4. A normal approve still completes; ``request_changes`` still routes to the
+   implementer; review dispatch caps / the ``review_dispatch`` gate are intact.
+5. The ``review_no_verdict`` diagnostic fires for the parked card and not for
+   healthy review cards.
+6. ``init_db`` upgrades a board created before the column existed.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_diagnostics as kd
+
+
+@pytest.fixture
+def home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    return hermes_home
+
+
+def _events(conn, tid, kind=None):
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id = ? ORDER BY id", (tid,),
+    ).fetchall()
+    out = [(r["kind"], json.loads(r["payload"]) if r["payload"] else None) for r in rows]
+    return [e for e in out if e[0] == kind] if kind is not None else out
+
+
+def _new_review(conn, title="review me", reviewer="reviewer"):
+    """An implementation that handed off to review, now waiting there."""
+    tid = kb.create_task(conn, title=title, assignee="builder")
+    impl = kb.claim_task(conn, tid, claimer="builder:1")
+    assert impl is not None
+    assert kb.request_review(
+        conn, tid, summary="impl ready", reviewer=reviewer,
+        expected_run_id=impl.current_run_id,
+    )
+    return tid
+
+
+def _reviewer_death(conn, tid, *, exit_code=None, pid=71000):
+    """Claim from the review lane, plant a dead worker pid, reap it.
+
+    ``exit_code`` is what the authority recorded for the run: ``None`` models a
+    plain crash (no trailer), 0 a clean exit without a terminal kanban call,
+    ``KANBAN_RATE_LIMIT_EXIT_CODE`` a 503/quota wall.
+    """
+    _kbd = kbd
+    claimed = kb.claim_review_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:r0")
+    assert claimed is not None, "reviewer run was not claimed"
+    conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (pid, tid))
+    conn.commit()
+    if exit_code is not None:
+        _kbd._record_worker_exit(pid, _exited_status(exit_code))
+    _kbd.detect_crashed_workers(conn)
+    return claimed
+
+
+def _exited_status(code: int):
+    """A waitpid-style status for a normally-exited child."""
+    return code << 8
+
+
+# ---------------------------------------------------------------------------
+# Gate 1: no-verdict terminations keep the card in the review lane
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("exit_code", [None, 0, kb.KANBAN_RATE_LIMIT_EXIT_CODE],
+                         ids=["crash", "clean-no-terminal-call", "rate-limited-503"])
+def test_no_verdict_reviewer_death_stays_in_review_lane(home, monkeypatch, exit_code):
+    """Every no-verdict death — crash, silent clean exit, quota wall — leaves the
+    card in ``review``. On base all three fell back to ``ready``, which is how a
+    half-reviewed card re-entered the implementation lane."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        _reviewer_death(conn, tid, exit_code=exit_code)
+        task = kb.get_task(conn, tid)
+        assert task.status == "review", (
+            f"a reviewer that produced no verdict must stay in review, got {task.status!r}"
+        )
+        assert task.review_lane_pending is True
+
+
+def test_pending_review_flag_cleared_by_approve(home):
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        assert kb.get_task(conn, tid).review_lane_pending is True
+        assert kb.complete_task(
+            conn, tid, summary="Reviewed and approved.",
+            metadata={"review_outcome": "approved"},
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        assert task.review_lane_pending is False
+
+
+def test_pending_review_flag_cleared_by_request_changes(home):
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        ok, implementer = kb.request_changes(
+            conn, tid, reason="fix X", expected_run_id=claimed.current_run_id,
+        )
+        assert ok is True and implementer == "builder"
+        assert kb.get_task(conn, tid).review_lane_pending is False
+
+
+def test_pending_review_flag_cleared_by_escalate_block(home):
+    """A reviewer's ``kanban_block`` (escalate) IS a terminal review exit."""
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        assert kb.block_task(
+            conn, tid, reason="escalation: a human must decide",
+            kind="needs_input", expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.review_lane_pending is False
+
+
+# ---------------------------------------------------------------------------
+# Gate 2: the existing bounded budget trips -> needs_input escalation
+# ---------------------------------------------------------------------------
+
+
+def test_repeated_no_verdict_reviews_trip_budget_and_escalate(home, monkeypatch):
+    """The SAME ``consecutive_failures`` budget as any other lane, then a typed
+    ``needs_input`` park carrying the review context. On base the loop was
+    unbounded: a rate-limited reviewer requeued forever and nothing blocked."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kbc.connect() as conn:
+        tid = _new_review(conn, title="trip the review budget")
+        conn.execute("UPDATE tasks SET max_retries = 2 WHERE id = ?", (tid,))
+        conn.commit()
+
+        _reviewer_death(conn, tid, exit_code=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        assert kb.get_task(conn, tid).status == "review", "first death is below budget"
+
+        _reviewer_death(conn, tid, exit_code=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked", f"budget spent must park the card, got {task.status!r}"
+        assert task.block_kind == "needs_input"
+        assert task.consecutive_failures == 2
+
+        # The reason must name the card, the branch/HEAD under review, the
+        # terminal failure class, and the Human's next action.
+        reason = task.last_failure_error or ""
+        assert tid in reason
+        assert "503" in reason or "quota" in reason
+        blocked = _events(conn, tid, "blocked")
+        assert blocked, "the escalation must be auditable"
+        payload = blocked[-1][1]
+        assert payload["kind"] == "needs_input"
+        assert payload["review_no_verdict"] is True
+        detail = payload["reason"]
+        assert tid in detail and "branch" in detail and "@" in detail
+        assert "hermes kanban complete" in detail and "request-changes" in detail
+
+
+def test_rate_limited_reviewer_death_is_charged_to_the_budget(home, monkeypatch):
+    """The rate-limit exit was explicitly EXEMPT from the failure budget. On a
+    REVIEW card it now counts, because a review lane that cannot produce a
+    verdict is a real defect, not a neutral quota wall."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        _reviewer_death(conn, tid, exit_code=kb.KANBAN_RATE_LIMIT_EXIT_CODE)
+        assert kb.get_task(conn, tid).consecutive_failures == 1
+
+
+def test_implementation_rate_limit_still_never_charges_the_budget(home, monkeypatch):
+    """Gate E: the non-review lanes are untouched — a 503 on implementation work
+    still requeues without counting a failure."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="impl", assignee="builder")
+        assert kb.claim_task(conn, tid, claimer=f"{kb._claimer_id().split(':', 1)[0]}:w0")
+        conn.execute("UPDATE tasks SET worker_pid = 71000 WHERE id = ?", (tid,))
+        conn.commit()
+        kbd._record_worker_exit(71000, _exited_status(kb.KANBAN_RATE_LIMIT_EXIT_CODE))
+        kbd.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.consecutive_failures == 0
+
+
+# ---------------------------------------------------------------------------
+# Gate 3: no review run reaches done without an explicit approved verdict
+# ---------------------------------------------------------------------------
+
+
+def test_verdictless_complete_is_refused_on_a_review_card(home):
+    """On base the second reviewer's ``kanban_complete`` was accepted -> ``done``
+    with no verdict at all. Now it is refused and the card is untouched."""
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        with pytest.raises(kb.ReviewVerdictRequiredError) as excinfo:
+            kb.complete_task(
+                conn, tid, summary="Reviewed and approved.",
+                expected_run_id=claimed.current_run_id,
+            )
+        assert "review_outcome" in str(excinfo.value)
+        task = kb.get_task(conn, tid)
+        assert task.status == "running", "a refusal must not mutate the card"
+        assert task.current_run_id == claimed.current_run_id
+        assert _events(conn, tid, "completion_blocked_no_verdict")
+
+
+def test_non_approved_verdicts_cannot_close_to_done(home):
+    """``changes_requested`` / ``escalate`` must take their own path; marking the
+    card PASS while the review said the opposite is the same bug."""
+    with kbc.connect() as conn:
+        for verdict in ("changes_requested", "escalate", "lgtm"):
+            tid = _new_review(conn, title=f"verdict {verdict}")
+            claimed = kb.claim_review_task(conn, tid)
+            with pytest.raises(kb.ReviewVerdictRequiredError):
+                kb.complete_task(
+                    conn, tid, summary="done", metadata={"review_outcome": verdict},
+                    expected_run_id=claimed.current_run_id,
+                )
+            assert kb.get_task(conn, tid).status == "running"
+
+
+def test_approval_records_the_verdict_in_run_metadata(home):
+    """Part C: the verdict lives in the EXISTING completion metadata, never a
+    second store, and is visible on the closing event."""
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="Verified.", metadata={"review_outcome": "approved"},
+            expected_run_id=claimed.current_run_id,
+        )
+        run = kb.latest_run(conn, tid)
+        assert (run.metadata or {})["review_outcome"] == "approved"
+        completed = _events(conn, tid, "completed")
+        assert completed[-1][1]["review_outcome"] == "approved"
+
+
+def test_kanban_complete_schema_requires_a_review_verdict():
+    """The model chooses here, so the tool description must state the obligation."""
+    from tools.kanban_tools_schemas import KANBAN_COMPLETE_SCHEMA
+    description = KANBAN_COMPLETE_SCHEMA["description"]
+    assert "review_outcome" in description
+    assert "approved" in description
+    assert "refused" in description
+
+
+# ---------------------------------------------------------------------------
+# Gate 4: the normal paths are unchanged
+# ---------------------------------------------------------------------------
+
+
+def test_normal_approve_still_completes(home):
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="Approved after independent verification.",
+            metadata={"review_outcome": "approved"},
+            expected_run_id=claimed.current_run_id,
+        )
+        assert kb.get_task(conn, tid).status == "done"
+
+
+def test_normal_request_changes_routes_to_the_implementer(home):
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        ok, detail = kb.request_changes(
+            conn, tid, reason="fix the guard", expected_run_id=claimed.current_run_id,
+        )
+        assert ok is True and detail == "builder"
+        task = kb.get_task(conn, tid)
+        assert task.assignee == "builder"
+        assert task.status in ("ready", "todo")
+
+
+def test_review_dispatch_gate_and_caps_unchanged(home, monkeypatch):
+    """The ``review_dispatch`` config gate still decides whether the review lane
+    is dispatched at all (Gate E: caps/reservation/gate untouched)."""
+    # The dispatcher refuses to spawn an assignee that is not an installed profile.
+    for name in ("builder", "reviewer"):
+        profile = home / "profiles" / name
+        profile.mkdir(parents=True, exist_ok=True)
+        (profile / "config.yaml").write_text("{}\n")
+    with kbc.connect() as conn:
+        tid = _new_review(conn, title="gated review")
+        spawned: list[str] = []
+
+        def spawn(task, workspace, board=None):
+            spawned.append(task.id)
+            return 42
+
+        monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: False)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert tid not in spawned, "review_dispatch=False must not spawn reviewers"
+
+        monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+        kbd.dispatch_once(conn, spawn_fn=spawn)
+        assert tid in spawned, "review_dispatch=True must still spawn the reviewer"
+        assert kb.get_task(conn, tid).review_lane_pending is True
+
+
+# ---------------------------------------------------------------------------
+# Gate 5: the new diagnostic fires for the parked card only
+# ---------------------------------------------------------------------------
+
+
+def test_review_no_verdict_diagnostic_fires_for_parked_card_only(home, monkeypatch):
+    """The parked card surfaces as Human attention (task id, branch, HEAD, last
+    failure class); a healthy review card raises nothing. No second diagnostics
+    surface — the rule lives in the existing engine."""
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    with kbc.connect() as conn:
+        # Healthy: a review card simply waiting for a reviewer.
+        healthy_review = _new_review(conn, title="healthy review")
+        # Parked: drive the real breaker to exhaustion on a review card.
+        parked = _new_review(conn, title="parked review")
+        conn.execute("UPDATE tasks SET max_retries = 1 WHERE id = ?", (parked,))
+        conn.commit()
+        _reviewer_death(conn, parked, exit_code=0)
+        assert kb.get_task(conn, parked).status == "blocked"
+
+        def kinds(tid):
+            task = kb.get_task(conn, tid)
+            return {d.kind: d for d in kd.compute_task_diagnostics(
+                task, kb.list_events(conn, tid), kb.list_runs(conn, tid),
+            )}
+
+        parked_kinds = kinds(parked)
+        assert "review_no_verdict" in parked_kinds
+        diag = parked_kinds["review_no_verdict"]
+        assert diag.severity == "error"
+        assert parked in diag.detail or parked in diag.title
+        assert diag.data["task_id"] == parked
+        assert diag.data["failure_class"]
+        assert "branch" in diag.data and "head" in diag.data
+        assert diag.actions, "an operator-fixable signal needs a recovery action"
+
+        assert "review_no_verdict" not in kinds(healthy_review), (
+            "a healthy review card must not raise the parked-review diagnostic"
+        )
+
+
+def test_review_no_verdict_diagnostic_ignores_a_done_review(home):
+    with kbc.connect() as conn:
+        tid = _new_review(conn)
+        claimed = kb.claim_review_task(conn, tid)
+        assert kb.complete_task(
+            conn, tid, summary="ok", metadata={"review_outcome": "approved"},
+            expected_run_id=claimed.current_run_id,
+        )
+        task = kb.get_task(conn, tid)
+        kinds = {d.kind for d in kd.compute_task_diagnostics(
+            task, kb.list_events(conn, tid), kb.list_runs(conn, tid),
+        )}
+        assert "review_no_verdict" not in kinds
+
+
+# ---------------------------------------------------------------------------
+# Gate 6 (implementation): the column migrates onto an older board
+# ---------------------------------------------------------------------------
+
+
+def test_init_db_upgrades_a_board_predating_review_lane_pending(home):
+    import sqlite3
+
+    path = kb.kanban_db_path()
+    # Simulate a board written before the column existed.
+    raw = sqlite3.connect(path)
+    raw.executescript(kb.SCHEMA_SQL)
+    raw.execute("ALTER TABLE tasks DROP COLUMN review_lane_pending")
+    raw.execute(
+        "INSERT INTO tasks (id, title, status, created_at) VALUES ('t_legacy', 'old', 'review', 1)"
+    )
+    raw.commit()
+    columns = {r[1] for r in raw.execute("PRAGMA table_info(tasks)")}
+    assert "review_lane_pending" not in columns, "fixture must start pre-column"
+    raw.close()
+
+    kb.init_db()  # <- the upgrade path
+
+    raw = sqlite3.connect(path)
+    columns = {r[1] for r in raw.execute("PRAGMA table_info(tasks)")}
+    assert "review_lane_pending" in columns, "init_db must add the missing column"
+    defaulted = raw.execute(
+        "SELECT review_lane_pending FROM tasks WHERE id = 't_legacy'"
+    ).fetchone()[0]
+    assert defaulted == 0, "pre-existing rows must read as 'owed no verdict'"
+    raw.close()

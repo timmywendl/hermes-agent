@@ -11,7 +11,8 @@ Manifest v1 (all paths absolute/canonical; no real credentials):
   expires_at=Unix seconds; root=<private temporary directory>; namespace=q1-<32hex>;
   binaries={limactl,ssh,sandbox,python,lsof,git,scutil}: {path,sha256}; artifacts={image,policy,
   identity,known_hosts,guestagent}: {path,sha256}; policies={M1..M6}: {path,sha256};
-  dns_control={server:'127.0.0.1',port:53,suffix:'q1.test.',exclusive_host_lease:decision_ref};
+  dns_control={server:'127.0.0.1',port:53,suffix:'q1.test.',exclusive_host_lease:decision_ref,
+    host_bind_privilege:{effective_uid:0,decision_ref:decision_ref,scope:'EXCLUSIVE_DNS_NODE_AND_CHILDREN'}};
   guest_user; guest_python=/usr/bin/python3; ssh_port>1024; host_ipv6=<local ULA>;
   guest_gateway=192.168.5.2; resources={cpus:2,memory_gib:4,disk_gib:12};
   deadlines={start:180,stop:45,probe:5,total:2700}; allowed_nodeids=[exact nodeids].
@@ -20,6 +21,22 @@ Policies are externally approved frozen artifacts, NOT generated/compiled here
 until a future authorized native execution. Mutant policies must also be approved.
 M1 is deliberately unconfined, but still uses the closed offline VM config and
 only disposable local canaries. No arbitrary internet target or model route.
+Before invoking pytest (INCLUDING collection), the operator must run a trusted
+stdlib-only exact-HEAD preflight from OUTSIDE this repository: compare the
+approved Git HEAD; require `git status --porcelain --untracked-files=all` empty;
+reject ignored untracked Python/native-import inputs; unset PYTHONPATH, set
+PYTHONSAFEPATH=1 and use a fresh private PYTHONPYCACHEPREFIX outside the checkout.
+Only after those checks may the existing runner import conftest/tests. Do not
+invoke this module to perform that first preflight: importing it is already too
+late. The PR execution-manifest comment supplies the inline command contract;
+no fourth helper or runner change is required. load_gate repeats the checks
+before native work, but cannot retroactively authenticate collection imports.
+
+DNS port53 requires effective UID0 and an explicit, separate Human D1 decision
+for the exclusive DNS pytest node AND ITS CHILDREN. No automatic sudo/capability
+service is provided. Other native nodes refuse UID0. Missing DNS privilege is
+UNAVAILABLE/NOT_RUN; never count PermissionError as a denied-network PASS.
+
 Missing authorization/capability is NOT_RUN/UNAVAILABLE, never qualification PASS.
 """
 from __future__ import annotations
@@ -39,7 +56,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,8 +146,16 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     assert set(data) == required and type(data['version']) is int and data['version'] == 1
     if sys.flags.optimize:
         raise RuntimeError('UNAVAILABLE: native qualification cannot use python -O')
+    dns_case = nodeid.rsplit('::', 1)[-1] == 'test_native_guest_builtin_dns_cannot_delegate_to_host_resolver'
+    privilege = data['dns_control'].get('host_bind_privilege')
+    if dns_case and (not privilege or os.geteuid() != 0):
+        pytest.skip('UNAVAILABLE/NOT_RUN: DNS port53 needs separately approved effective UID0; never sudo')
+    if not dns_case and os.geteuid() == 0:
+        pytest.skip('UNAVAILABLE/NOT_RUN: root authority is scoped only to the exclusive DNS node')
     assert data['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.',
-                                   'exclusive_host_lease': data['decision_ref']}
+                                   'exclusive_host_lease': data['decision_ref'],
+                                   'host_bind_privilege': {'effective_uid': 0, 'decision_ref': data['decision_ref'],
+                                                           'scope': 'EXCLUSIVE_DNS_NODE_AND_CHILDREN'}}
     assert data['allow_unconfined_controls'] is True, 'native positive/mutant controls need explicit scope'
     assert data['authorization'] == 'STAGE3_Q1_NATIVE_VZ_EXECUTION_V1'
     assert re.fullmatch(r'https://github\.com/[^/]+/[^/]+/(issues|pull)/\d+#issuecomment-\d+',
@@ -173,9 +198,18 @@ def load_gate(nodeid: str) -> dict[str, Any]:
     head = subprocess.run([git, 'rev-parse', 'HEAD'], cwd=repo, env=safe_env,
                           capture_output=True, text=True, timeout=5, check=True)
     assert head.stdout.strip() == data['source_head'], 'execution source HEAD drift'
-    clean = subprocess.run([git, 'status', '--porcelain', '--untracked-files=no'], cwd=repo,
+    clean = subprocess.run([git, 'status', '--porcelain', '--untracked-files=all'], cwd=repo,
                            env=safe_env, capture_output=True, text=True, timeout=5, check=True)
-    assert not clean.stdout, 'tracked source differs from frozen HEAD'
+    assert not clean.stdout, 'source freeze includes tracked and ALL untracked files'
+    ignored = subprocess.run([git, 'ls-files', '--others', '--ignored', '--exclude-standard',
+                              '--', '*.py', '*.pyw', '*.pyc', '*.so', '*.pyd', '*.pth'],
+                             cwd=repo, env=safe_env, capture_output=True, text=True, timeout=5, check=True)
+    assert all('__pycache__' in Path(name).parts and name.endswith('.pyc')
+               for name in ignored.stdout.splitlines()), 'untracked ignored import input'
+    cache = Path(os.environ.get('PYTHONPYCACHEPREFIX', ''))
+    assert cache.is_absolute() and cache.resolve() == cache and cache.is_relative_to(root)
+    assert cache.is_dir() and stat.S_IMODE(cache.stat().st_mode) == 0o700
+    assert not os.environ.get('PYTHONPATH') and os.environ.get('PYTHONSAFEPATH') == '1'
     assert pinned(data['binaries']['python']) == Path(sys.executable).resolve()
     assert set(data['artifacts']) == {'image', 'policy', 'identity', 'known_hosts', 'guestagent'}
     for name, item in data['artifacts'].items():
@@ -216,6 +250,7 @@ class Lab:
     _stop_at: float | None = None
     _events_path: Path = field(default_factory=Path)
     _exec_watch: Any = None
+    process_pins: dict[int, dict[str, Any]] = field(default_factory=dict)
     _stop_receipt: dict[str, Any] = field(default_factory=dict)
     applied_policy: str = ''
     applied_policy_path: Path | None = None
@@ -288,6 +323,8 @@ class Lab:
         self.check_budget()
         assert self.process is None or (self.verified_stop and not self.uncertain)
         self.current_variant = policy
+        self.process_pins = {}
+        self.process_identities = {}
         self.attempt += 1
         self.verified_stop = self.retired = False
         self._stop_at = None
@@ -339,6 +376,8 @@ class Lab:
         assert any(e.fflags & select.KQ_NOTE_EXEC for e in initial_events), 'UNAVAILABLE: missing pre-exec custody'
         if not over_vsock:
             raise AssertionError('vsock fallback must never be admitted')
+        self.watch_process(self.process.pid, parent_pid=os.getpid())
+        self.watch_process(self.driver_pid, parent_pid=self.process.pid)
         self.listener_identity()  # Before accepting any Guest provenance over SSH.
         info = self.ssh_code("import json,os; print(json.dumps({'boot':open('/proc/sys/kernel/random/boot_id').read().strip(),'uid':os.getuid()}))")
         assert info['uid'] != 0 and re.fullmatch('[0-9a-f-]{36}', info['boot'])
@@ -402,12 +441,56 @@ class Lab:
             child = subprocess.Popen(argv, env=self.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=subprocess.PIPE, text=True, close_fds=True, start_new_session=True)
             self.transport_processes.append(child)
-            self.process_identities[child.pid] = psutil.Process(child.pid).create_time()
+            self.watch_process(child.pid, parent_pid=os.getpid())
         except BaseException:
             self.mark_uncertain('transport_acquisition_unknown')
             raise
         self.acquiring = False
         return child
+
+    def watch_process(self, pid: int, *, parent_pid: int) -> None:
+        """Book before reliance; no UID/argv/name-only helper adoption."""
+        try:
+            proc = psutil.Process(pid)
+            parent = psutil.Process(parent_pid)
+            pin = {'birth': proc.create_time(), 'exe': str(Path(proc.exe()).resolve()),
+                   'ppid': proc.ppid(), 'parent_birth': parent.create_time()}
+            assert pin['ppid'] == parent_pid
+            assert parent_pid == os.getpid() or parent_pid in self.process_pins
+            admitted = {self.binary(name) for name in self.gate['binaries']}
+            assert pin['exe'] in admitted, 'unaccounted helper executable'
+            if pid in self.process_pins:
+                assert self.process_pins[pid] == pin, 'tracked process identity drift'
+                return
+            if self._exec_watch is None:
+                self._exec_watch = select.kqueue()
+            self._exec_watch.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                fflags=select.KQ_NOTE_EXEC | select.KQ_NOTE_EXIT)], 0, 0)
+            self.process_pins[pid] = pin
+            self.process_identities[pid] = pin['birth']
+            # Registration races must fail, not silently freeze an unobserved image.
+            self.check_process_inventory()
+        except BaseException:
+            self.mark_uncertain('process_monitor_unavailable_or_drift')
+            raise
+
+    def check_process_inventory(self) -> None:
+        try:
+            assert self._exec_watch is not None, 'process monitor unavailable'
+            events = self._exec_watch.control(None, max(1, len(self.process_pins) * 2), 0)
+            assert not events, 'tracked process exec/exit invalidates identity'
+            for pid, pin in self.process_pins.items():
+                proc = psutil.Process(pid)
+                assert proc.status() != psutil.STATUS_ZOMBIE
+                assert proc.create_time() == pin['birth'], 'PID reuse'
+                assert str(Path(proc.exe()).resolve()) == pin['exe'], 'executable drift'
+                assert proc.ppid() == pin['ppid'], 'parent relationship drift'
+                parent = psutil.Process(pin['ppid'])
+                assert parent.create_time() == pin['parent_birth'], 'parent PID reuse'
+        except BaseException:
+            self.mark_uncertain('process_identity_unknown')
+            raise
 
     def listener_identity(self) -> dict[str, int]:
         driver = psutil.Process(self.driver_pid)
@@ -425,8 +508,10 @@ class Lab:
         assert driver.create_time() == self.process_identities[self.driver_pid]
         assert Path(driver.exe()).resolve() == Path(self.binary('limactl'))
         listener = self.listener_identity()
+        self.check_process_inventory()
         for proc in driver.children(recursive=True):
-            self.process_identities.setdefault(proc.pid, proc.create_time())
+            self.watch_process(proc.pid, parent_pid=proc.ppid())
+        self.check_process_inventory()
         boot = self.ssh_code("import json;print(json.dumps({'boot':open('/proc/sys/kernel/random/boot_id').read().strip()}))")['boot']
         assert boot == self.boot_id, 'actual Guest boot identity drift'
         return {'pid': driver.pid, 'birth': driver.create_time(), 'listener_fd': listener['fd'],
@@ -436,7 +521,7 @@ class Lab:
 
     def assert_identity(self, expected: dict[str, Any] | None = None) -> None:
         assert not self.uncertain and not self.retired
-        assert not self._exec_watch.control(None, 8, 0), 'unexpected exec/exit invalidates custody'
+        self.check_process_inventory()
         actual = self.identity_snapshot()
         assert actual == (expected or self._baseline), 'joint VM/boot/process/FD/policy identity drift'
 
@@ -521,6 +606,34 @@ class Lab:
         return dict(self._stop_receipt)
 
 
+class CallFailureFence:
+    """Pytest resumes yield-fixtures normally even after a failed test call."""
+
+    def __init__(self, lab: Lab, nodeid: str) -> None:
+        self.lab = lab
+        self.nodeid = nodeid
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_call(self, item: pytest.Item) -> Iterator[None]:
+        try:
+            yield
+        except BaseException:
+            if item.nodeid == self.nodeid:
+                self.lab.mark_uncertain('pytest_call_failed_or_interrupted')
+                (self.lab.root.parent / 'STOP_UNCERTAIN').touch(exist_ok=True)
+            raise
+
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_makereport(self, item: pytest.Item,
+                                 call: pytest.CallInfo[Any]) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+        report = yield
+        if item.nodeid == self.nodeid and call.when == 'call' and report.failed:
+            self.lab.mark_uncertain('pytest_call_failed_or_interrupted')
+            (self.lab.root.parent / 'STOP_UNCERTAIN').touch(exist_ok=True)
+        return report
+
+
 @pytest.fixture
 def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
     gate = load_gate(request.node.nodeid)
@@ -542,6 +655,9 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
             json.dump({'case_root': str(root), 'instance_namespace': gate['namespace']}, lease)
             lease.flush()
             os.fsync(lease.fileno())
+        fence = CallFailureFence(lab, request.node.nodeid)
+        request.config.pluginmanager.register(fence, 'q1-fence-' + root.name)
+        request.addfinalizer(lambda: request.config.pluginmanager.unregister(fence))
         try:
             yield lab
         except BaseException:
@@ -563,6 +679,9 @@ def native_lab(request: pytest.FixtureRequest) -> Iterator[Lab]:
                 assert lab.process is None or lab.verified_stop
                 active.unlink()
     finally:
+        if 'lab' in locals() and lab._exec_watch is not None:
+            lab._exec_watch.close()
+            lab._exec_watch = None
         lock.close()
 
 
@@ -873,8 +992,12 @@ def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
     import selectors
     import struct
 
+    if os.geteuid() != 0:
+        pytest.skip('UNAVAILABLE/NOT_RUN: privileged DNS bind requires separately Human-approved UID0')
     assert lab.gate['dns_control'] == {'server': '127.0.0.1', 'port': 53, 'suffix': 'q1.test.',
-                                        'exclusive_host_lease': lab.gate['decision_ref']}
+                                        'exclusive_host_lease': lab.gate['decision_ref'],
+                                        'host_bind_privilege': {'effective_uid': 0, 'decision_ref': lab.gate['decision_ref'],
+                                                                'scope': 'EXCLUSIVE_DNS_NODE_AND_CHILDREN'}}
     config = lab.run([lab.binary('scutil'), '--dns'])
     assert config.returncode == 0
     servers = re.findall(r'nameserver\[\d+\]\s*:\s*(\S+)', config.stdout)
@@ -943,7 +1066,10 @@ def controlled_system_dns(lab: Lab) -> Iterator[list[str]]:
         # No SO_REUSEPORT: if already occupied, refuse instead of adopting a
         # real resolver. Permission denied is UNAVAILABLE, not native PASS.
         for endpoint in sockets:
-            endpoint.bind(('127.0.0.1', 53))
+            try:
+                endpoint.bind(('127.0.0.1', 53))
+            except PermissionError:
+                pytest.skip('UNAVAILABLE/NOT_RUN: effective UID lacks approved DNS bind privilege')
         sockets[1].listen(4)
         thread = threading.Thread(target=serve, name='q1-controlled-dns', daemon=True)
         thread.start()
@@ -991,3 +1117,63 @@ def test_native_guest_builtin_dns_cannot_delegate_to_host_resolver(native_lab: L
         threading.Event().wait(lab.gate['deadlines']['probe'])
         assert negative not in seen, 'Guest gvisor DNS bypassed Host kernel/Mach fence'
         assert socket.inet_aton('198.18.0.7').hex() not in reply['reply']
+
+
+@pytest.mark.parametrize('failure', [AssertionError, RuntimeError, KeyboardInterrupt, SystemExit])
+def test_call_phase_failure_fence_without_vm(tmp_path: Path, failure: type[BaseException]) -> None:
+    """Actual pytest/pluggy call wrapper, no native fixture, VM or subprocess."""
+    from types import SimpleNamespace
+
+    gate = {'deadlines': {'probe': 2}, 'artifacts': {
+        'identity': {'path': str(tmp_path / 'unused-key')},
+        'known_hosts': {'path': str(tmp_path / 'unused-hosts')}}}
+    case = tmp_path / 'case'
+    case.mkdir()
+    active = tmp_path / 'ACTIVE_RUN'
+    active.touch()
+    lab = Lab(gate, case, 'no-vm')
+    item = SimpleNamespace(nodeid='no-vm-call')
+    fence = CallFailureFence(lab, item.nodeid)
+    manager = pytest.PytestPluginManager()
+
+    class Body:
+        @pytest.hookimpl
+        def pytest_runtest_call(self, item: pytest.Item) -> None:
+            raise failure('uncaught call-phase failure')
+
+    manager.register(fence)
+    manager.register(Body())
+    cleaned = False
+    try:
+        with pytest.raises(failure):
+            manager.hook.pytest_runtest_call(item=item)
+    finally:
+        # Equivalent known-resource cleanup still runs; failure remains sticky.
+        cleaned = True
+    assert cleaned and lab.process is None
+    assert lab.uncertain == 'pytest_call_failed_or_interrupted'
+    assert (tmp_path / 'STOP_UNCERTAIN').exists() and active.exists()
+    with pytest.raises(AssertionError, match='successor'):
+        lab.assert_no_successor()
+
+
+def test_caught_negative_call_does_not_fence_without_vm(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    gate = {'deadlines': {'probe': 2}, 'artifacts': {
+        'identity': {'path': str(tmp_path / 'unused-key')},
+        'known_hosts': {'path': str(tmp_path / 'unused-hosts')}}}
+    lab = Lab(gate, tmp_path / 'case', 'no-vm')
+    item = SimpleNamespace(nodeid='caught-no-vm-call')
+    manager = pytest.PytestPluginManager()
+    manager.register(CallFailureFence(lab, item.nodeid))
+
+    class Body:
+        @pytest.hookimpl
+        def pytest_runtest_call(self, item: pytest.Item) -> None:
+            with pytest.raises(AssertionError):
+                raise AssertionError('expected negative caught inside test')
+
+    manager.register(Body())
+    manager.hook.pytest_runtest_call(item=item)
+    assert not lab.uncertain and not (tmp_path / 'STOP_UNCERTAIN').exists()

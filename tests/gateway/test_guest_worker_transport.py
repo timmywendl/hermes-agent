@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import selectors
 import shlex
 import socket
@@ -16,7 +17,7 @@ import struct
 import subprocess
 import threading
 from collections.abc import Iterator
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -222,8 +223,7 @@ def test_protocol_stdout_pollution_cannot_be_accepted_as_a_result(native_lab: An
 
 @pytest.mark.platforms('macos', arch='arm64')
 def test_same_interpreter_exec_is_observed_before_trusting_birth(native_lab: Any) -> None:
-    """C1 actual NOTE_EXEC witness: PID/birth stay the same across exec."""
-    import select
+    """C1 exercises the actual Lab inventory; PID/birth remain unchanged across exec."""
     import sys
 
     import psutil
@@ -247,18 +247,18 @@ def test_same_interpreter_exec_is_observed_before_trusting_birth(native_lab: Any
             ready.register(child.stdout, selectors.EVENT_READ)
             assert ready.select(deadline) and child.stdout.readline() == 'READY\n'
         before = psutil.Process(child.pid).create_time()
-        with closing(select.kqueue()) as events:
-            events.control([select.kevent(child.pid, filter=select.KQ_FILTER_PROC,
-                           flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
-                           fflags=select.KQ_NOTE_EXEC | select.KQ_NOTE_EXIT)], 0, 0)
-            child.stdin.write('G')
-            child.stdin.flush()
-            observed = events.control(None, 4, deadline)
-            assert any(event.fflags & select.KQ_NOTE_EXEC for event in observed)
-            assert psutil.Process(child.pid).create_time() == before
-            assert Path(psutil.Process(child.pid).exe()).resolve() == Path(sys.executable).resolve()
-        # An implementation accepting unchanged birth as continuation would
-        # miss the native event above; the Lab's watch rejects any later exec.
+        native_lab.watch_process(child.pid, parent_pid=os.getpid())
+        native_lab.check_process_inventory()
+        child.stdin.write('G')
+        child.stdin.flush()
+        with selectors.DefaultSelector() as ready:
+            ready.register(child.stdout, selectors.EVENT_READ)
+            assert ready.select(deadline) and child.stdout.readline() == 'EXECUTED\n'
+        assert psutil.Process(child.pid).create_time() == before
+        assert Path(psutil.Process(child.pid).exe()).resolve() == Path(sys.executable).resolve()
+        with pytest.raises(AssertionError, match='exec|identity'):
+            native_lab.check_process_inventory()
+        assert native_lab.uncertain == 'process_identity_unknown'
     finally:
         child.stdin.close()
         child.wait(timeout=deadline)

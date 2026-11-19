@@ -147,6 +147,24 @@ func request(_ descriptor: Descriptor, _ operation: String, _ sequence: Int64, p
         try suite.rejects(.capacity) { _ = try capacity.handle(request(desc, "contract_check", 17)) }
         let cached = try capacity.handle(request(desc, "contract_check", 16))
         try suite.check(cached.reference.hasPrefix("q1c-pure:16:"), "cache survives full bound")
+        let revoke = try request(desc, "revoke", 17)
+        let revoked = try capacity.handle(revoke)
+        try suite.check(capacity.lifecycle.capabilitiesRevoked && revoked.state == .revoking, "full capacity cannot block revoke")
+        try suite.check(try capacity.handle(revoke) == revoked, "full-capacity revoke exact replay")
+        let beforeLoss = try capacity.handle(request(desc, "lifecycle_receipt", 18))
+        try suite.check(beforeLoss.code == "NATIVE_NOT_OBSERVED", "full-capacity lifecycle readback")
+        capacity.transportLost()
+        let readback = try request(desc, "lifecycle_receipt", 19)
+        let afterLoss = try capacity.handle(readback)
+        try suite.check(afterLoss.code == "STOP_UNCERTAIN" && afterLoss.state == .stopUncertain, "uncertainty readback after capacity and earlier receipt")
+        try suite.check(try capacity.handle(readback) == afterLoss, "uncertainty receipt idempotence")
+        try suite.check(try capacity.handle(revoke) == revoked, "old revoke observation remains immutable")
+        try suite.rejects(.capacity) {
+            _ = try capacity.handle(request(desc, "lifecycle_receipt", 20, payload: .object([:])))
+        }
+        let changedID = String(decoding: try request(desc, "lifecycle_receipt", 20), as: UTF8.self)
+            .replacingOccurrences(of: "test:req:20", with: "test:req:17")
+        try suite.rejects(.replay) { _ = try capacity.handle(Data(changedID.utf8)) }
         var replay = AdapterContract(descriptor: desc)
         let raw = try request(desc, "enumerate_devices", 1)
         let first = try replay.handle(raw)

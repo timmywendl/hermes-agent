@@ -366,6 +366,11 @@ struct AdapterContract {
     private(set) var lifecycle = Lifecycle()
     private var sequence: Int64 = 0
     private var receipts: [String: (Frame, Receipt)] = [:]
+    // Ordinary capacity must never consume terminal safety/readback capacity.
+    // Keep one revoke receipt and one immutable readback per finite lifecycle state.
+    // Additional fresh IDs for an already recorded terminal state fail capacity;
+    // exact duplicates remain replayable. This is a finite offline contract, not a queue.
+    private var terminalReceipts: [String: (Frame, Receipt)] = [:]
 
     mutating func transportLost() {
         // No native custody witness is available; EOF/error/timeout never clears uncertainty.
@@ -375,7 +380,8 @@ struct AdapterContract {
         let frame = try Frame(data)
         try descriptor.binding.check(frame.binding)
         try validatePayload(frame)
-        if let (old, receipt) = receipts[frame.requestID] {
+        let terminal = terminalReceipts.values.first { $0.0.requestID == frame.requestID }
+        if let (old, receipt) = receipts[frame.requestID] ?? terminal {
             guard old.sequence == frame.sequence, old.fingerprint == frame.fingerprint else { throw ContractError.replay }
             guard !lifecycle.capabilitiesRevoked || ["revoke", "lifecycle_receipt"].contains(frame.operation) else {
                 throw ContractError.revoked
@@ -383,12 +389,23 @@ struct AdapterContract {
             return receipt
         }
         guard frame.sequence == sequence + 1 else { throw ContractError.replay }
-        guard receipts.count < 16 else { throw ContractError.capacity }
+        let terminalKey: String?
+        switch frame.operation {
+        case "revoke": terminalKey = "revoke"
+        case "lifecycle_receipt": terminalKey = "lifecycle_receipt:\(lifecycle.state.rawValue)"
+        default: terminalKey = nil
+        }
+        if let key = terminalKey {
+            guard terminalReceipts[key] == nil else { throw ContractError.capacity }
+        } else {
+            guard receipts.count < 16 else { throw ContractError.capacity }
+        }
         let result = try execute(frame)
         sequence = frame.sequence
         let receipt = Receipt(code: result, reference: "q1c-pure:\(frame.sequence):\(frame.fingerprint)",
                               state: lifecycle.state, plannedInventory: frame.operation == "enumerate_devices" ? descriptor.inventory : nil)
-        receipts[frame.requestID] = (frame, receipt)
+        if let key = terminalKey { terminalReceipts[key] = (frame, receipt) }
+        else { receipts[frame.requestID] = (frame, receipt) }
         return receipt
     }
     private func validatePayload(_ frame: Frame) throws {

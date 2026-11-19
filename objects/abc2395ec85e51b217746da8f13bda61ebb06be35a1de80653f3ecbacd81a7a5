@@ -1,0 +1,7 @@
+"""One-shot launcher for read-only checks under the launchd host session."""
+
+import os
+import sys
+
+program = sys.argv[1]
+os.execve(program, sys.argv[1:], os.environ)

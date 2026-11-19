@@ -1,0 +1,2043 @@
+"""Frozen legacy commit-email → GitHub login mappings. Data only; never append.
+
+The contributor-check CI job and ``scripts/audit_pr_attribution.py`` grep this
+file for ``"<email>"``, so the entries must stay a literal dict here.
+"""
+
+# FROZEN legacy mappings — do NOT add new entries here. New contributor
+# mappings live as one-file-per-email entries under contributors/emails/
+# (see contributors/README.md), which merge-conflict-free by construction.
+# This dict is kept only so existing history keeps resolving; the effective
+# AUTHOR_MAP in authors.py merges it with the directory (directory wins).
+LEGACY_AUTHOR_MAP = {
+    "<REDACTED_EMAIL>": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
+    "<REDACTED_EMAIL>": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
+    "<REDACTED_EMAIL>": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)
+    "<REDACTED_EMAIL>": "shady2k",  # PR #60104 salvage of #66143 (MCP loop-owned shutdown drain)
+    "<REDACTED_EMAIL>": "zzpigpinggai",  # PR #66017 salvage of #63617 (OpenRouter explicit-provider picker visibility)
+    "<REDACTED_EMAIL>": "StellarisW",  # PR #66222 salvage (Discord WebSocket liveness + systemd watchdog; #26656 follow-up)
+    "<REDACTED_EMAIL>": "wxy-nlp",  # PR #66222 salvage (systemd event-loop watchdog co-author)
+    "<REDACTED_EMAIL>": "sam7894604",  # PR #55803 salvage (discord: /reasoning slash choices)
+    "<REDACTED_EMAIL>": "hydraxman",  # PR #62028 salvage (copilot xhigh) — regression-test commit authored under a bare-noreply local git identity; PR author is @hydraxman
+    "<REDACTED_EMAIL>": "antydizajn",  # PR #36043 salvage (auxiliary: route custom:<name> through named-provider arm + Palantir Bearer auth)
+    "<REDACTED_EMAIL>": "briandevans",  # PR #64951 salvage (lmstudio: clamp max/ultra reasoning effort)
+    "<REDACTED_EMAIL>": "karfly",  # PR #64012 salvage (gateway: surface extended reasoning efforts)
+    "<REDACTED_EMAIL>": "enzo-adami",  # PR #66637 salvage (compression: preserve human intent and durable handoffs)
+    "<REDACTED_EMAIL>": "rlaehddus302",  # PR #61985 salvage (gateway: secondary-adapter auth callback profile)
+    "<REDACTED_EMAIL>": "bautrey",  # PR #66479 salvage (gateway reliability hardening: Bedrock liveness, supervised watchers, launchd respawn throttle)
+    "<REDACTED_EMAIL>": "aguung",  # PR #64461 salvage (gateway: multiplex secret_scope for authz/Slack/webhooks)
+    "<REDACTED_EMAIL>": "jtstothard",  # PR #63256 salvage (gateway: multiplex secondary adapter config validation)
+    "<REDACTED_EMAIL>": "fjlaowan1983",  # PR #11256 salvage (honcho: reject whitespace-only reasoning queries)
+    "<REDACTED_EMAIL>": "RainbowAndSun",  # PR #62982 salvage (honcho: observer target in prefetch context)
+    "<REDACTED_EMAIL>": "Elektrofussel",  # PR #61675 salvage (honcho: defaultHost + private-range local URL detection)
+    "<REDACTED_EMAIL>": "SAMBAS123",  # PR #64986 salvage (gateway: multiplex primary bot token scope)
+    "<REDACTED_EMAIL>": "MaartenDMT",  # PR #65637 salvage (gateway: retry failed transcript appends and rebuild corrupted FTS)
+    "<REDACTED_EMAIL>": "kocaemre",  # PR #36051 salvage (docs: audit round 3 code/doc reconciliation)
+    "<REDACTED_EMAIL>": "m1qaweb",  # PR #29290 salvage (gateway: strip /queue prefix when idle)
+    "<REDACTED_EMAIL>": "otsune",  # PR #36019 salvage (kanban: attachment toolset + CLI)
+    "<REDACTED_EMAIL>": "wesleion",  # PR #36049 salvage (telegram: per-topic free-response allowlist)
+    "<REDACTED_EMAIL>": "evefromwayback",  # PR #64611 salvage (agent: never load install-tree AGENTS.md as project context)
+    "<REDACTED_EMAIL>": "Rival",  # PR #64935/#64936 salvage (state: restore-boundary alternation repair; agent: turn-overlap tripwire)
+    "<REDACTED_EMAIL>": "embwl0x",  # PR #65105 salvage (gateway: preserve external supervisor ownership)
+    "<REDACTED_EMAIL>": "2751738943",  # PR #54785 salvage (tui: post-turn completion ownership routing)
+    "<REDACTED_EMAIL>": "Burgunthy",  # PR #20096 salvage (gateway: profile-based routing for inbound messages)
+    "<REDACTED_EMAIL>": "BB-light",  # PR #76015 salvage (caching: honor cache_ttl disable; #33555)
+    "<REDACTED_EMAIL>": "webtecnica",  # PR #63360 salvage (nous: restore inference-api base_url)
+    "<REDACTED_EMAIL>": "webtecnica",  # PR #70888 salvage
+    "<REDACTED_EMAIL>": "webtecnica",  # PR #75838 salvage (aux: free-only fallback guard; #75803)
+    "<REDACTED_EMAIL>": "ckaznocha",  # PR #71543 salvage (matrix: crypto store reset + pickle migration)
+    "<REDACTED_EMAIL>": "Epoxidex",  # PR #29820 salvage (ollama: top-level reasoning_effort=none; #25758)
+    "<REDACTED_EMAIL>": "JiaDe-Wu",  # PR #34742 salvage (bedrock: bearer routing + streaming fallback + image decode; #28156)
+    "<REDACTED_EMAIL>": "minchang",  # PR #42231 salvage (providers: add Upstage Solar)
+    "<REDACTED_EMAIL>": "neo-claw-bot",  # PR #58465 salvage (moa: drop empty user turns from advisory view)
+    "<REDACTED_EMAIL>": "pixel4039",  # PR #64420 salvage (streaming: retry zero-chunk streams)
+    "<REDACTED_EMAIL>": "marcelohildebrand",  # PR #42346 salvage (lmstudio: JIT load mode)
+    "<REDACTED_EMAIL>": "Soju06",  # agent turn-latency perf PRs
+    "<REDACTED_EMAIL>": "mguttmann",  # PR #63738 salvage (Anthropic setup-token pool auth normalization)
+    "<REDACTED_EMAIL>": "flyingdoubleG",  # PR #18166 salvage (memory-provider tools honor disabled_toolsets in initial and MCP-refresh injection)
+    "<REDACTED_EMAIL>": "VrtxOmega",  # PR #43809 salvage (desktop: WSL folder-picker path bridge)
+    "<REDACTED_EMAIL>": "SemonCat",  # PR #56786 salvage (Slack Agent View manifests and Assistant APIs)
+    "<REDACTED_EMAIL>": "KCAYAAI",  # PR #62248 partial salvage (resume typing after clarify reply)
+    "<REDACTED_EMAIL>": "jakelongvu-bot",  # PR #36683 partial salvage (approval: honor canonical approvals.timeout in gateway waits)
+    "<REDACTED_EMAIL>": "Tortugasaur",  # PR #43205 salvage (desktop: profile-aware three-way approval mode statusbar control)
+    "<REDACTED_EMAIL>": "kavioavio",  # Issue #46544 / PR #47705 evolution (smart DENY exact-operation owner override)
+    "<REDACTED_EMAIL>": "ansel-f",  # PR #62388 salvage (approval: allow exact verifier temp cleanup without broadening rm safety boundary)
+    "<REDACTED_EMAIL>": "Hopfensaft",  # PR #31933 salvage (dashboard: align approvals.mode dropdown with canonical engine values)
+    "<REDACTED_EMAIL>": "professorpalmer",  # PR #48591 salvage (sessions: CLI workspace filter + restore-cwd-on-resume)
+    "<REDACTED_EMAIL>": "Supersynergy",  # PR #59241 salvage (desktop: workspace path status-bar action)
+    "<REDACTED_EMAIL>": "roryford",  # PR #63132 salvage (compression: fail closed for errors from a resolved lock API, preserving lineage)
+    "<REDACTED_EMAIL>": "esthonjr",  # PR #61950 salvage (desktop: legacy non-git workspace grouping + Windows path identity)
+    "<REDACTED_EMAIL>": "Drexuxux",  # PR #36042 salvage (gateway: /footer reachable mid-run via safe-toggle set)
+    "<REDACTED_EMAIL>": "IgorGanapolsky",  # PR #62125 salvage (compaction anti-thrash threshold verification)
+    "<REDACTED_EMAIL>": "aeyeopsdev",  # PRs #36035/#36068 salvage (google-chat: http inbound without pubsub; clarify cards)
+    "<REDACTED_EMAIL>": "TheTom",  # PR #62696 salvage (gateway: expand @ context references under runtime/session model resolution)
+    "<REDACTED_EMAIL>": "ljy-2000",  # PR #62204 adopted in #62290
+    "<REDACTED_EMAIL>": "vizi0uz",  # PR #59795 adopted in #62290
+    "<REDACTED_EMAIL>": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
+    "<REDACTED_EMAIL>": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "<REDACTED_EMAIL>": "light-merlin-dark",  # PR #7821 salvage (zai: parallel endpoint detection probes)
+    "<REDACTED_EMAIL>": "frizikk",  # PR #63389 salvage (session-search: fields projection skips unused context enrichment)
+    "<REDACTED_EMAIL>": "EndeavorYen",  # PR #33971 salvage (image: parallel image_generate batches + FileSyncManager transaction lock)
+    "<REDACTED_EMAIL>": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
+    "<REDACTED_EMAIL>": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
+    "<REDACTED_EMAIL>": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
+    "<REDACTED_EMAIL>": "evelynburger",  # PR #57544 salvage (gateway: webhook payload filters + route scripts; commit under unlinked identity)
+    "<REDACTED_EMAIL>": "SiteupAgencia",  # PR #57435 salvage (tui_gateway: back off notification poller when session is busy; #55578)
+    "<REDACTED_EMAIL>": "rainbowgore",  # PR #59405 salvage (mcp: bound stdio initialize handshake to stop subprocess/FD leak; #59349)
+    "<REDACTED_EMAIL>": "thestudionorth",  # PR #60015 salvage (mcp: parent-death watchdog for stdio children; commit under unlinked local identity)
+    "<REDACTED_EMAIL>": "vampyren",  # PR #59830 salvage (kanban: grab-to-pan board scrolling; original commit under unlinked local identity)
+    "<REDACTED_EMAIL>": "spiky02plateau",  # PR #32824 salvage (usage: fetch Codex account limits from the credential pool in pool-only setups; superseded by #60028)
+    "<REDACTED_EMAIL>": "hwrdprkns",  # PR #36896 salvage (secrets: 1Password op:// secret source + shared _cache substrate, adapted onto the SecretSource interface)
+    "<REDACTED_EMAIL>": "isheng-eqi",  # PR #59428 salvage (cron: reject past one-shot timestamps in update_job fallback + resume_job; #59395). Also PR #59446 salvage (cron: advance one-shot next_run_at before dispatch so concurrent gateway+desktop schedulers can't double-execute; #59229).
+    "<REDACTED_EMAIL>": "derek2000139",  # PR #57838 salvage (desktop/windows: pre-write update marker before quit dwell so the renderer's waitForUpdateToFinish gate parks instead of respawning a backend that re-locks venv .pyd files mid-update)
+    "<REDACTED_EMAIL>": "AndreasHiltner",  # PR #56854 salvage (gateway: route multiplex profile responses through the profile's own adapter — 53-site _adapter_for_source sweep)
+    "<REDACTED_EMAIL>": "AlexFucuson9",  # PR #61347 salvage (agent: reapply provider headers after model switch; #61099)
+    "<REDACTED_EMAIL>": "allenliang2022",  # PR #56932 test coverage folded into #56909 salvage (408 → retryable timeout)
+    "<REDACTED_EMAIL>": "ManniBr",  # PR #57417 partial salvage (gateway: fail-closed adapter resolution for unregistered secondary profiles)
+    "<REDACTED_EMAIL>": "Umi4Life",  # PR #47377 salvage (agent: emit one-shot fallback switch notice on successful fallback so gateway users see model/provider change; #35419)
+    "<REDACTED_EMAIL>": "austinlaw076",  # PR #57563 partial salvage (auth: lazy per-profile Anthropic OAuth file; gateway: whatsapp_cloud/line added to port-binding platform set)
+    "<REDACTED_EMAIL>": "liuhao1024",  # PR #56993 salvage (gateway: process-level HERMES_HOME for pid/lock/status identity files; #56986)
+    "<REDACTED_EMAIL>": "Roseyco-management",  # PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243, #63766)
+    "<REDACTED_EMAIL>": "nima20002000",  # PR #36022/#36025 salvage (code-exec truncation metadata; achievements hover loop)
+    "<REDACTED_EMAIL>": "gauravsaxena1997",  # PR #59868 partial salvage (agent: guard response.text against httpx.ResponseNotRead in _summarize_api_error; #59769)
+    "<REDACTED_EMAIL>": "irresi",  # PR #59048 salvage (gateway: scope reset banners' session info to the serving profile; #59003)
+    "<REDACTED_EMAIL>": "s905060",  # PR #57943 salvage (photon: auto-reinstall stale sidecar node_modules when lockfile is newer than npm's install marker; #59169)
+    "<REDACTED_EMAIL>": "l0h1nth",  # PR #32210 salvage (mattermost: accept leading-space slash commands from mobile clients; #25184)
+    "<REDACTED_EMAIL>": "arnispiekus",  # PR #63581 salvage (telegram: require getUpdates progress before polling is healthy; #63243)
+    "<REDACTED_EMAIL>": "devatnull",  # PR #58704 salvage (whatsapp: native Baileys polls, clarify-as-poll, location pins, structured quoted replies, PTT/audio split, bridge_helpers extraction)
+    "<REDACTED_EMAIL>": "tjp2021",  # PR #4097 salvage (copilot: per-turn x-initiator header so user prompts bill as premium requests; #3040)
+    "<REDACTED_EMAIL>": "falkoro",  # PRs #58519/#58520 salvage (config: env-ref-aware load_config cache invalidation; auxiliary: honor auxiliary.<task>.base_url/api_key with explicit provider arg)
+    "<REDACTED_EMAIL>": "kevinrajaram",  # PR #3850 salvage (gateway: add POSIX system dirs to PATH so launchctl/systemctl resolve under UV's minimal-PATH bundled Python; #3849)
+    "<REDACTED_EMAIL>": "lord-dubious",  # PR #58453 salvage (preserve static custom provider models declared as dict rows)
+    "<REDACTED_EMAIL>": "williamumu",  # PR #31041 salvage (pairing: merge split legacy/new pairing store dirs at PairingStore init so approved users aren't re-prompted to pair)
+    "<REDACTED_EMAIL>": "JAlmanzarMint",  # PR #52688 salvage (vision: rasterize SVG / re-encode unsupported raster formats to PNG before embedding), folded into #57890
+    "<REDACTED_EMAIL>": "alex-fireworks",  # PR #61182 salvage (Fireworks AI model-provider integration)
+    "<REDACTED_EMAIL>": "ooiuuii",  # PR #58466/#58377 salvage (redact: fireworks fw-/fpk_ prefixes; telegram: redact bot tokens out of transport error strings). Also PR #58433 salvage (codex: accept recorded final_text when app-server omits turn/completed) and PR #58472 salvage (gateway: cap proxy SSE line buffer at 16MiB).
+    "<REDACTED_EMAIL>": "Jigoooo",  # PR #58474 salvage (auxiliary: fall back to token resolver when anthropic pool has no usable entry)
+    "<REDACTED_EMAIL>": "ostravajih",  # PR #58374 salvage (poolside: coerce integer finish_reason and tool_call id to strings)
+    "<REDACTED_EMAIL>": "sahil-shubham",  # PR #58448 salvage (whatsapp_cloud: honor documented WHATSAPP_CLOUD_ALLOWED_USERS / ALLOW_ALL_USERS in the DM intake gate)
+    "<REDACTED_EMAIL>": "Ahmett101",  # PR #58445 salvage (profiles: allowlist default-export roots + preserve symlinks)
+    "<REDACTED_EMAIL>": "IpastorSan",  # PR #63690 salvage (codex: rescue reasoning-only turns that die after 3 continuation attempts)
+    "<REDACTED_EMAIL>": "Ahmett101",  # PR #59455 salvage (background-review: guard summarize against list-shaped tool responses; #59437)
+    "<REDACTED_EMAIL>": "wyuebei-cloud",  # PR #56640 salvage (hermes journey: replace GNU-only %-d strftime with dt.day for Windows)
+    "<REDACTED_EMAIL>": "msh01",  # PR #58250 salvage (telegram: wall-clock init timeout via daemon-thread deadline + abandon the shielded initialize task on timeout so the retry ladder advances instead of hanging on attempt 1/8 under s6 supervision; #58236). Also covers PR #58276 salvage (compression: preserve a real user turn after compaction; #55677).
+    "<REDACTED_EMAIL>": "danilofalcao",  # PR #56674 salvage (update: skip unsupported platform.matrix lazy refresh on native Windows — python-olm has no Windows wheel)
+    "<REDACTED_EMAIL>": "huanshan5195",  # PR #57601 salvage (custom-provider: emit reasoning_effort at the live CustomProfile path so GLM-5.2/ARK/vLLM/Ollama endpoints receive it; + "max" reasoning level)
+    "<REDACTED_EMAIL>": "infinitycrew39",  # PR #56431 salvage (honor live vLLM context limits on local endpoints)
+    "<REDACTED_EMAIL>": "CocaKova",  # PR #57692 salvage (cron: run jobs under the profile secret scope so get_secret does not fail-close with UnscopedSecretError under profile isolation)
+    "<REDACTED_EMAIL>": "trismegistus-wanderer",  # PR #31856 salvage (gateway: defer idle-TTL agent-cache eviction until the session store says the session actually expired, so the expiry watcher can still fire MemoryProvider.on_session_end with the live transcript; #11205)
+    "<REDACTED_EMAIL>": "Mibayy",  # PR #3243 salvage (/compact alias + preview/aggressive flags for /compress)
+    "<REDACTED_EMAIL>": "Mibayy",  # PR #3176 salvage (api-server: per-client model routing via model_routes)
+    "<REDACTED_EMAIL>": "jneeee",  # PR #3526 salvage (extra HTTP headers for LLM API calls via config.yaml)
+    "<REDACTED_EMAIL>": "CrazyBoyM",  # PR #55828 salvage (image_gen openai-codex: wire image-to-image / reference-image editing via Codex Responses input_image parts; magic-byte + read-guard + 25MB-cap + clamp-to-16 hardening)
+    "<REDACTED_EMAIL>": "r0gersm1th",  # PR #3219 salvage (whatsapp bridge: resolve LID sender IDs to phone numbers in the message payload so phone-based allowlists match; commit authored by collaborator r0gersm1th, PR by @ajmeese7)
+    "<REDACTED_EMAIL>": "Mibayy",  # PR #3296 salvage (status: provider label honors config.yaml model.base_url, not just OPENAI_BASE_URL env)
+    "<REDACTED_EMAIL>": "keslerm",  # PR #3459 salvage (gateway: 'log' tool_progress mode — silent in chat, tool calls appended to ~/.hermes/logs/tool_calls.log via rotating handler; duplicate of #3458 by @dlkakbs who submitted 4 min earlier — both credited)
+    "<REDACTED_EMAIL>": "Git-on-my-level",  # PR #3659 salvage (gateway: persist per-session /model overrides across gateway restarts)
+    "<REDACTED_EMAIL>": "tarunravi",  # PR #2696 salvage (api-server: inline MEDIA:<path> image tags as base64 data URLs in final responses so remote OpenAI-compatible frontends can render server-local screenshots; the PR's tool-progress-streaming and SSE-sentinel pieces were independently superseded on main)
+    "<REDACTED_EMAIL>": "VolodymyrBg",  # PR #2861 salvage (webhook: drop the unused full request payload from retained _delivery_info entries — up to ~1MB dead weight per delivery for the 1h idempotency TTL)
+    "<REDACTED_EMAIL>": "CharmingGroot",  # PR #2794 salvage (email: guard msg_data[0][1] against malformed IMAP fetch structures so one bad response can't abort the batch and permanently lose seen-marked messages; Message-ID domain falls back to localhost when EMAIL_ADDRESS lacks '@')
+    "<REDACTED_EMAIL>": "sahibzada-allahyar",  # PR #39227 salvage (desktop: configured terminal.cwd overrides a stale remembered workspace-cwd localStorage value when no session is active; #38855)
+    "<REDACTED_EMAIL>": "rarf",  # PR #56966 salvage (desktop chat model picker: hide implicitly discovered providers unless explicitly configured)
+    "<REDACTED_EMAIL>": "plcunha",  # PR #55300 salvage (gateway: record child gateway peer metadata after a compression session-id rotation and repoint stale sessions.json compression-parent entries to the recovered live child; consolidated in the compression-routing-integrity salvage)
+    "<REDACTED_EMAIL>": "jakepresent",  # PR #55721 salvage (gateway: identity-guard stale in-flight compression splits — a late run may publish its compressed child only if its run generation is still current and the session key still points at the run's original parent, so an old run can't overwrite a newer /new or moved binding)
+    "<REDACTED_EMAIL>": "gumclaw",  # PR #57322 salvage (gateway: close per-delivery webhook sessions on completion so prune_sessions can reap them — fixes unbounded state.db growth from unprunable ended_at=NULL webhook rows)
+    "<REDACTED_EMAIL>": "zmlgit",  # PR #54872 salvage (multiplex-profile kanban: route task notifications via the owning profile's adapter + wake the creator agent with a synthetic internal MessageEvent on terminal events)
+    "<REDACTED_EMAIL>": "nankingjing",  # PR #56404 salvage (gateway: while a state.db compression lock is held for the session, demote busy_input_mode 'interrupt' to 'queue' so a rapid message burst can't interrupt and fork orphaned compression siblings off a stale parent; #56391)
+    "<REDACTED_EMAIL>": "udatny",  # PR #29433 salvage (subdirectory_hints: catch RuntimeError from Path.expanduser()/Path.home() so a literal ~ in tool-call args — e.g. LLM "~500-700" or ~unknownuser — can't escape the hint walker and crash the conversation loop)
+    "<REDACTED_EMAIL>": "brett539",  # PR #49369 salvage (cap Telegram initialize() with asyncio.wait_for(HERMES_TELEGRAM_INIT_TIMEOUT, default 30s) per attempt so an unreachable fallback-IP connect chain can't block gateway startup indefinitely; add WARNING progress logs before DoH discovery and each connect attempt)
+    "<REDACTED_EMAIL>": "randomuser2026x",  # PR #50204 salvage (gateway /restart under systemd: probe both system + --user scope for MainPID instead of hardcoding --user; always exit 75 so RestartForceExitStatus=75 revives the unit under Restart=on-failure too, not just Restart=always)
+    "<REDACTED_EMAIL>": "valenteff",  # PR #53277 salvage (macOS launchd reload: retry bootstrap via _launchctl_bootstrap until launchctl-list confirms registration or the restart-drain window elapses; retry TimeoutExpired not just CalledProcessError; log persistent orphans)
+    "<REDACTED_EMAIL>": "slawt",  # PR #8427 salvage (Google Vertex AI provider for Gemini: OAuth2 token minting via service-account JSON / ADC on the OpenAI-compat endpoint, rewired as a provider profile with per-turn 401 token refresh)
+    "<REDACTED_EMAIL>": "bitcryptic-gw",  # PR #53997 salvage (Matrix E2EE: resolve device_id via query_keys({mxid: []}) when whoami returns none; guard verification call sites so query_keys is never sent [null]; reset _device_id_unverified at connect() start; disconnect before reconnect)
+    "<REDACTED_EMAIL>": "Gromykoss",  # PR #56372 salvage (context_compressor merge-into-tail: place END MARKER last, wrap prior tail content in [PRIOR CONTEXT]...[END OF PRIOR CONTEXT] delimiters so the model doesn't read it as a fresh message)
+    "<REDACTED_EMAIL>": "HODLCLONE",  # PR #49351 salvage (Nous Portal token resilience: rotate refresh tokens write-through to the source auth store in profile mode, skip Nous fallback when no local token, sync gateway session model after fallback)
+    "<REDACTED_EMAIL>": "abchiaravalle",  # PR #46997 salvage (recover resume_pending sessions: dual freshness signal + empty-turn safety net so restart auto-resume never sends a blank user turn)
+    "<REDACTED_EMAIL>": "swissly",  # PR #47167 salvage (wrap cron delivery thread-pool fallback in its own try/except so a per-target failure can't escape the except-RuntimeError block and crash the multi-target delivery loop; #47163)
+    "<REDACTED_EMAIL>": "shawchanshek",  # PR #44126 salvage (strip <think>...</think> reasoning blocks from title-generator LLM output via the canonical strip_think_blocks scrubber so reasoning-model output can't leak into session titles)
+    "<REDACTED_EMAIL>": "YLChen-007",  # PR #27289 salvage (case-insensitive streaming reasoning-tag filter in cli.py _stream_delta + gateway stream_consumer so mixed-case variants like <Think>/<ThInK> are suppressed, not just the hardcoded case literals)
+    "<REDACTED_EMAIL>": "kangsoo-bit",  # PR #47508 salvage (keep Telegram gateway alive on transient bootstrap network errors: best-effort deleteWebhook + resilient start_polling degrade to background recovery instead of failing startup)
+    "<REDACTED_EMAIL>": "testingbuddies24",  # PR #43192 salvage (strip orphan think-tag close tags in progressive gateway stream so a bare </think> whose open was dropped upstream can't leak to the user)
+    "<REDACTED_EMAIL>": "Lazymonter",  # PR #42914 salvage (retry launchd bootstrap after bootout on EIO for install/start instead of degrading to detached)
+    "<REDACTED_EMAIL>": "WXBR",  # PR #46183 salvage (persist recovered final_response at the finalize_turn chokepoint so recovery-path breaks don't drop the delivered assistant row)
+    "<REDACTED_EMAIL>": "dmabry",  # PR #63862 salvage (output-cap retry: use provider available_tokens + request estimate; exempt parseable vLLM/LM Studio errors from compression-disabled guard)
+    "<REDACTED_EMAIL>": "SahilRakhaiya05",  # PR #44073 salvage (fail-closed gateway/external-surface hardening: own-policy defaults, open-policy startup guard, profile-aware multiplex authz, API-server auth, execute_code per-session RPC token)
+    "<REDACTED_EMAIL>": "itenev",  # PR #22753 salvage (asyncify model-context resolution in gateway message path so blocking requests.get can't starve Discord heartbeats)
+    "<REDACTED_EMAIL>": "arthurzhang",  # PR #34718 salvage (redact Slack App-Level xapp- tokens in agent/redact.py + gateway/run.py)
+    "<REDACTED_EMAIL>": "rrevenanttt",  # PR #40773 salvage (close hardline rm bypass via quoted paths and ${HOME} brace form)
+    "<REDACTED_EMAIL>": "Vesna-9",  # PR #41274 salvage (collapse shell line continuations before dangerous/hardline pattern matching so `rm -rf \<newline>/` can't bypass the yolo-proof hardline floor)
+    "<REDACTED_EMAIL>": "kernel-t1",  # PR #41349 salvage (.env sanitizer: only split when line starts with a known KEY= and preceding values are plain tokens; keep URL/query/whitespace secrets verbatim)
+    "<REDACTED_EMAIL>": "sasquatch9818",  # PR #41198 salvage (defang untrusted-tool-result delimiter against tag injection; drop forgeable startswith fast-path)
+    "<REDACTED_EMAIL>": "jnibarger01",  # PR #35130 salvage (ReDoS-bound threat-pattern filler + FTS5 query cap + V4A Move-File approval/traversal targets)
+    "<REDACTED_EMAIL>": "yong2bba",  # PR #49830 salvage (harden browser tool safety boundaries: config-gated risky-eval blocklist, force-redact browser/CDP/supervisor output, session-ownership tracking, credential-query denylist)
+    "<REDACTED_EMAIL>": "djimit",  # PR #48034 salvage (recover from truncated gateway responses: 4 continuation retries + exponential token headroom + normalize empty partials)
+    "<REDACTED_EMAIL>": "lubosxyz",  # PR #49225 salvage (persist codex app-server turns to session DB via agent_persisted=False so session_search/distill see gateway conversations)
+    "<REDACTED_EMAIL>": "petrichor-op",  # PR #41281 salvage (never persist ephemeral empty-response recovery scaffolding to the SQLite session store / JSON log; filter by flag not position)
+    "<REDACTED_EMAIL>": "redactdeveloper",  # PR #36897 salvage (route /sessions & /history through prompt_toolkit-safe print; filter doctor missing-key summary to CLI-enabled toolsets)
+    "<REDACTED_EMAIL>": "charleneleong-ai",  # PR #11736 salvage (classify Anthropic "out of extra usage" 400 as billing)
+    "<REDACTED_EMAIL>": "janrenz",  # PR #35862 salvage (prompt_caching.enabled escape hatch for strict providers)
+    "<REDACTED_EMAIL>": "syahidfrd",  # PR #17059 salvage (tag unverified senders in Slack thread context to mitigate indirect prompt injection)
+    "<REDACTED_EMAIL>": "H2KFORGIVEN",  # PR #22523 salvage (turn-pair preservation: never orphan the last user ask at head_end during compaction)
+    "<REDACTED_EMAIL>": "sgabel",  # PR #13139 salvage (redact secrets in user-facing approval prompts)
+    "<REDACTED_EMAIL>": "CRWuTJ",  # PR #17082 salvage (cancel delayed Telegram deliveries on disconnect so buffered flushes don't dispatch into a torn-down session)
+    "<REDACTED_EMAIL>": "cyb3rwr3n",  # PR #11333 salvage (sanitize FTS5 queries for natural-language recall in holographic memory)
+    "<REDACTED_EMAIL>": "codexGW",  # PR #12302 salvage (Discord raw <@!ID> mention detection + drop bare mention-only pings)
+    "<REDACTED_EMAIL>": "jackroofan",  # PR #54609 salvage (add anthropic to MoA _slot_runtime name-preserve set; OAuth sk-ant-oat* needs Bearer + anthropic-beta header)
+    "<REDACTED_EMAIL>": "iizotov",  # PR #54912 salvage (add bedrock to MoA _slot_runtime name-preserve set; SigV4-signed client, placeholder aws-sdk api_key)
+    "<REDACTED_EMAIL>": "JustinOhms",  # PR #24469 salvage (route native-SDK delegation providers through runtime resolver; fail on '(empty)' sentinel instead of accepting it as success)
+    "<REDACTED_EMAIL>": "lEWFkRAD",  # PR #53848 salvage (stream the MoA aggregator response to the user)
+    "<REDACTED_EMAIL>": "jimmyjohansson84",  # PR #27123 salvage (Kanban unknown-skill warn-instead-of-crash; #27136)
+    "<REDACTED_EMAIL>": "Jeffgithub0029",  # PR #28558 salvage (chunk Telegram text *after* MarkdownV2/HTML formatting so escaping inflation can't push a send over the 4096 UTF-16 limit; #28557)
+    "<REDACTED_EMAIL>": "fayenix",  # PR #28846 salvage (normalize _cfg_model in gateway fallback-eviction so vendor-prefixed config matches stripped agent.model on native providers)
+    "<REDACTED_EMAIL>": "theAgenticBuilder",  # PR #14180 salvage (route delegate_task progress lines through _safe_print so ACP stdio JSON-RPC frames stay clean)
+    "<REDACTED_EMAIL>": "huangxudong663-sys",  # PR #15157 salvage (isinstance(dict) guard on tool-call model_extra; NVIDIA NIM non-dict crash)
+    "<REDACTED_EMAIL>": "jasonQin6",  # PR #15093 salvage (session staleness guard on stream consumer run() loop; #11016 follow-up)
+    "<REDACTED_EMAIL>": "znding04",  # PR #15487 salvage (distinguish OpenRouter upstream 429 from account 429; upstream_rate_limit failover reason)
+    "<REDACTED_EMAIL>": "nnnet",  # PR #25142 salvage (stop STT-failure chatter poisoning the LLM prompt; drop hardcoded English notice)
+    "<REDACTED_EMAIL>": "nnnet",  # PR #36024 salvage (dashboard: inline critical-CSS bootstrap for user themes)
+    "<REDACTED_EMAIL>": "londo161",  # PR #15795 salvage (redact status --all API keys; tolerate dict/str compression message shape)
+    "<REDACTED_EMAIL>": "neo-2026",  # PR #14026 salvage (clear input-blocking overlays on interrupt so the CLI doesn't freeze; #13618)
+    "<REDACTED_EMAIL>": "Nickperillo",  # PR #8008 salvage (Discord channel-name matching + flush pending sends on shutdown)
+    "<REDACTED_EMAIL>": "MarioYounger",  # PR #9028 salvage (bash/sh heredoc approval, NFKC homograph fold, execute_code CREDS/BEARER/APIKEY env filter)
+    "<REDACTED_EMAIL>": "peetwan",  # PR #51841 salvage (loopback ws-ping tuning + token-frame coalescing + loop heartbeat; #48445/#50005)
+    "<REDACTED_EMAIL>": "Peterskaronis",  # PR #63889 salvage (mcp-oauth: WAF-safe redirect_host for loopback callback URIs)
+    "<REDACTED_EMAIL>": "Zyxxx-xxxyZ",  # PR #54287 salvage (route frontend-polled inline RPCs to _LONG_HANDLERS; #48445/#50005)
+    "<REDACTED_EMAIL>": "DataAdvisory",  # PR #9562 salvage (flatten multi-part user_message in codex intermediate-ack detector so vision turns don't crash)
+    "<REDACTED_EMAIL>": "huangsen365",  # PR #42334 (CVE dependency pins + pin-drift guard)
+    "<REDACTED_EMAIL>": "telos-oc",  # PR #14353 salvage (propagate custom_providers key_env into ProviderDef.api_key_env_vars; named + bare-custom self-heal paths)
+    "<REDACTED_EMAIL>": "Kolektori",  # PR #6436 salvage (require approval for host-bound Docker commands; container guard fast-path)
+    "<REDACTED_EMAIL>": "LIC99",  # PR #4682 salvage (warn + default to manual on unknown approvals.mode; #4261)
+    "<REDACTED_EMAIL>": "cmcejas",  # PR #41188 salvage (early Telegram auth gate before event build/observe; #40863)
+    "<REDACTED_EMAIL>": "oreoluwa",  # PR #49845 salvage (skip preflight content-type probe for OAuth MCP servers so OAuth discovery runs; Akiflow/Hospitable)
+    "<REDACTED_EMAIL>": "PRATHAMESH75",  # PR #37550 salvage (ExecStopPost cgroup-orphan reaper to unblock systemd restart; #37454)
+    "<REDACTED_EMAIL>": "konsisumer",  # PR #19608 salvage (read-modify-write merge in write_credential_pool to preserve concurrently-added credentials; #19566)
+    "<REDACTED_EMAIL>": "linyubin",  # PR #50228 salvage (eager fallback on persistent transport timeout/overloaded; #22277)
+    "<REDACTED_EMAIL>": "bradhallett",  # PR #46948 salvage (force app exit after update/uninstall handoff on macOS; #46948)
+    "<REDACTED_EMAIL>": "coygeek",  # PR #37951 salvage (fail closed when provider env blocklist import fails; #37950)
+    "<REDACTED_EMAIL>": "djstunami",  # PR #5316 salvage / co-author (suppress transient check_fn flakes so subagents keep file/terminal tools; #21658 / #5304)
+    "<REDACTED_EMAIL>": "jmmaloney4",  # PR #25206 salvage (re-select credential pool on primary runtime restore; #25205)
+    "<REDACTED_EMAIL>": "hmirin",
+    "<REDACTED_EMAIL>": "dalenguyen",  # PR #53678 salvage (strip VIRTUAL_ENV/CONDA_PREFIX from terminal subprocess env; #23473)
+    "<REDACTED_EMAIL>": "prashantjain25",  # PR #80740 salvage (custom-endpoint /v1/models disk cache; #72762)
+    "<REDACTED_EMAIL>": "HexLab98",  # PR #53863 salvage (env-only proxy policy for auxiliary OpenAI clients on macOS; #53702)
+    "<REDACTED_EMAIL>": "fangliquanflq",  # PR #99265 (linear lowercase env-assignment redaction; #99255) - merged directly by maintainer
+    "<REDACTED_EMAIL>": "sycamoregroupltd",  # PR #97779 salvage (estop fleet-root sentinel for profile gateways)
+    "<REDACTED_EMAIL>": "Blaryxoff",  # PR #32602 salvage (deep-merge PUT /api/config to preserve unrelated sections; #13396)
+    "<REDACTED_EMAIL>": "DiamondEyesFox",  # PR #53351 salvage (rebaseline in-place compression flushes to prevent duplicate compacted rows; #9096)
+    "<REDACTED_EMAIL>": "rlaope",  # PR #35075 salvage (align cron invisible-unicode set with install-time scanner; #35075)
+    "<REDACTED_EMAIL>": "bykim0119",  # PR #22335 salvage (honor "*" wildcard in DISCORD_ALLOWED_USERS; #22334)
+    "<REDACTED_EMAIL>": "rebel0789",  # PR #47308 salvage (redact browser_type typed text across display surfaces; #47197)
+    "<REDACTED_EMAIL>": "agt-user",  # PR #48496 salvage (telegram CLOSE-WAIT polling heartbeat, #48495)
+    "<REDACTED_EMAIL>": "DavidMetcalfe",  # PR #52272 salvage (route reasoning-model thinking-timeouts to timeout not context_overflow + reasoning-specific guidance; #52271)
+    "<REDACTED_EMAIL>": "Tranquil-Flow",  # PR #52623 salvage (auxiliary Anthropic base_url host validation; #52608)
+    "<REDACTED_EMAIL>": "nikshepsvn",  # PR #27426 salvage (two-layer guard against hallucinated acp_command crashing the gateway on hosts with no ACP CLI)
+    "<REDACTED_EMAIL>": "coygeek",  # PR #37735 salvage (redact provider error text at api-server HTTP boundary; #37733)
+    "<REDACTED_EMAIL>": "Tranquil-Flow",  # PR #52623 salvage (auxiliary Anthropic base_url host validation; #52608)
+    "<REDACTED_EMAIL>": "isair",  # PR #50124 salvage (periodic FTS5 segment merge to curb write-lock contention; #54752)
+    "<REDACTED_EMAIL>": "Dr1985",  # PR #42567 salvage (launchd supervision detection + status reporting; #42524)
+    "<REDACTED_EMAIL>": "herbalizer404",  # PR #49076 + #51835 salvage (auxiliary compression fallback: 403/session-usage payment errors + honor fallback chain when aux provider auth unavailable)
+    "<REDACTED_EMAIL>": "pyxl-dev",  # PR #52230 salvage (include rate-limit in auxiliary capacity-error fallback gate; #52228)
+    "<REDACTED_EMAIL>": "yashiels",  # PR #53284 salvage (discord markdown table-to-bullet conversion; #21168)
+    "<REDACTED_EMAIL>": "yungchentang",  # PR #53622 salvage (drain Telegram general send pool on pool timeout before retry; #53524)
+    "<REDACTED_EMAIL>": "595650661",  # PR #37851 salvage (classify MiniMax new_sensitive content filter → content_policy_blocked; #32421)
+    "<REDACTED_EMAIL>": "qWaitCrypto",  # PR #52534 salvage (preserve assistant tool_use cache_control marker in Anthropic conversion so cache breakpoints aren't dropped from the wire)
+    "<REDACTED_EMAIL>": "benbenlijie",  # PR #47205 salvage (named custom-provider extra_body + Z.AI Coding overload adaptive backoff; #50663)
+    "<REDACTED_EMAIL>": "Danamove",  # PR #46726 salvage (kill venv-resident pythonw gateway before recreating venv on Windows; #47036/#47557/#47910)
+    "<REDACTED_EMAIL>": "rc-int",  # PR #9126 salvage / co-author (cap subagent summary size vs parent context overflow)
+    "<REDACTED_EMAIL>": "wgu9",  # PR #51468 salvage (WSL/no-systemd orphan gateway tracking, #51325)
+    "<REDACTED_EMAIL>": "uperLu",  # PR #50958 salvage (rename plugins/cron → plugins/cron_providers; #50872)
+    "<REDACTED_EMAIL>": "yusekiotacode",  # PR #48706 salvage (anthropic OAuth login token endpoint → platform.claude.com; #45250/#49821)
+    "<REDACTED_EMAIL>": "s010mn",  # PR #29221 salvage (ollama-cloud reasoning_effort xhigh→max)
+    "<REDACTED_EMAIL>": "chriswesley4",  # PR #53185 salvage (re-enable titleBarOverlay on plain Linux; missing min/max/close regression)
+    "<REDACTED_EMAIL>": "RafaelMiMi",  # PR #42229 salvage (no-sandbox fallback for AppArmor-restricted Linux desktop launch)
+    "<REDACTED_EMAIL>": "jeeves-assistant",  # PR #50771 (computer-use CuaDriver vision capture routing)
+    "<REDACTED_EMAIL>": "ScotterMonk",  # PR #50145 salvage (cron output truncation: adapter-aware chunking, #50126)
+    "<REDACTED_EMAIL>": "TutkuEroglu",  # PR #50481 salvage (AGENTS.md stale token-lock adapter path)
+    "<REDACTED_EMAIL>": "f-trycua",  # PR #50507 salvage (cross-platform computer_use; supersedes #44221/#30660)
+    "<REDACTED_EMAIL>": "flewe",  # PR #47755 salvage (mcp-oauth: configurable redirect_uri for proxied callbacks, e.g. Tailscale Funnel)
+    "<REDACTED_EMAIL>": "pmos69",  # PR #29474 salvage (native Antigravity OAuth provider; Gemini CLI sunset #29294/#49701)
+    "<REDACTED_EMAIL>": "orbisai0security",  # PR #9560 salvage (session.py path-traversal guard, V-009)
+    "<REDACTED_EMAIL>": "panghuer023",  # PR #37994 salvage (interrupt unblocks pending gateway approval; #8697)
+    "<REDACTED_EMAIL>": "natehale",  # PR #48678 salvage (typing indicator lingers after final reply)
+    "<REDACTED_EMAIL>": "kn8-codes",  # PR #48422 salvage (rich messages opt-in default off)
+    "<REDACTED_EMAIL>": "de1tydev",  # PR #10158 salvage (poll read-only for notify_on_complete watcher; #10156)
+    "<REDACTED_EMAIL>": "skabartem",  # PR #32867 salvage (atomic check-and-replace in _ensure_primary_openai_client; #32846)
+    "<REDACTED_EMAIL>": "szzhoujiarui-sketch",  # cron model.default salvage co-author (#45550)
+    "<REDACTED_EMAIL>": "rayjun",  # cron model.default salvage co-author (#43952)
+    "<REDACTED_EMAIL>": "sweetcornna",  # cron ticker-liveness salvage co-author (#33849)
+    "<REDACTED_EMAIL>": "izumi0uu",  # PR #49544 salvage (native rich reply echo; #49534)
+    "<REDACTED_EMAIL>": "yingliang-zhang",  # PR #56084 (setup RPC pool routing; #57335)
+    "<REDACTED_EMAIL>": "texhy",  # PR #27435 salvage (few-but-huge preflight compression gate; #27405)
+    "<REDACTED_EMAIL>": "qdaszx",  # PR #29190 salvage (non-blocking OSV malware preflight; #29184)
+    "<REDACTED_EMAIL>": "w31rdm4ch1nZ",
+    "<REDACTED_EMAIL>": "x7peeps",
+    "<REDACTED_EMAIL>": "ahmadashfq",
+    "<REDACTED_EMAIL>": "yinkev",  # scratch artifact preservation salvage
+    "<REDACTED_EMAIL>": "rratmansky",
+    "<REDACTED_EMAIL>": "lkz-de",
+    "<REDACTED_EMAIL>": "salesondemandio",
+    "<REDACTED_EMAIL>": "IamSanchoPanza",
+    "<REDACTED_EMAIL>": "victor-kyriazakos",
+    "<REDACTED_EMAIL>": "JoaoMarcos44",
+    "<REDACTED_EMAIL>": "JoaoMarcos44",
+    "<REDACTED_EMAIL>": "neoguyverx",  # PR #60526 salvage (fail-closed write syntax gate; #60525)
+    "<REDACTED_EMAIL>": "srojk34",
+    "<REDACTED_EMAIL>": "srojk34",  # legacy prefix-less noreply (PR #50098 salvage; #38763)
+    "<REDACTED_EMAIL>": "PINKIIILQWQ",  # PR #45035 salvage (resume-to-tip; #38763)
+    "<REDACTED_EMAIL>": "PINKIIILQWQ",  # PR #45035 local git identity (resume-to-tip; #38763)
+    "<REDACTED_EMAIL>": "ailang323",  # PR #48682 salvage (compression-tip predicate; #38763)
+    "<REDACTED_EMAIL>": "sitkarev",
+    "<REDACTED_EMAIL>": "omegazheng",
+    "<REDACTED_EMAIL>": "james47kjv",
+    "<REDACTED_EMAIL>": "1960697431",
+    "<REDACTED_EMAIL>": "XVVH",
+    "<REDACTED_EMAIL>": "definitelynotguru",
+    "<REDACTED_EMAIL>": "ChasLui",
+    "<REDACTED_EMAIL>": "rio-jeong",
+    "<REDACTED_EMAIL>": "Cdddo",
+    "<REDACTED_EMAIL>": "Cdddo",
+    "<REDACTED_EMAIL>": "ArcanePivot",
+    "<REDACTED_EMAIL>": "benegessarit",
+    "<REDACTED_EMAIL>": "MrDiamondBallz",
+    "<REDACTED_EMAIL>": "claudlos",  # PR #52351 salvage (cron base_url exfil guard; #<salvagePR>)
+    "<REDACTED_EMAIL>": "Adolanium",
+    "<REDACTED_EMAIL>": "Kenmege",
+    "<REDACTED_EMAIL>": "xtymac",
+    "<REDACTED_EMAIL>": "Diyoncrz18",
+    "<REDACTED_EMAIL>": "ali-nld",
+    "<REDACTED_EMAIL>": "necoweb3",
+    "<REDACTED_EMAIL>": "DNAlec",  # PR #61743 salvage (honor reset policy in #54878 stale-heal recovery)
+    "<REDACTED_EMAIL>": "joelbrilliant",  # PR #58486 salvage (session-expiry cleanup must not end row as agent_close)
+    "<REDACTED_EMAIL>": "hydracoco7",  # PR #61382 salvage (id-less cron job freeze)
+    "<REDACTED_EMAIL>": "AlexFucuson9",  # PR #61209 salvage (hygiene compression data loss)
+    "<REDACTED_EMAIL>": "shauneccles",  # PR #95433 salvage (compression stall-fallback retry on fallback_chain; #78981)
+    "<REDACTED_EMAIL>": "fedosis",  # PR #94996 salvage (compression rotation dedupe current-turn rows)
+    "<REDACTED_EMAIL>": "adambiggs",  # PR #43819 salvage (holographic shared SQLite connection)
+    "<REDACTED_EMAIL>": "kohoj",  # PR #61667 salvage (nonce-CSP HTML session export)
+    "<REDACTED_EMAIL>": "cypctlinux",  # PR #52403 salvage (Slack bot/workflow auth before no-user-id guard)
+    "<REDACTED_EMAIL>": "YLChen-007",  # PR #26965 (approval remote command substitution)
+    "<REDACTED_EMAIL>": "egilewski",  # co-author, PR #40663
+    "<REDACTED_EMAIL>": "pinguarmy",
+    "<REDACTED_EMAIL>": "joerj123",
+    "<REDACTED_EMAIL>": "AIalliAI",
+    "<REDACTED_EMAIL>": "AIalliAI",
+    "<REDACTED_EMAIL>": "iamlukethedev",
+    "<REDACTED_EMAIL>": "HaozheZhang6",
+    "<REDACTED_EMAIL>": "barronlroth",
+    "<REDACTED_EMAIL>": "OndrejDrapalik",
+    "<REDACTED_EMAIL>": "tomekpanek",
+    "<REDACTED_EMAIL>": "PhilipAD",
+    "<REDACTED_EMAIL>": "underthestars-zhy",
+    "<REDACTED_EMAIL>": "yanxue06",
+    "<REDACTED_EMAIL>": "ARegalado1",
+    "<REDACTED_EMAIL>": "AlchemistChaos",  # co-author only
+    "<REDACTED_EMAIL>": "giladbau",
+    "<REDACTED_EMAIL>": "Dusk1e",
+    "<REDACTED_EMAIL>": "LaPhilosophie",
+    "<REDACTED_EMAIL>": "maxtrigify",
+    "<REDACTED_EMAIL>": "ccook1963",
+    "<REDACTED_EMAIL>": "libre-7",
+    "<REDACTED_EMAIL>": "kristianvast",
+    "<REDACTED_EMAIL>": "RyTsYdUp",
+    "<REDACTED_EMAIL>": "ProgramCaiCai",
+    "<REDACTED_EMAIL>": "bmoore210",
+    "<REDACTED_EMAIL>": "deaneeth",
+    "<REDACTED_EMAIL>": "psionic73",
+    "<REDACTED_EMAIL>": "manishbyatroy",
+    "<REDACTED_EMAIL>": "manus-use",  # PR #51129 salvage (Discord thread-starter dedup, #51057)
+    "<REDACTED_EMAIL>": "TheGardenGallery",
+    "<REDACTED_EMAIL>": "randomsnowflake",
+    "<REDACTED_EMAIL>": "zakame",
+    "<REDACTED_EMAIL>": "jiangkoumo",
+    "<REDACTED_EMAIL>": "qin-ctx",
+    "<REDACTED_EMAIL>": "ViewWay",
+    "<REDACTED_EMAIL>": "m4dni5",
+    "<REDACTED_EMAIL>": "harjothkhara",
+    "<REDACTED_EMAIL>": "HeLLGURD",
+    "<REDACTED_EMAIL>": "synapsesx",
+    "<REDACTED_EMAIL>": "itsflownium",
+    "<REDACTED_EMAIL>": "dirtyren",
+    "<REDACTED_EMAIL>": "juniperbevensee",
+    "<REDACTED_EMAIL>": "krowd3v",
+    "<REDACTED_EMAIL>": "dfein38347g",
+    "<REDACTED_EMAIL>": "thegoodguysla",
+    "<REDACTED_EMAIL>": "s96919",
+    "<REDACTED_EMAIL>": "rasitakyol",
+    "<REDACTED_EMAIL>": "Thatgfsj",
+    "<REDACTED_EMAIL>": "seagpt",
+    "<REDACTED_EMAIL>": "davidrobertson",
+    "<REDACTED_EMAIL>": "HaiderSultanArc",
+    "<REDACTED_EMAIL>": "jjadeo-oss",
+    "<REDACTED_EMAIL>": "juanfradb",
+    "<REDACTED_EMAIL>": "100yenadmin",
+    "<REDACTED_EMAIL>": "doxe0x",
+    "<REDACTED_EMAIL>": "Code-suphub",
+    "<REDACTED_EMAIL>": "Code-suphub",
+    "<REDACTED_EMAIL>": "shuangxinniao",
+    "<REDACTED_EMAIL>": "brendandebeasi",
+    "<REDACTED_EMAIL>": "dorokuma",
+    "<REDACTED_EMAIL>": "liuwei666888",
+    "<REDACTED_EMAIL>": "liuwei666888",
+    "<REDACTED_EMAIL>": "justinschille",
+    "<REDACTED_EMAIL>": "unsupportedpastels",
+    "<REDACTED_EMAIL>": "John-Lussier",
+    "<REDACTED_EMAIL>": "bytesnail",  # PR #60360 salvage (--yolo startup ordering; #60328)
+    "<REDACTED_EMAIL>": "nullptr0807",  # PR #60956 salvage (gateway hygiene in-place compaction; #60947)
+    "<REDACTED_EMAIL>": "embwl0x",  # PR #60810 salvage (channel directory offload)
+    "<REDACTED_EMAIL>": "doncazper",
+    "<REDACTED_EMAIL>": "alex107ivanov",
+    "<REDACTED_EMAIL>": "rungmc357",
+    "<REDACTED_EMAIL>": "flo1t",
+    "<REDACTED_EMAIL>": "fanyangCS",
+    "<REDACTED_EMAIL>": "bigstar0920",
+    "<REDACTED_EMAIL>": "tanmayxchoudhary",
+    "<REDACTED_EMAIL>": "AIalliAI",
+    "<REDACTED_EMAIL>": "waseemshahwan",
+    "<REDACTED_EMAIL>": "hellno",
+    "<REDACTED_EMAIL>": "devatnull",
+    "<REDACTED_EMAIL>": "Marxb85",
+    "<REDACTED_EMAIL>": "yyzquwu",  # PR #47567 salvage (Matrix: register inbound handlers with wait_sync=True so _dispatch_sync's gather awaits them; without it mautrix fire-and-forgets and inbound intake has no completion point)
+    "<REDACTED_EMAIL>": "jearnest11",  # PR #48700 salvage (multi-profile gateway flap: use node symlink's own parent, not .resolve() target, when building systemd/launchd service PATH so one profile's node path can't leak into every unit and force a perpetual daemon-reload restart loop)
+    "<REDACTED_EMAIL>": "tgmerritt",  # PR #43553 salvage (parse vLLM's token-based output-cap error format so over-cap max_tokens 400s reduce the output cap instead of death-looping into compression)
+    "<REDACTED_EMAIL>": "justin-cyhuang",
+    "<REDACTED_EMAIL>": "Tranquil-Flow",
+    "jason@hermes-jc": "jcjc81",
+    "<REDACTED_EMAIL>": "friendshipisover",
+    "<REDACTED_EMAIL>": "MattKotsenas",
+    "<REDACTED_EMAIL>": "ypwcharles",
+    "<REDACTED_EMAIL>": "marco0158",
+    "<REDACTED_EMAIL>": "lkevincc0",
+    "<REDACTED_EMAIL>": "Cossackx",  # PR #52528 salvage (Windows hermes-shim resolution + prefer --update on recovery; #52378)
+    "<REDACTED_EMAIL>": "Icather",  # PR #45554 salvage (self-lock guard breaks Windows update-recovery infinite loop; #52378 / #45542)
+    "--email": "<REDACTED_EMAIL>",
+    "<REDACTED_EMAIL>": "francescomucio",
+    "<REDACTED_EMAIL>": "thestral123",
+    "<REDACTED_EMAIL>": "tkwong",
+    "<REDACTED_EMAIL>": "buihongduc132",
+    "<REDACTED_EMAIL>": "EtherAura",  # PR #45205 salvage (Linux in-app update relaunch / GUI-skew terminal state)
+    "<REDACTED_EMAIL>": "valentt",
+    "<REDACTED_EMAIL>": "devorun",
+    "<REDACTED_EMAIL>": "x7peeps",
+    "<REDACTED_EMAIL>": "andressommerhoff",
+    "<REDACTED_EMAIL>": "x7peeps",
+    "<REDACTED_EMAIL>": "skyc1e",
+    "<REDACTED_EMAIL>": "namredips",
+    "<REDACTED_EMAIL>": "whoislikemiha",
+    "<REDACTED_EMAIL>": "m24927605",
+    "<REDACTED_EMAIL>": "gdeyoung",
+    "<REDACTED_EMAIL>": "GauravPatil2515",
+    "<REDACTED_EMAIL>": "Sworntech-dev",
+    "<REDACTED_EMAIL>": "jvradahellys24-art",
+    "<REDACTED_EMAIL>": "bbopen",
+    "<REDACTED_EMAIL>": "BBCrypto-web",
+    "<REDACTED_EMAIL>": "asimons81",
+    "<REDACTED_EMAIL>": "HwangJohn",
+    "<REDACTED_EMAIL>": "anderskev",
+    "<REDACTED_EMAIL>": "alloevil",
+    "<REDACTED_EMAIL>": "aieng-abdullah",
+    "<REDACTED_EMAIL>": "loes5050",
+    "<REDACTED_EMAIL>": "Tortugasaur",
+    "<REDACTED_EMAIL>": "DrZM007",
+    "<REDACTED_EMAIL>": "yapsrubricsz0",
+    "<REDACTED_EMAIL>": "Railway9784",
+    "<REDACTED_EMAIL>": "graphanov",
+    "<REDACTED_EMAIL>": "Antimatter543",
+    "<REDACTED_EMAIL>": "mkslzk",
+    "<REDACTED_EMAIL>": "baolingao",
+    "<REDACTED_EMAIL>": "hakanpak",
+    "<REDACTED_EMAIL>": "lgalabru",
+    "<REDACTED_EMAIL>": "johnjacobkenny",
+    "<REDACTED_EMAIL>": "channkim",
+    "<REDACTED_EMAIL>": "xxchan",
+    "<REDACTED_EMAIL>": "x1erra",
+    "<REDACTED_EMAIL>": "zimigit2020",
+    "<REDACTED_EMAIL>": "ft-ioxcs",
+    "<REDACTED_EMAIL>": "0xneobyte",
+    "<REDACTED_EMAIL>": "Veritas-7",
+    "<REDACTED_EMAIL>": "kmccammon",
+    "<REDACTED_EMAIL>": "CiarasClaws",
+    "<REDACTED_EMAIL>": "WolframRavenwolf",
+    "<REDACTED_EMAIL>": "WolframRavenwolf",
+    "<REDACTED_EMAIL>": "895252509",
+    "<REDACTED_EMAIL>": "zxcasongs",
+    "<REDACTED_EMAIL>": "alfred-smith-0",
+    "<REDACTED_EMAIL>": "tangtaizong666",
+    "<REDACTED_EMAIL>": "aldoeliacim",
+    "<REDACTED_EMAIL>": "MaxFreedomPollard",
+    "<REDACTED_EMAIL>": "achaljhawar",
+    "<REDACTED_EMAIL>": "claytonchew",
+    "<REDACTED_EMAIL>": "hbentel",
+    "<REDACTED_EMAIL>": "justinbao19",
+    "<REDACTED_EMAIL>": "kdunn926",
+    "<REDACTED_EMAIL>": "mvanhorn",
+    "<REDACTED_EMAIL>": "youjunxiaji",
+    "<REDACTED_EMAIL>": "NormallyGaussian",
+    "<REDACTED_EMAIL>": "mollusk",
+    "<REDACTED_EMAIL>": "temalo",
+    "<REDACTED_EMAIL>": "alarcritty",
+    "<REDACTED_EMAIL>": "islam666",
+    "<REDACTED_EMAIL>": "mnajafian-nv",
+    "<REDACTED_EMAIL>": "lsaether",
+    "<REDACTED_EMAIL>": "JimStenstrom",
+    "<REDACTED_EMAIL>": "rodboev",
+    "<REDACTED_EMAIL>": "dangelo352",
+    "<REDACTED_EMAIL>": "zhaoleibd",
+    "<REDACTED_EMAIL>": "jeffrobodie-glitch",
+    "<REDACTED_EMAIL>": "kyssta-exe",
+    "<REDACTED_EMAIL>": "kyssta-exe",  # PR #55657 salvage (read-before-write invariant for background-review skill patches; #55647)
+    "<REDACTED_EMAIL>": "ITheEqualizer",
+    "<REDACTED_EMAIL>": "stremtec",
+    "<REDACTED_EMAIL>": "solaitken",
+    "<REDACTED_EMAIL>": "worlldz",
+    "<REDACTED_EMAIL>": "vladkvlchk",
+    "<REDACTED_EMAIL>": "ThyFriendlyFox",
+    "<REDACTED_EMAIL>": "truenorth-lj",
+    "<REDACTED_EMAIL>": "nepenth",
+    "<REDACTED_EMAIL>": "benfrank241",
+    "<REDACTED_EMAIL>": "SaguaroDev",
+    "<REDACTED_EMAIL>": "Subway2023",
+    "<REDACTED_EMAIL>": "tmchow",
+    "<REDACTED_EMAIL>": "a1245582339",
+    "<REDACTED_EMAIL>": "mathijsvandenhurk",
+    "<REDACTED_EMAIL>": "davidgut1982",
+    "<REDACTED_EMAIL>": "SeaXen",
+    "<REDACTED_EMAIL>": "LengR",
+    "<REDACTED_EMAIL>": "Kewe63",
+    "<REDACTED_EMAIL>": "Kewe63",
+    "<REDACTED_EMAIL>": "CharZhou",
+    "<REDACTED_EMAIL>": "HashClawAI",
+    "<REDACTED_EMAIL>": "TonyPepeBear",
+    "<REDACTED_EMAIL>": "nielskaspers",
+    "<REDACTED_EMAIL>": "bpasquini",
+    "<REDACTED_EMAIL>": "kurobaryo",
+    "<REDACTED_EMAIL>": "scubamount",
+    "<REDACTED_EMAIL>": "youngstar-eth",
+    "<REDACTED_EMAIL>": "alelpoan",
+    "<REDACTED_EMAIL>": "alelpoan",
+    "<REDACTED_EMAIL>": "Aman113114-IITD",
+    "<REDACTED_EMAIL>": "octavioturra",
+    "<REDACTED_EMAIL>": "ryo-solo",
+    "<REDACTED_EMAIL>": "Twanislas",
+    "<REDACTED_EMAIL>": "adam91holt",
+    "<REDACTED_EMAIL>": "kchuang1015",
+    "<REDACTED_EMAIL>": "MaheshtheDev",
+    "<REDACTED_EMAIL>": "kyssta-exe",
+    "<REDACTED_EMAIL>": "ashishpatel26",
+    "<REDACTED_EMAIL>": "fujinice",
+    "<REDACTED_EMAIL>": "carltonawong",
+    "<REDACTED_EMAIL>": "EvilHumphrey",
+    "<REDACTED_EMAIL>": "superearn-fisher",
+    "<REDACTED_EMAIL>": "kpadilha",
+    "<REDACTED_EMAIL>": "chaconne67",
+    "<REDACTED_EMAIL>": "Pluviobyte",
+    "<REDACTED_EMAIL>": "sanghyuk-seo-nexcube",
+    "<REDACTED_EMAIL>": "Brixyy",
+    "<REDACTED_EMAIL>": "wangpuv",
+    "<REDACTED_EMAIL>": "ticketclosed-wontfix",
+    "<REDACTED_EMAIL>": "victorGPT",
+    "<REDACTED_EMAIL>": "xiaoxinova",
+    "<REDACTED_EMAIL>": "wenchengxucool",
+    "<REDACTED_EMAIL>": "Frowtek",
+    "<REDACTED_EMAIL>": "julio-cloudvisor",
+    "<REDACTED_EMAIL>": "kweiner",
+    "<REDACTED_EMAIL>": "kweiner",
+    "<REDACTED_EMAIL>": "faisfamilytravel",
+    "<REDACTED_EMAIL>": "baofuen",
+    "<REDACTED_EMAIL>": "Interstellar-code",
+    "<REDACTED_EMAIL>": "Interstellar-code",
+    "<REDACTED_EMAIL>": "tillfalko",
+    "<REDACTED_EMAIL>": "fesalfayed",
+    "<REDACTED_EMAIL>": "maxcz79",
+    # teknium (multiple emails)
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "kenyonxu",
+    "<REDACTED_EMAIL>": "CipherFrame",
+    "<REDACTED_EMAIL>": "donovan-yohan",
+    "<REDACTED_EMAIL>": "jacevys",
+    "<REDACTED_EMAIL>": "CNSeniorious000",
+    "<REDACTED_EMAIL>": "YarrowQiao",
+    "<REDACTED_EMAIL>": "erhnysr",
+    "<REDACTED_EMAIL>": "0xdany",  # PR #26124 salvage (chat argv off event loop)
+    "<REDACTED_EMAIL>": "WorldWriter",
+    "<REDACTED_EMAIL>": "WorldWriter",
+    "<REDACTED_EMAIL>": "Strontvod",
+    "<REDACTED_EMAIL>": "someaka",
+    "<REDACTED_EMAIL>": "Jaggia",
+    "<REDACTED_EMAIL>": "steveonjava",
+    "<REDACTED_EMAIL>": "steveonjava",
+    "<REDACTED_EMAIL>": "MoonRay305",
+    "<REDACTED_EMAIL>": "annguyenNous",
+    "<REDACTED_EMAIL>": "simpolism",
+    "<REDACTED_EMAIL>": "simpolism",
+    "<REDACTED_EMAIL>": "simpolism",
+    "<REDACTED_EMAIL>": "vKongv",
+    "<REDACTED_EMAIL>": "devatnull",
+    "<REDACTED_EMAIL>": "discodirector",
+    "<REDACTED_EMAIL>": "TruaShamu",
+    "<REDACTED_EMAIL>": "Stark-X",
+    "<REDACTED_EMAIL>": "nthrow",
+    "<REDACTED_EMAIL>": "mikeyobrien",
+    "<REDACTED_EMAIL>": "falasi",
+    "<REDACTED_EMAIL>": "chdlc",
+    "<REDACTED_EMAIL>": "nycomar",
+    "<REDACTED_EMAIL>": "qiyin-code",
+    "<REDACTED_EMAIL>": "aashizpoudel",
+    "<REDACTED_EMAIL>": "AdityaRajeshGadgil",
+    "<REDACTED_EMAIL>": "shaun0927",
+    "<REDACTED_EMAIL>": "Soju06",
+    "<REDACTED_EMAIL>": "Soju06",
+    "<REDACTED_EMAIL>": "Bihruze",
+    "<REDACTED_EMAIL>": "Lempkey",
+    "<REDACTED_EMAIL>": "m0n3r0",
+    "<REDACTED_EMAIL>": "leeseoki0",
+    "<REDACTED_EMAIL>": "kronexoi",
+    "<REDACTED_EMAIL>": "vgocoder",
+    "<REDACTED_EMAIL>": "Schrotti77",
+    "<REDACTED_EMAIL>": "devwdave",
+    "<REDACTED_EMAIL>": "devwdave",
+    "<REDACTED_EMAIL>": "zapabob",
+    "<REDACTED_EMAIL>": "zapabob",
+    "<REDACTED_EMAIL>": "jfuenmayor",
+    "<REDACTED_EMAIL>": "Jiahui-Gu",
+    "<REDACTED_EMAIL>": "YLChen-007",
+    "<REDACTED_EMAIL>": "xzessmedia",
+    "<REDACTED_EMAIL>": "AdamPlatin123",
+    "<REDACTED_EMAIL>": "waefrebeorn",
+    "<REDACTED_EMAIL>": "dusterbloom",
+    "<REDACTED_EMAIL>": "basilalshukaili",
+    "<REDACTED_EMAIL>": "basilalshukaili",
+    "<REDACTED_EMAIL>": "liuhao1024",
+    "<REDACTED_EMAIL>": "Rivuza",
+    "<REDACTED_EMAIL>": "annguyenNous",
+    "<REDACTED_EMAIL>": "annguyenNous",
+    "<REDACTED_EMAIL>": "devatnull",
+    "<REDACTED_EMAIL>": "kylekahraman",
+    "<REDACTED_EMAIL>": "kylekahraman",
+    "<REDACTED_EMAIL>": "seppegadeyne",
+    "<REDACTED_EMAIL>": "seppegadeyne",
+    "<REDACTED_EMAIL>": "blackpilledsoftware-prog",
+    "<REDACTED_EMAIL>": "blackpilledsoftware-prog",
+    "<REDACTED_EMAIL>": "dsr-restyn",
+    "<REDACTED_EMAIL>": "WuKongAI-CMU",
+    "<REDACTED_EMAIL>": "codeblackhole1024",
+    "<REDACTED_EMAIL>": "Lempkey",
+    "<REDACTED_EMAIL>": "nidhi-singh02",
+    "<REDACTED_EMAIL>": "aashizpoudel",
+    "<REDACTED_EMAIL>": "olisikh",
+    "<REDACTED_EMAIL>": "JithendraNara",
+    "<REDACTED_EMAIL>": "islam666",
+    "<REDACTED_EMAIL>": "islam666",
+    "<REDACTED_EMAIL>": "outdoorsea",
+    "<REDACTED_EMAIL>": "thedavidmurray",
+    "<REDACTED_EMAIL>": "leoneparise",
+    "<REDACTED_EMAIL>": "mrshu",
+    "<REDACTED_EMAIL>": "am423",
+    "<REDACTED_EMAIL>": "ygd58",
+    "<REDACTED_EMAIL>": "buntingszn",
+    "<REDACTED_EMAIL>": "Alex-yang00",
+    "<REDACTED_EMAIL>": "yangguangjin",
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "Glucksberg",
+    "<REDACTED_EMAIL>": "Glucksberg",
+    "<REDACTED_EMAIL>": "thelumiereguy",
+    "<REDACTED_EMAIL>": "pnascimento9596",
+    "<REDACTED_EMAIL>": "dskwe",
+    "<REDACTED_EMAIL>": "wuli666",
+    "<REDACTED_EMAIL>": "tw2818",
+    "<REDACTED_EMAIL>": "counterposition",
+    "<REDACTED_EMAIL>": "Korkyzer",
+    "<REDACTED_EMAIL>": "zhengyn0001",
+    "<REDACTED_EMAIL>": "littlewwwhite",
+    "<REDACTED_EMAIL>": "db-aeon",
+    "<REDACTED_EMAIL>": "ahmedbadr3",
+    "<REDACTED_EMAIL>": "CoinTheHat",
+    "<REDACTED_EMAIL>": "curiouscleo",
+    "<REDACTED_EMAIL>": "hrkzogw",
+    "<REDACTED_EMAIL>": "dandacompany",
+    "<REDACTED_EMAIL>": "TreyDong",
+    "<REDACTED_EMAIL>": "explainanalyze",
+    "<REDACTED_EMAIL>": "pkyanam",
+    "<REDACTED_EMAIL>": "1000Delta",
+    "<REDACTED_EMAIL>": "1000Delta",
+    "<REDACTED_EMAIL>": "szymonclawd",
+    "<REDACTED_EMAIL>": "szymonclawd",
+    "<REDACTED_EMAIL>": "worlldz",
+    "<REDACTED_EMAIL>": "luoyuctl",
+    "<REDACTED_EMAIL>": "luoyuctl",
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "InB4DevOps",
+    "<REDACTED_EMAIL>": "InB4DevOps",
+    "<REDACTED_EMAIL>": "AhmetArif0",
+    "<REDACTED_EMAIL>": "purzbeats",
+    "<REDACTED_EMAIL>": "Hugo-SEQUIER",
+    "<REDACTED_EMAIL>": "Kylejeong2",
+    "<REDACTED_EMAIL>": "Gutslabs",
+    "<REDACTED_EMAIL>": "nocturnum91",
+    "<REDACTED_EMAIL>": "gianfrancopiana",
+    "<REDACTED_EMAIL>": "Abd0r",
+    "<REDACTED_EMAIL>": "HuangYuChuh",
+    "<REDACTED_EMAIL>": "hrygo",
+    "<REDACTED_EMAIL>": "hrygo",
+    "<REDACTED_EMAIL>": "eren-karakus0",
+    "<REDACTED_EMAIL>": "Freeman-Consulting",
+    "<REDACTED_EMAIL>": "rahimsais",
+    "<REDACTED_EMAIL>": "rahimsais",
+    "<REDACTED_EMAIL>": "NivOO5",
+    "<REDACTED_EMAIL>": "NivOO5",
+    "<REDACTED_EMAIL>": "kjames2001",
+    "<REDACTED_EMAIL>": "kjames2001",
+    "<REDACTED_EMAIL>": "wilsen0",
+    "<REDACTED_EMAIL>": "Abd0r",
+    "<REDACTED_EMAIL>": "oswaldb22",
+    "<REDACTED_EMAIL>": "AJV20",
+    "<REDACTED_EMAIL>": "masonjames",
+    "<REDACTED_EMAIL>": "amethystani",
+    "<REDACTED_EMAIL>": "liquidchen",
+    "<REDACTED_EMAIL>": "subtract0",
+    "<REDACTED_EMAIL>": "ReqX",
+    "<REDACTED_EMAIL>": "qWaitCrypto",
+    "<REDACTED_EMAIL>": "kidonng",
+    "<REDACTED_EMAIL>": "ayushere",
+    "<REDACTED_EMAIL>": "DanielLSM",
+    "<REDACTED_EMAIL>": "v1b3coder",
+    "<REDACTED_EMAIL>": "ming1523",
+    "<REDACTED_EMAIL>": "Qwinty",
+    "<REDACTED_EMAIL>": "Que0x",
+    "<REDACTED_EMAIL>": "CalmProton",
+    "<REDACTED_EMAIL>": "mbac",
+    "<REDACTED_EMAIL>": "nicoechaniz",
+    "<REDACTED_EMAIL>": "Ninso112",
+    "<REDACTED_EMAIL>": "wesleysimplicio",
+    "<REDACTED_EMAIL>": "SiliconID",
+    "<REDACTED_EMAIL>": "xieNniu",
+    "<REDACTED_EMAIL>": "wali-reheman",
+    "<REDACTED_EMAIL>": "uzunkuyruk",
+    "<REDACTED_EMAIL>": "Zhekinmaksim",
+    "<REDACTED_EMAIL>": "KvnGz",
+    "<REDACTED_EMAIL>": "MottledShadow",
+    "<REDACTED_EMAIL>": "adamludwin",
+    "<REDACTED_EMAIL>": "NikolayGusev-astra",
+    "<REDACTED_EMAIL>": "liuguangyong93",
+    "<REDACTED_EMAIL>": "exiao",
+    "<REDACTED_EMAIL>": "nik1t7n",
+    "<REDACTED_EMAIL>": "ggnnggez",
+    "<REDACTED_EMAIL>": "ehz0ah",
+    "<REDACTED_EMAIL>": "eloklam",
+    "<REDACTED_EMAIL>": "kyan12",
+    "<REDACTED_EMAIL>": "rylena",
+    "<REDACTED_EMAIL>": "jatingodnani",
+    "<REDACTED_EMAIL>": "adybag14-cyber",
+    "<REDACTED_EMAIL>": "tmimmanuel",
+    "<REDACTED_EMAIL>": "donramon77",
+    "<REDACTED_EMAIL>": "IMHaoyan",
+    "<REDACTED_EMAIL>": "revaraver",
+    "<REDACTED_EMAIL>": "dengtaoyuan450-a11y",
+    "<REDACTED_EMAIL>": "Junass1",
+    "<REDACTED_EMAIL>": "Bartok9",
+    "<REDACTED_EMAIL>": "Bartok9",
+    "<REDACTED_EMAIL>": "erhnysr",  # PR #25198 salvage (tool-progress flood-control)
+    "<REDACTED_EMAIL>": "CryptoByz",  # PR #25630 salvage (polling conflict Stage 1+2)
+    "<REDACTED_EMAIL>": "fabiosiqueira",  # PR #27212 salvage (bg-process notif anchor)
+    "<REDACTED_EMAIL>": "falconexe",  # PR #24511 salvage (sticky-IP reset)
+    "<REDACTED_EMAIL>": "fonhal",  # PR #27865/#27861 salvage (mention entities / typing fallback)
+    "<REDACTED_EMAIL>": "Zyrixtrex",  # PR #26754 salvage (avoid duplicate text after auto-TTS)
+    "<REDACTED_EMAIL>": "nftpoetrist",  # PR #25856 salvage (escape slash-confirm preview)
+    "<REDACTED_EMAIL>": "samahn0601",  # PR #27887 salvage (retry wrapped connect timeouts)
+    "<REDACTED_EMAIL>": "aqilaziz",  # PR #26406 salvage (preserve native audio outside Telegram)
+    "<REDACTED_EMAIL>": "karthikeyann",  # PR #26609 salvage (DM-topic routing pin)
+    "<REDACTED_EMAIL>": "kunci115",  # PR #27098 salvage (thread-not-found retry)
+    "<REDACTED_EMAIL>": "hayka-pacha",  # PR #25270 salvage (registry-aware mcp_ prefix strip)
+    "<REDACTED_EMAIL>": "chromalinx",  # PR #27014 salvage (commands for groups+DM)
+    "<REDACTED_EMAIL>": "chromalinx",  # PR #37026 salvage (SSL CA guard)
+    "<REDACTED_EMAIL>": "booker1207",  # PR #25132 salvage (gate profile bots by allowed topics)
+    "<REDACTED_EMAIL>": "kiranvk-2011",  # PR #24815 salvage (image documents → vision)
+    "<REDACTED_EMAIL>": "rak135",  # PR #25960 salvage (Windows /restart)
+    "<REDACTED_EMAIL>": "B0Tch1",  # PR #27634 salvage (disable_topic_auto_rename)
+    "<REDACTED_EMAIL>": "jackjin1997",  # PR #27239 salvage (restore DM topic thread_id after split)
+    "<REDACTED_EMAIL>": "soynchux",  # PR #27806 salvage (chat-scoped auth without user_id)
+    "<REDACTED_EMAIL>": "el-analista",  # PR #25368 salvage (cron topic fallback report)
+    "<REDACTED_EMAIL>": "khungate",  # PR #25829 salvage (gmail-triage gt: callbacks)
+    "<REDACTED_EMAIL>": "stevehq26-bot",  # PR #28015 salvage (quick-command-only menus)
+    "<REDACTED_EMAIL>": "brndnsvr",  # PR #25327 salvage (channel post updates)
+    "<REDACTED_EMAIL>": "houenyang-momo",  # PR #24014 salvage (quiet noisy errors)
+    "<REDACTED_EMAIL>": "OCWC22",  # PR #24581 salvage (multi-bot exclusive mentions)
+    "<REDACTED_EMAIL>": "ai-hana-ai",  # PR #23928 salvage (ignore_root_dm)
+    "<REDACTED_EMAIL>": "indigokarasu",  # PR #26636 salvage (pin user message)
+    "<REDACTED_EMAIL>": "alber70g",  # PR #25280 salvage (skip-STT + 2GB cap)
+    "<REDACTED_EMAIL>": "eliteworkstation94-ai",  # PR #28157 salvage (group reply session splits)
+    "<REDACTED_EMAIL>": "hllqkb",
+    "<REDACTED_EMAIL>": "Bongulielmi",
+    "<REDACTED_EMAIL>": "JTroyerOvermatch",
+    "<REDACTED_EMAIL>": "tt-a1i",  # PR #48933 (SSE-only Anthropic stream aggregation, #48923)
+    "<REDACTED_EMAIL>": "hharry11",
+    "<REDACTED_EMAIL>": "wysie",
+    "<REDACTED_EMAIL>": "RonHillDev",  # PR #29523 salvage (machine-local commit email)
+    "<REDACTED_EMAIL>": "Moikapy",  # PR #31527 salvage
+    "<REDACTED_EMAIL>": "gbarany",  # PR #27907 salvage (xAI sanitizer deepcopy)
+    "<REDACTED_EMAIL>": "Nami4D",  # PR #28490 salvage
+    "<REDACTED_EMAIL>": "jkausel-ai",
+    "<REDACTED_EMAIL>": "Es1la",
+    "<REDACTED_EMAIL>": "stephen0110",
+    "<REDACTED_EMAIL>": "sonic-netizen",
+    "<REDACTED_EMAIL>": "mwnickerson",
+    "<REDACTED_EMAIL>": "SandroHub013",
+    "<REDACTED_EMAIL>": "maciekczech",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "cyb0rgk1tty",
+    "<REDACTED_EMAIL>": "cyb0rgk1tty",
+    "<REDACTED_EMAIL>": "chimpera",
+    "<REDACTED_EMAIL>": "cmullins70",
+    "<REDACTED_EMAIL>": "zeejaytan",
+    "<REDACTED_EMAIL>": "Aslaaen",
+    "<REDACTED_EMAIL>": "Tkander1715",
+    "<REDACTED_EMAIL>": "beardthelion",
+    "<REDACTED_EMAIL>": "orcool",
+    "<REDACTED_EMAIL>": "tangyuanjc",
+    "<REDACTED_EMAIL>": "agentlinker",
+    "<REDACTED_EMAIL>": "npmisantosh",
+    "<REDACTED_EMAIL>": "luarss",
+    "<REDACTED_EMAIL>": "zccyman",
+    "<REDACTED_EMAIL>": "zccyman",  # PR #26998 (auxiliary fallback chain)
+    "<REDACTED_EMAIL>": "Osraka",
+    "<REDACTED_EMAIL>": "Osraka",
+    "<REDACTED_EMAIL>": "ryptotalent",
+    "<REDACTED_EMAIL>": "hookinglau",
+    "<REDACTED_EMAIL>": "AllynSheep",
+    "<REDACTED_EMAIL>": "AllynSheep",
+    "<REDACTED_EMAIL>": "aqilaziz",
+    "<REDACTED_EMAIL>": "aqilaziz",
+    "<REDACTED_EMAIL>": "laoli-no1",
+    "<REDACTED_EMAIL>": "laoli-no1",
+    "<REDACTED_EMAIL>": "NorethSea",
+    "<REDACTED_EMAIL>": "NorethSea",
+    "<REDACTED_EMAIL>": "JamesX88",
+    "<REDACTED_EMAIL>": "JamesX88",
+    "<REDACTED_EMAIL>": "novax635",
+    "<REDACTED_EMAIL>": "Krionex",
+    "<REDACTED_EMAIL>": "rxdxxxx",
+    "<REDACTED_EMAIL>": "MaHaoHao-ch",
+    "<REDACTED_EMAIL>": "xydigit-zt",
+    "<REDACTED_EMAIL>": "revaraver",
+    "<REDACTED_EMAIL>": "TheEpTic",
+    "<REDACTED_EMAIL>": "wmagev",
+    "<REDACTED_EMAIL>": "ashermorse",
+    "<REDACTED_EMAIL>": "happy5318",
+    "<REDACTED_EMAIL>": "wabrent",
+    "<REDACTED_EMAIL>": "CashWilliams",
+    "<REDACTED_EMAIL>": "chengoak",
+    "<REDACTED_EMAIL>": "qxxaa",
+    "<REDACTED_EMAIL>": "guillaumemeyer",
+    "<REDACTED_EMAIL>": "EmelyanenkoK",
+    "<REDACTED_EMAIL>": "manateelazycat",
+    "<REDACTED_EMAIL>": "Beandon13",
+    "<REDACTED_EMAIL>": "asimons81",
+    "<REDACTED_EMAIL>": "jethac",
+    "<REDACTED_EMAIL>": "vishal-dharm",
+    "<REDACTED_EMAIL>": "deep-name",
+    # LINE messaging plugin (synthesis PR)
+    "<REDACTED_EMAIL>": "leepoweii",
+    "<REDACTED_EMAIL>": "liyoungc",
+    "<REDACTED_EMAIL>": "perng",
+    "<REDACTED_EMAIL>": "soichiyo",
+    "<REDACTED_EMAIL>": "David-0x221Eight",
+    "<REDACTED_EMAIL>": "David-0x221Eight",
+    "<REDACTED_EMAIL>": "yuga-hashimoto",
+    "<REDACTED_EMAIL>": "CES4751",
+    "<REDACTED_EMAIL>": "counterposition",
+    "<REDACTED_EMAIL>": "nidhi-singh02",
+    "<REDACTED_EMAIL>": "Fearvox",
+    "<REDACTED_EMAIL>": "Fearvox",
+    "<REDACTED_EMAIL>": "Hypnus-Yuan",
+    "<REDACTED_EMAIL>": "xsfX20",
+    "<REDACTED_EMAIL>": "binhnt92",
+    "<REDACTED_EMAIL>": "Alix-007",  # PR #54620 salvage (sms: bound Twilio webhook body reads)
+    "<REDACTED_EMAIL>": "acesjohnny",
+    "<REDACTED_EMAIL>": "liu-collab",
+    "<REDACTED_EMAIL>": "haidao1919",
+    "<REDACTED_EMAIL>": "zhanggttry",
+    "<REDACTED_EMAIL>": "formulahendry",
+    "<REDACTED_EMAIL>": "bogerman1",
+    "<REDACTED_EMAIL>": "rob-maron",
+    # Matrix parity salvage batch (April 2026)
+    "sr@samirusani": "samrusani",
+    "<REDACTED_EMAIL>": "angel12",
+    "<REDACTED_EMAIL>": "charles-brooks",
+    # DeepSeek v4 + Kimi thinking-mode reasoning_content salvage (April 2026)
+    "<REDACTED_EMAIL>": "lsdsjy",
+    "<REDACTED_EMAIL>": "season179",
+    "<REDACTED_EMAIL>": "heathley",
+    "<REDACTED_EMAIL>": "heathley",
+    "<REDACTED_EMAIL>": "dandaka",
+    "<REDACTED_EMAIL>": "cyclingwithelephants",
+    # Temporary tool-progress cleanup salvage (May 2026)
+    "<REDACTED_EMAIL>": "mrcharlesiv",
+    "<REDACTED_EMAIL>": "liizfq",
+    "<REDACTED_EMAIL>": "dhabibi",
+    "<REDACTED_EMAIL>": "JayGwod",
+    "<REDACTED_EMAIL>": "0xKingBack",
+    "<REDACTED_EMAIL>": "SimbaKingjoe",
+    "<REDACTED_EMAIL>": "MaxyMoos",
+    "<REDACTED_EMAIL>": "leprincep35700",
+    # OpenViking viking_read salvage (April 2026)
+    "<REDACTED_EMAIL>": "htsh",
+    "<REDACTED_EMAIL>": "pty819",
+    "<REDACTED_EMAIL>": "pty819",
+    "<REDACTED_EMAIL>": "pty819",
+    "<REDACTED_EMAIL>": "chennest",
+    # Curator fixes (Apr 30 2026)
+    "<REDACTED_EMAIL>": "y0shua1ee",
+    "<REDACTED_EMAIL>": "0xDevNinja",
+    "<REDACTED_EMAIL>": "steezkelly",
+    "<REDACTED_EMAIL>": "btorresgil",
+    "<REDACTED_EMAIL>": "momowind",
+    "<REDACTED_EMAIL>": "misery-hl",
+    "<REDACTED_EMAIL>": "misery-hl",
+    "<REDACTED_EMAIL>": "nik1t7n",
+    "<REDACTED_EMAIL>": "nik1t7n",
+    "<REDACTED_EMAIL>": "suncokret12",
+    "<REDACTED_EMAIL>": "WompaJango",
+    "<REDACTED_EMAIL>": "mioimotoai-lgtm",
+    "<REDACTED_EMAIL>": "heyitsaamir",
+    "<REDACTED_EMAIL>": "johnncenae",
+    "<REDACTED_EMAIL>": "ThomassJonax",
+    "<REDACTED_EMAIL>": "yes999zc",
+    "<REDACTED_EMAIL>": "rmoen",
+    "<REDACTED_EMAIL>": "thirstycrow",  # PR #23630 salvage (config-aware memory status labels)
+    # Slack ephemeral slash-ack salvage (May 2026)
+    "<REDACTED_EMAIL>": "probepark",
+    # Slack batch salvage (May 2026)
+    "<REDACTED_EMAIL>": "priveperfumes",
+    "<REDACTED_EMAIL>": "amroessam",
+    "<REDACTED_EMAIL>": "Hinotoi-agent",
+    "<REDACTED_EMAIL>": "valda",
+    "<REDACTED_EMAIL>": "0z1-ghb",
+    "<REDACTED_EMAIL>": "yes999zc",
+    "<REDACTED_EMAIL>": "DrStrangerUJN",
+    "<REDACTED_EMAIL>": "hejuntt1014",
+    "<REDACTED_EMAIL>": "dlkakbs",
+    "<REDACTED_EMAIL>": "BeliefanX",
+    "<REDACTED_EMAIL>": "changchun989",
+    "<REDACTED_EMAIL>": "Mind-Dragon",
+    "<REDACTED_EMAIL>": "Nanako0129",
+    "<REDACTED_EMAIL>": "westers",
+    "<REDACTED_EMAIL>": "yeyitech",
+    "<REDACTED_EMAIL>": "beenherebefore",
+    "<REDACTED_EMAIL>": "txbxxx",
+    "<REDACTED_EMAIL>": "liuhao1024",
+    "<REDACTED_EMAIL>": "devorun",
+    "<REDACTED_EMAIL>": "iaji",
+    "<REDACTED_EMAIL>": "beesrsj2500",
+    "<REDACTED_EMAIL>": "beesrsj2500",
+    "<REDACTED_EMAIL>": "Mind-Dragon",
+    "<REDACTED_EMAIL>": "JustinUssuri",
+    "<REDACTED_EMAIL>": "ma-pony",
+    "<REDACTED_EMAIL>": "Sonoyunchu",
+    "<REDACTED_EMAIL>": "yatesjalex",
+    "<REDACTED_EMAIL>": "say8hi",
+    "<REDACTED_EMAIL>": "Mirac1eSky",
+    "<REDACTED_EMAIL>": "web3blind",
+    "<REDACTED_EMAIL>": "web3blind",
+    # Sessions export format cluster (July 2026): HTML + prompt-only salvages
+    "<REDACTED_EMAIL>": "simplast",
+    "<REDACTED_EMAIL>": "catbearlove1-lang",
+    "<REDACTED_EMAIL>": "alexg0bot",
+    "<REDACTED_EMAIL>": "scheidti",
+    # Moonshot schema anyOf+enum salvage (May 2026)
+    "<REDACTED_EMAIL>": "hendrixfreire",
+    "<REDACTED_EMAIL>": "benjaminsehl",
+    "<REDACTED_EMAIL>": "Nerijusas",
+    # Compaction salvage batch (May 2026)
+    "<REDACTED_EMAIL>": "MacroAnarchy",
+    "<REDACTED_EMAIL>": "Ito-69",
+    "<REDACTED_EMAIL>": "georgeglessner",
+    "<REDACTED_EMAIL>": "maxims-oss",
+    # Codex Spark restoration salvage (May 2026)
+    "<REDACTED_EMAIL>": "nederev",
+    "<REDACTED_EMAIL>": "askclaw-vesper",
+    "<REDACTED_EMAIL>": "nazirulhafiy",
+    "<REDACTED_EMAIL>": "BadTechBandit",
+    "<REDACTED_EMAIL>": "Yoimex",
+    "<REDACTED_EMAIL>": "romanornr",
+    "<REDACTED_EMAIL>": "foxion37",
+    "<REDACTED_EMAIL>": "bloodcarter",
+    "<REDACTED_EMAIL>": "scotttrinh",
+    "<REDACTED_EMAIL>": "quocanh261997",
+    "<REDACTED_EMAIL>": "savanne-kham",  # PR #28958 salvage (strip tool_name for strict providers)
+    # contributors (from noreply pattern)
+    "<REDACTED_EMAIL>": "davidvv",
+    "<REDACTED_EMAIL>": "xiaoqiang243",
+    "<REDACTED_EMAIL>": "snreynolds",
+    "<REDACTED_EMAIL>": "0xbyt4",
+    "<REDACTED_EMAIL>": "MassiveMassimo",
+    "<REDACTED_EMAIL>": "MassiveMassimo",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "keifergu",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "SHL0MS",
+    "<REDACTED_EMAIL>": "Abnertheforeman",
+    "<REDACTED_EMAIL>": "amanning3390",
+    "<REDACTED_EMAIL>": "tochukwuada",
+    "<REDACTED_EMAIL>": "zicochaos",
+    "<REDACTED_EMAIL>": "hharry11",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "Tosko4",
+    "<REDACTED_EMAIL>": "keiravoss94",
+    "<REDACTED_EMAIL>": "veradim",  # PR #41201 salvage (Z.AI endpoint persist)
+    "<REDACTED_EMAIL>": "stablegenius49",
+    "<REDACTED_EMAIL>": "EKKOLearnAI",
+    "<REDACTED_EMAIL>": "octo-patch",
+    "<REDACTED_EMAIL>": "math0r-be",
+    "<REDACTED_EMAIL>": "simbam99",
+    "<REDACTED_EMAIL>": "irispillars",
+    "<REDACTED_EMAIL>": "stablegenius49",
+    "<REDACTED_EMAIL>": "batuhankocyigit",
+    "<REDACTED_EMAIL>": "ismell0992-afk",
+    "<REDACTED_EMAIL>": "iRonin",
+    "<REDACTED_EMAIL>": "jvcl",
+    "<REDACTED_EMAIL>": "aj-nt",
+    "<REDACTED_EMAIL>": "UgwujaGeorge",
+    "<REDACTED_EMAIL>": "francip",
+    "<REDACTED_EMAIL>": "omnissiah-comelse",
+    "<REDACTED_EMAIL>": "mavrickdeveloper",
+    "<REDACTED_EMAIL>": "vilkasdev",
+    "<REDACTED_EMAIL>": "cutepawss",
+    "<REDACTED_EMAIL>": "memosr",
+    "<REDACTED_EMAIL>": "memosr",
+    "<REDACTED_EMAIL>": "milkoor",
+    "<REDACTED_EMAIL>": "Fatty911",
+    "<REDACTED_EMAIL>": "SHL0MS",
+    "<REDACTED_EMAIL>": "raulvidis",
+    "<REDACTED_EMAIL>": "Aum08Desai",
+    "<REDACTED_EMAIL>": "kshitij-eliza",
+    "<REDACTED_EMAIL>": "Jason2031",
+    "<REDACTED_EMAIL>": "shitcoinsherpa",
+    "<REDACTED_EMAIL>": "Sertug17",
+    "<REDACTED_EMAIL>": "caentzminger",
+    "<REDACTED_EMAIL>": "voidborne-d",
+    "<REDACTED_EMAIL>": "ddupont808",
+    "<REDACTED_EMAIL>": "voidborne-d",
+    "<REDACTED_EMAIL>": "Readon",
+    "<REDACTED_EMAIL>": "sirEven",
+    "<REDACTED_EMAIL>": "sirEven",
+    "<REDACTED_EMAIL>": "insecurejezza",
+    "<REDACTED_EMAIL>": "JezzaHehn",
+    "<REDACTED_EMAIL>": "JezzaHehn",
+    "<REDACTED_EMAIL>": "dodo-reach",
+    "<REDACTED_EMAIL>": "EdderTalmor",  # PR #41575 salvage (prompt-size: pass platform-resolved enabled_toolsets + agent.disabled_toolsets into the inspection agent; #41445)
+    "<REDACTED_EMAIL>": "Bartok9",
+    "<REDACTED_EMAIL>": "banditburai",
+    "<REDACTED_EMAIL>": "Kyzcreig",
+    "<REDACTED_EMAIL>": "Kyzcreig",
+    "<REDACTED_EMAIL>": "crayfish-ai",
+    "<REDACTED_EMAIL>": "MestreY0d4-Uninter",
+    "<REDACTED_EMAIL>": "Roy-oss1",
+    "<REDACTED_EMAIL>": "nosleepcassette",
+    "<REDACTED_EMAIL>": "MestreY0d4-Uninter",
+    "<REDACTED_EMAIL>": "davetist",
+    "<REDACTED_EMAIL>": "yyq4193",
+    "<REDACTED_EMAIL>": "Asunfly",
+    "<REDACTED_EMAIL>": "honghua",
+    "<REDACTED_EMAIL>": "jplew",
+    "<REDACTED_EMAIL>": "nish3451",
+    "<REDACTED_EMAIL>": "Mibayy",
+    "<REDACTED_EMAIL>": "Mibayy",
+    "<REDACTED_EMAIL>": "Mibayy",
+    "<REDACTED_EMAIL>": "Mibayy",
+    "<REDACTED_EMAIL>": "sgaofen",
+    "<REDACTED_EMAIL>": "zhiyanliu",
+    "<REDACTED_EMAIL>": "hhhonzik",
+    "<REDACTED_EMAIL>": "hhuang91",
+    "<REDACTED_EMAIL>": "Satoshi-agi",
+    "<REDACTED_EMAIL>": "kunlabs",
+    "<REDACTED_EMAIL>": "Wang-tianhao",
+    "<REDACTED_EMAIL>": "ghostmfr",
+    "<REDACTED_EMAIL>": "mewwts",
+    "<REDACTED_EMAIL>": "haru398801",
+    "<REDACTED_EMAIL>": "badgerbees",
+    "<REDACTED_EMAIL>": "xnbi",
+    "<REDACTED_EMAIL>": "xiahu88988",
+    "<REDACTED_EMAIL>": "nocoo",
+    "<REDACTED_EMAIL>": "n-WN",
+    "<REDACTED_EMAIL>": "hiddenpuppy",
+    "<REDACTED_EMAIL>": "ygd58",
+    "<REDACTED_EMAIL>": "HiddenPuppy",
+    "<REDACTED_EMAIL>": "jerome-benoit",
+    "<REDACTED_EMAIL>": "Wysie",
+    "<REDACTED_EMAIL>": "keyuyuan",
+    "<REDACTED_EMAIL>": "Only-Code-A",
+    "<REDACTED_EMAIL>": "TroyMitchell911",
+    "<REDACTED_EMAIL>": "zhongyueming1121",
+    "<REDACTED_EMAIL>": "hansnow",
+    "<REDACTED_EMAIL>": "UNLINEARITY",
+    "<REDACTED_EMAIL>": "burtenshaw",
+    "<REDACTED_EMAIL>": "rnijhara",
+    "<REDACTED_EMAIL>": "j0sephz",
+    # contributors (manual mapping from git names)
+    "<REDACTED_EMAIL>": "asheriif",
+    "<REDACTED_EMAIL>": "dyxushuai",
+    "<REDACTED_EMAIL>": "etcircle",
+    "<REDACTED_EMAIL>": "liujinkun2025",
+    "<REDACTED_EMAIL>": "dmahan93",
+    "<REDACTED_EMAIL>": "ifrederico",
+    "<REDACTED_EMAIL>": "cdanis",
+    "<REDACTED_EMAIL>": "samherring99",
+    "<REDACTED_EMAIL>": "crazywriter1",
+    "<REDACTED_EMAIL>": "Aum08Desai",
+    "<REDACTED_EMAIL>": "shannonsands",
+    "<REDACTED_EMAIL>": "shannonsands",
+    "<REDACTED_EMAIL>": "AxDSan",
+    "<REDACTED_EMAIL>": "Erosika",
+    "<REDACTED_EMAIL>": "hjc-puro",
+    "<REDACTED_EMAIL>": "aydnOktay",
+    "<REDACTED_EMAIL>": "Farukest",
+    "<REDACTED_EMAIL>": "rovle",
+    "<REDACTED_EMAIL>": "mengjian-github",
+    "<REDACTED_EMAIL>": "kevinskysunny",
+    "<REDACTED_EMAIL>": "yule975",
+    "<REDACTED_EMAIL>": "meng93",
+    "<REDACTED_EMAIL>": "teyrebaz33",
+    "<REDACTED_EMAIL>": "Linux2010",
+    "<REDACTED_EMAIL>": "elmatadorgh",
+    "<REDACTED_EMAIL>": "elmatadorgh",
+    "<REDACTED_EMAIL>": "alexzhu0",
+    "<REDACTED_EMAIL>": "Swift42",
+    "<REDACTED_EMAIL>": "Ruzzgar",
+    "<REDACTED_EMAIL>": "Yukipukii1",
+    "<REDACTED_EMAIL>": "alireza78a",
+    "<REDACTED_EMAIL>": "OutThisLife",
+    "<REDACTED_EMAIL>": "StefanIsMe",
+    "<REDACTED_EMAIL>": "helix4u",
+    "<REDACTED_EMAIL>": "SidUParis",
+    "<REDACTED_EMAIL>": "Ifkellx",
+    "<REDACTED_EMAIL>": "counterposition",
+    "<REDACTED_EMAIL>": "BrennerSpear",
+    "<REDACTED_EMAIL>": "akhater",
+    "<REDACTED_EMAIL>": "akhater",
+    "<REDACTED_EMAIL>": "handsdiff",
+    "<REDACTED_EMAIL>": "etherman-os",
+    "<REDACTED_EMAIL>": "mark-ramsell",
+    "<REDACTED_EMAIL>": "taeng0204",
+    "<REDACTED_EMAIL>": "gpickett00",
+    "<REDACTED_EMAIL>": "wakamex",
+    "<REDACTED_EMAIL>": "clawdia-nash",
+    "<REDACTED_EMAIL>": "austinpickett",
+    "<REDACTED_EMAIL>": "dieutx",
+    "<REDACTED_EMAIL>": "jaisup",
+    "<REDACTED_EMAIL>": "PercyDikec",
+    "<REDACTED_EMAIL>": "HenkDz",
+    # Azure Foundry salvage (PRs #9029, #4599, #10086, #8766)
+    "<REDACTED_EMAIL>": "TechPrototyper",
+    "<REDACTED_EMAIL>": "HangGlidersRule",
+    "<REDACTED_EMAIL>": "pein892",
+    "<REDACTED_EMAIL>": "deankerr",
+    "<REDACTED_EMAIL>": "socrates1024",
+    "<REDACTED_EMAIL>": "Salt-555",
+    "<REDACTED_EMAIL>": "satelerd",
+    "<REDACTED_EMAIL>": "danklynn",
+    "<REDACTED_EMAIL>": "MattMaximo",
+    "<REDACTED_EMAIL>": "mrhwick",
+    "<REDACTED_EMAIL>": "j3ffffff",
+    "<REDACTED_EMAIL>": "A-FdL-Prog",
+    "<REDACTED_EMAIL>": "l0hde",
+    "<REDACTED_EMAIL>": "difujia",
+    "<REDACTED_EMAIL>": "trevorgordon981",  # PR #50590 co-author (prefer endpoints.api for Copilot base URL + empty-base-URL guard; #50252)
+    "<REDACTED_EMAIL>": "vominh1919",
+    "<REDACTED_EMAIL>": "YueLich",
+    "<REDACTED_EMAIL>": "andyylin",
+    "<REDACTED_EMAIL>": "jakubkrcmar",
+    "<REDACTED_EMAIL>": "prasadus92",
+    "<REDACTED_EMAIL>": "mssteuer",
+    "<REDACTED_EMAIL>": "konsisumer",
+    "<REDACTED_EMAIL>": "amanuel2",
+    "<REDACTED_EMAIL>": "alexzhu0",
+    "<REDACTED_EMAIL>": "AntAISecurityLab",
+    "<REDACTED_EMAIL>": "briandevans",
+    "<REDACTED_EMAIL>": "tcconnally",
+    "<REDACTED_EMAIL>": "mijanx",
+    "<REDACTED_EMAIL>": "inchargeautomation-lab",
+    "<REDACTED_EMAIL>": "Bartok9",
+    "<REDACTED_EMAIL>": "kuangmi-bit",
+    "<REDACTED_EMAIL>": "sweetcornna",
+    "<REDACTED_EMAIL>": "briancl2",
+    "<REDACTED_EMAIL>": "CruxExperts",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "Kailigithub",
+    "<REDACTED_EMAIL>": "vlwkaos",
+    "<REDACTED_EMAIL>": "Oxidane-bot",
+    "<REDACTED_EMAIL>": "Tranquil-Flow",
+    "<REDACTED_EMAIL>": "Tranquil-Flow",
+    "<REDACTED_EMAIL>": "mcndjxlefnd",
+    "<REDACTED_EMAIL>": "Wangshengyang2004",
+    "<REDACTED_EMAIL>": "H-Ali13381",
+    "<REDACTED_EMAIL>": "XieNBi",
+    "<REDACTED_EMAIL>": "maymuneth",
+    "<REDACTED_EMAIL>": "nightq",
+    "<REDACTED_EMAIL>": "5park1e",
+    "<REDACTED_EMAIL>": "5park1e",
+    "<REDACTED_EMAIL>": "innocarpe",
+    "<REDACTED_EMAIL>": "qike-ms",
+    "<REDACTED_EMAIL>": "AndreKurait",
+    "<REDACTED_EMAIL>": "bsgdigital",
+    "<REDACTED_EMAIL>": "nummanali",
+    "<REDACTED_EMAIL>": "whitehatjr1001",
+    "<REDACTED_EMAIL>": "0xNyk",
+    "<REDACTED_EMAIL>": "0xNyk",
+    "<REDACTED_EMAIL>": "buray",
+    "<REDACTED_EMAIL>": "joshmartinelle",
+    "<REDACTED_EMAIL>": "tekelala",
+    "<REDACTED_EMAIL>": "vincentcharlebois",
+    "<REDACTED_EMAIL>": "aryansingh",
+    "<REDACTED_EMAIL>": "voteblake",
+    "<REDACTED_EMAIL>": "pedh",
+    "<REDACTED_EMAIL>": "haileymarshall",
+    "<REDACTED_EMAIL>": "BennetYrWang",
+    "<REDACTED_EMAIL>": "g-guthrie",
+    "<REDACTED_EMAIL>": "bobashopcashier",
+    "<REDACTED_EMAIL>": "bobashopcashier",
+    "<REDACTED_EMAIL>": "megastary",  # PR #18325
+    "<REDACTED_EMAIL>": "areu01or00",
+    "<REDACTED_EMAIL>": "bryanyoung",
+    "<REDACTED_EMAIL>": "christomitov",
+    "<REDACTED_EMAIL>": "NousResearch",
+    "<REDACTED_EMAIL>": "ReginaldasR",
+    "<REDACTED_EMAIL>": "0xharryriddle",
+    "<REDACTED_EMAIL>": "ericnicolaides",
+    "<REDACTED_EMAIL>": "georgex8001",
+    "<REDACTED_EMAIL>": "dimitrovi",
+    "<REDACTED_EMAIL>": "benbarclay",
+    "<REDACTED_EMAIL>": "ChimingLiu",
+    "<REDACTED_EMAIL>": "AllardQuek",
+    "<REDACTED_EMAIL>": "openclaw",
+    "<REDACTED_EMAIL>": "Himess",
+    "<REDACTED_EMAIL>": "erenkarakus",
+    "<REDACTED_EMAIL>": "adavyas",
+    "<REDACTED_EMAIL>": "aayushchaudhary",
+    "<REDACTED_EMAIL>": "jasonoutland",
+    "<REDACTED_EMAIL>": "Magaav",
+    "<REDACTED_EMAIL>": "SPANISHFLU",
+    "<REDACTED_EMAIL>": "mormio",
+    "<REDACTED_EMAIL>": "cesareth",
+    "<REDACTED_EMAIL>": "fuleinist",
+    "<REDACTED_EMAIL>": "JackTheGit",
+    "<REDACTED_EMAIL>": "0xjackyang",
+    "<REDACTED_EMAIL>": "Jr-kenny",
+    "<REDACTED_EMAIL>": "mbierling",
+    "<REDACTED_EMAIL>": "alt-glitch",
+    "<REDACTED_EMAIL>": "alt-glitch",
+    "<REDACTED_EMAIL>": "oluwadareab12",
+    "<REDACTED_EMAIL>": "simon-marcus",
+    "<REDACTED_EMAIL>": "Xowiek",
+    "<REDACTED_EMAIL>": "Gutslabs",
+    "<REDACTED_EMAIL>": "zons-zhaozhy",
+    "<REDACTED_EMAIL>": "Es1la",
+    "<REDACTED_EMAIL>": "stephen0110",
+    "<REDACTED_EMAIL>": "sonic-netizen",
+    "<REDACTED_EMAIL>": "mwnickerson",
+    "<REDACTED_EMAIL>": "SandroHub013",
+    "<REDACTED_EMAIL>": "maciekczech",
+    "<REDACTED_EMAIL>": "CoreyNoDream",
+    "<REDACTED_EMAIL>": "franksong2702",
+    "<REDACTED_EMAIL>": "ambition0802",
+    "<REDACTED_EMAIL>": "beibi9966",
+    # ── bulk addition: 75 emails resolved via API, PR salvage bodies, noreply
+    #    crossref, and GH contributor list matching (April 2026 audit) ──
+    "<REDACTED_EMAIL>": "aaronlab",
+    "<REDACTED_EMAIL>": "hqhq1025",
+    "<REDACTED_EMAIL>": "luyao618",
+    "<REDACTED_EMAIL>": "houziershi",
+    "<REDACTED_EMAIL>": "PStarH",
+    "<REDACTED_EMAIL>": "Sanjays2402",
+    "<REDACTED_EMAIL>": "Andy283",
+    "<REDACTED_EMAIL>": "bingo906",
+    "<REDACTED_EMAIL>": "AaronWong1999",
+    "<REDACTED_EMAIL>": "DeployFaith",
+    "<REDACTED_EMAIL>": "angelos",
+    "<REDACTED_EMAIL>": "cokemine",
+    "<REDACTED_EMAIL>": "ethernet8023",
+    "<REDACTED_EMAIL>": "benbarclay",
+    "<REDACTED_EMAIL>": "yyovil",
+    "<REDACTED_EMAIL>": "nicoloboschi",
+    "<REDACTED_EMAIL>": "cherifya",
+    "<REDACTED_EMAIL>": "BongSuCHOI",
+    "<REDACTED_EMAIL>": "Cafexss",
+    "<REDACTED_EMAIL>": "dalianmao000",
+    "<REDACTED_EMAIL>": "konsisumer",
+    "<REDACTED_EMAIL>": "DomGrieco",
+    "<REDACTED_EMAIL>": "spideystreet",
+    "<REDACTED_EMAIL>": "dippwho",
+    "<REDACTED_EMAIL>": "donrhmexe",
+    "<REDACTED_EMAIL>": "dorukardahan",
+    "<REDACTED_EMAIL>": "dsocolobsky",
+    "<REDACTED_EMAIL>": "dsocolobsky",
+    "<REDACTED_EMAIL>": "IAvecilla",
+    "<REDACTED_EMAIL>": "duerzy",
+    "<REDACTED_EMAIL>": "emozilla",
+    "<REDACTED_EMAIL>": "fancydirty",
+    "<REDACTED_EMAIL>": "farion1231",
+    "<REDACTED_EMAIL>": "flobo3",
+    "<REDACTED_EMAIL>": "pefontana",
+    "<REDACTED_EMAIL>": "fxfitz",
+    "<REDACTED_EMAIL>": "Helmi",
+    "<REDACTED_EMAIL>": "gaixianggeng",
+    "<REDACTED_EMAIL>": "geoffwellman",
+    "<REDACTED_EMAIL>": "jamesarch",
+    "<REDACTED_EMAIL>": "LongOddCode",
+    "<REDACTED_EMAIL>": "glennc",
+    "<REDACTED_EMAIL>": "hata1234",
+    "<REDACTED_EMAIL>": "Hmbown",
+    "<REDACTED_EMAIL>": "m0n5t3r",
+    "<REDACTED_EMAIL>": "m0n5t3r",
+    "<REDACTED_EMAIL>": "JiayuuWang",
+    "<REDACTED_EMAIL>": "sjh9714",
+    "<REDACTED_EMAIL>": "yoniebans",
+    "<REDACTED_EMAIL>": "simpolism",
+    "<REDACTED_EMAIL>": "jjovalle99",
+    "<REDACTED_EMAIL>": "Julientalbot",
+    "<REDACTED_EMAIL>": "kagura-agent",
+    "<REDACTED_EMAIL>": "youngDoo",
+    "<REDACTED_EMAIL>": "kamil-gwozdz",
+    "<REDACTED_EMAIL>": "bugkill3r",
+    "<REDACTED_EMAIL>": "MustafaKara7",
+    "<REDACTED_EMAIL>": "kira-ariaki",
+    "<REDACTED_EMAIL>": "KiraKatana",
+    "<REDACTED_EMAIL>": "knopki",
+    "<REDACTED_EMAIL>": "limars874",
+    "<REDACTED_EMAIL>": "lesterli",
+    "<REDACTED_EMAIL>": "MagicRay1217",
+    "<REDACTED_EMAIL>": "GenKoKo",
+    "<REDACTED_EMAIL>": "iacker",
+    "<REDACTED_EMAIL>": "sontianye",
+    "<REDACTED_EMAIL>": "jackjin1997",
+    "<REDACTED_EMAIL>": "jackjin1997",
+    "<REDACTED_EMAIL>": "danieldoderlein",
+    "<REDACTED_EMAIL>": "lrawnsley",
+    "<REDACTED_EMAIL>": "taeuk178",
+    "<REDACTED_EMAIL>": "ogzerber",
+    "<REDACTED_EMAIL>": "cola-runner",
+    "<REDACTED_EMAIL>": "ygd58",
+    "<REDACTED_EMAIL>": "warabe1122",
+    "<REDACTED_EMAIL>": "willy-scr",
+    "<REDACTED_EMAIL>": "vominh1919",
+    "<REDACTED_EMAIL>": "iamagenius00",
+    "<REDACTED_EMAIL>": "cresslank",
+    "<REDACTED_EMAIL>": "trevthefoolish",
+    "<REDACTED_EMAIL>": "ATran28",  # PR #77270 whatsapp bridge reconnect wedge fix
+    "<REDACTED_EMAIL>": "ziliangpeng",
+    "<REDACTED_EMAIL>": "ziliangpeng",
+    "<REDACTED_EMAIL>": "centripetal-star",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "Lubrsy706",
+    "<REDACTED_EMAIL>": "spniyant",
+    "<REDACTED_EMAIL>": "nicha16",  # PR #54139 partial salvage (re-register tools after park revival)
+    "<REDACTED_EMAIL>": "olafthiele",
+    "<REDACTED_EMAIL>": "sprmn24",
+    "<REDACTED_EMAIL>": "olafthiele",
+    "<REDACTED_EMAIL>": "r266-tech",
+    "<REDACTED_EMAIL>": "r266-tech",  # PR #55780 salvage (dead-target not_found blast radius)
+    "<REDACTED_EMAIL>": "BlackishGreen33",
+    "<REDACTED_EMAIL>": "gnodet",  # PR #37598 salvage (MCP preflight POST probe fallback)
+    "<REDACTED_EMAIL>": "kaishi00",  # PR #55203 salvage (skip_preflight opt-out)
+    "<REDACTED_EMAIL>": "setclock",  # PR #27052 salvage (MCP session-expired retry waits for a distinct fresh session)
+    "<REDACTED_EMAIL>": "sberan",  # PR #54494 salvage (--connect-timeout flag on hermes mcp add)
+    "<REDACTED_EMAIL>": "labsobsidian",  # PR #56699 salvage (MCP OAuth login connect_timeout floor)
+    "<REDACTED_EMAIL>": "SaulJWu",
+    "<REDACTED_EMAIL>": "hcshen0111",
+    "<REDACTED_EMAIL>": "Cygra",
+    "<REDACTED_EMAIL>": "Sertug17",
+    "<REDACTED_EMAIL>": "stephenschoettler",
+    "<REDACTED_EMAIL>": "yyovil",
+    "<REDACTED_EMAIL>": "taosiyuan163",
+    "<REDACTED_EMAIL>": "tesseracttars-creator",
+    "<REDACTED_EMAIL>": "xingkongliang",
+    "<REDACTED_EMAIL>": "Oxidane-bot",
+    "<REDACTED_EMAIL>": "Tranquil-Flow",
+    "<REDACTED_EMAIL>": "mcndjxlefnd",
+    "<REDACTED_EMAIL>": "Unayung",
+    "<REDACTED_EMAIL>": "WorldInnovationsDepartment",
+    "<REDACTED_EMAIL>": "win4r",
+    "<REDACTED_EMAIL>": "KUSH42",
+    "<REDACTED_EMAIL>": "SeeYangZhi",
+    "<REDACTED_EMAIL>": "yongtenglei",
+    "<REDACTED_EMAIL>": "YoungYang963",
+    "<REDACTED_EMAIL>": "Junass1",
+    "<REDACTED_EMAIL>": "WAXLYY",
+    "<REDACTED_EMAIL>": "Dusk1e",
+    "<REDACTED_EMAIL>": "zhouboli",
+    "<REDACTED_EMAIL>": "tomqiaozc",
+    "<REDACTED_EMAIL>": "xinbenlv",
+    "<REDACTED_EMAIL>": "ZaynJarvis",
+    "<REDACTED_EMAIL>": "ZaynJarvis",
+    "<REDACTED_EMAIL>": "loongfay",
+    "<REDACTED_EMAIL>": "lrt4836",
+    "<REDACTED_EMAIL>": "beforeload",
+    "<REDACTED_EMAIL>": "libo1106",
+    "<REDACTED_EMAIL>": "295367131",
+    "<REDACTED_EMAIL>": "IxAres",
+    "<REDACTED_EMAIL>": "danieldliu",
+    "<REDACTED_EMAIL>": "loongzhao",
+    "<REDACTED_EMAIL>": "Bartok9",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "malaiwah",
+    "<REDACTED_EMAIL>": "malaiwah",
+    "<REDACTED_EMAIL>": "gnanam1990",
+    "<REDACTED_EMAIL>": "0xyg3n",
+    "<REDACTED_EMAIL>": "Spaceman-Spiffy",  # PR #35586 (renamed account)
+    "<REDACTED_EMAIL>": "ianculling",  # PR #36087
+    "<REDACTED_EMAIL>": "0xyg3n",
+    "<REDACTED_EMAIL>": "nftpoetrist",  # PR #18982
+    "<REDACTED_EMAIL>": "millerc79",  # PR #19033
+    "<REDACTED_EMAIL>": "shellybotmoyer",  # PR #18915 (bot-committed)
+    "<REDACTED_EMAIL>": "exxmen",  # PR #19555
+    "<REDACTED_EMAIL>": "Hypn0sis",
+    "<REDACTED_EMAIL>": "OwenYWT",
+    "<REDACTED_EMAIL>": "v1k22",
+    "<REDACTED_EMAIL>": "RucchiZ",
+    "<REDACTED_EMAIL>": "tannerfokkens-maker",
+    "<REDACTED_EMAIL>": "LehaoLin",
+    "<REDACTED_EMAIL>": "imink",
+    "<REDACTED_EMAIL>": "hedgeho9X",
+    "<REDACTED_EMAIL>": "bernylinville",
+    "<REDACTED_EMAIL>": "briandevans",
+    "<REDACTED_EMAIL>": "LLQWQ",
+    "<REDACTED_EMAIL>": "memosr",
+    "<REDACTED_EMAIL>": "perlowja",
+    "<REDACTED_EMAIL>": "web-dev0521",
+    "<REDACTED_EMAIL>": "bjianhang",
+    "<REDACTED_EMAIL>": "tangyuanjc",
+    "<REDACTED_EMAIL>": "harryplusplus",
+    "<REDACTED_EMAIL>": "anthhub",
+    "<REDACTED_EMAIL>": "phuongvm",
+    "<REDACTED_EMAIL>": "AllardQuek",
+    "<REDACTED_EMAIL>": "shenuu",
+    "<REDACTED_EMAIL>": "xiayh0107",
+    "<REDACTED_EMAIL>": "opriz",
+    "<REDACTED_EMAIL>": "xxxigm",
+    "<REDACTED_EMAIL>": "ElSnacko",
+    "<REDACTED_EMAIL>": "x9x9x9x9x9x91",
+    "<REDACTED_EMAIL>": "NickLarcombe",
+    "<REDACTED_EMAIL>": "xxxigm",
+    "<REDACTED_EMAIL>": "anniesurla",
+    "<REDACTED_EMAIL>": "nv-kasikritc",
+    "<REDACTED_EMAIL>": "bbednarski9",
+    "<REDACTED_EMAIL>": "WideLee",
+    "<REDACTED_EMAIL>": "AviArora02-commits",
+    "<REDACTED_EMAIL>": "draix",
+    "<REDACTED_EMAIL>": "draix",
+    "<REDACTED_EMAIL>": "JimLiu",
+    "<REDACTED_EMAIL>": "jooray",
+    "<REDACTED_EMAIL>": "maxchernin",
+    "<REDACTED_EMAIL>": "LVT382009",
+    "<REDACTED_EMAIL>": "heykb",
+    "<REDACTED_EMAIL>": "StefanIsMe",
+    "<REDACTED_EMAIL>": "lumenradley",
+    "<REDACTED_EMAIL>": "sjz-ks",
+    "<REDACTED_EMAIL>": "haileymarshall",
+    "<REDACTED_EMAIL>": "aniruddhaadak80",
+    "<REDACTED_EMAIL>": "jerilynzheng",
+    "<REDACTED_EMAIL>": "Aslaaen",
+    "<REDACTED_EMAIL>": "pinion05",
+    "<REDACTED_EMAIL>": "VTRiot",
+    "<REDACTED_EMAIL>": "iamagenius00",
+    "<REDACTED_EMAIL>": "Feranmi10",
+    "<REDACTED_EMAIL>": "Feranmi10",
+    "<REDACTED_EMAIL>": "simon-gtcl",
+    "<REDACTED_EMAIL>": "houko",
+    "<REDACTED_EMAIL>": "cgarwood82",
+    "<REDACTED_EMAIL>": "anna-oake",
+    "<REDACTED_EMAIL>": "jaffarkeikei",
+    "<REDACTED_EMAIL>": "hxp-plus",
+    "<REDACTED_EMAIL>": "Tianworld",
+    "<REDACTED_EMAIL>": "wujhsu",
+    "<REDACTED_EMAIL>": "niyoh120",
+    "<REDACTED_EMAIL>": "vrinek",
+    "<REDACTED_EMAIL>": "xandersbell",
+    "<REDACTED_EMAIL>": "Somme4096",
+    "<REDACTED_EMAIL>": "brianclemens",
+    "<REDACTED_EMAIL>": "yudaiyan",
+    "<REDACTED_EMAIL>": "ycbai",
+    "<REDACTED_EMAIL>": "longsizhuo",
+    "<REDACTED_EMAIL>": "ms-alan",
+    "<REDACTED_EMAIL>": "johnisag",
+    "<REDACTED_EMAIL>": "explainanalyze",
+    "<REDACTED_EMAIL>": "WuTianyi123",
+    "<REDACTED_EMAIL>": "li0near",
+    "<REDACTED_EMAIL>": "li0near",
+    "<REDACTED_EMAIL>": "tymrtn",
+    "<REDACTED_EMAIL>": "kallidean",
+    "<REDACTED_EMAIL>": "baocin",
+    "<REDACTED_EMAIL>": "princepal9120",
+    "<REDACTED_EMAIL>": "guglielmofonda",
+    "<REDACTED_EMAIL>": "yehuosi",
+    "<REDACTED_EMAIL>": "yehuosi",
+    "<REDACTED_EMAIL>": "jelrod27",
+    "<REDACTED_EMAIL>": "konsisumer",
+    "<REDACTED_EMAIL>": "sicnuyudidi",
+    "<REDACTED_EMAIL>": "haimu0x",
+    "<REDACTED_EMAIL>": "NIDNASSER-Abdelmajid",
+    "<REDACTED_EMAIL>": "projectadmin-dev",
+    "<REDACTED_EMAIL>": "Dev-Mriganka",
+    "<REDACTED_EMAIL>": "shushuzn",
+    "<REDACTED_EMAIL>": "iborazzi",
+    "<REDACTED_EMAIL>": "A-afflatus",
+    "<REDACTED_EMAIL>": "huangke19",
+    "<REDACTED_EMAIL>": "10ishq",
+    "<REDACTED_EMAIL>": "christopherwoodall",
+    "<REDACTED_EMAIL>": "zhang9w0v5",
+    "<REDACTED_EMAIL>": "fuleinist",
+    "<REDACTED_EMAIL>": "Llugaes",
+    "<REDACTED_EMAIL>": "Llugaes",
+    "<REDACTED_EMAIL>": "fengtianyu88",
+    "<REDACTED_EMAIL>": "lmoncany",
+    "<REDACTED_EMAIL>": "fatinghenji",
+    "<REDACTED_EMAIL>": "xinpengdr",
+    "<REDACTED_EMAIL>": "mikewaters",
+    "<REDACTED_EMAIL>": "WadydX",
+    "<REDACTED_EMAIL>": "isaachuangGMICLOUD",
+    "<REDACTED_EMAIL>": "isaachuangGMICLOUD",
+    "<REDACTED_EMAIL>": "hsy5571616",
+    "<REDACTED_EMAIL>": "Nan93",
+    "<REDACTED_EMAIL>": "zhouxiaoya12",
+    "<REDACTED_EMAIL>": "roytian1217",
+    "<REDACTED_EMAIL>": "minorgod",
+    "<REDACTED_EMAIL>": "wenhao7",
+    "<REDACTED_EMAIL>": "yzx9",
+    "<REDACTED_EMAIL>": "lvnilesh",
+    "<REDACTED_EMAIL>": "azhengbot",
+    "<REDACTED_EMAIL>": "sharziki",
+    "<REDACTED_EMAIL>": "RyanLee-Dev",
+    "<REDACTED_EMAIL>": "TaroballzChen",
+    "<REDACTED_EMAIL>": "Lind3ey",
+    "<REDACTED_EMAIL>": "phpoh",
+    "<REDACTED_EMAIL>": "vivganes",
+    "<REDACTED_EMAIL>": "MikeFac",
+    "<REDACTED_EMAIL>": "GuyCui",
+    "<REDACTED_EMAIL>": "maelrx",
+    "<REDACTED_EMAIL>": "ats3v",
+    # v0.11.0 additions
+    "<REDACTED_EMAIL>": "benbarclay",
+    "<REDACTED_EMAIL>": "Jiawen-lee",
+    "<REDACTED_EMAIL>": "kovyrin",
+    "<REDACTED_EMAIL>": "kovyrin",
+    "<REDACTED_EMAIL>": "liftaris",
+    "<REDACTED_EMAIL>": "arihantsethia",
+    "<REDACTED_EMAIL>": "coekfung",
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "cuyua9",
+    "<REDACTED_EMAIL>": "Disaster-Terminator",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "grimmjoww578",  # PR #52142 co-author (direct CUA window targeting)
+    "<REDACTED_EMAIL>": "Zyproth",
+    "<REDACTED_EMAIL>": "amitgaur",
+    "<REDACTED_EMAIL>": "mrbob-git",
+    "<REDACTED_EMAIL>": "kiala9",
+    "<REDACTED_EMAIL>": "alanxchen85",
+    "<REDACTED_EMAIL>": "John-tip",
+    "<REDACTED_EMAIL>": "konsisumer",
+    "<REDACTED_EMAIL>": "CIRWEL",
+    "<REDACTED_EMAIL>": "molvikar",
+    "<REDACTED_EMAIL>": "nftpoetrist",
+    "<REDACTED_EMAIL>": "colorcross",
+    "<REDACTED_EMAIL>": "zhao0112",
+    "<REDACTED_EMAIL>": "EthanGuo-coder",
+    "<REDACTED_EMAIL>": "tmdgusya",
+    "<REDACTED_EMAIL>": "leavrcn",
+    "<REDACTED_EMAIL>": "wanazhar",
+    "<REDACTED_EMAIL>": "cixuuz",
+    "<REDACTED_EMAIL>": "pasevin",
+    "<REDACTED_EMAIL>": "pasevin",
+    "<REDACTED_EMAIL>": "holynn-q",
+    "<REDACTED_EMAIL>": "holynn-q",
+    "<REDACTED_EMAIL>": "jacdevos",
+    "<REDACTED_EMAIL>": "liuhao1024",
+    "<REDACTED_EMAIL>": "suninrain086",  # PR #57651 salvage of #50685 (vision custom-endpoint creds)
+    "<REDACTED_EMAIL>": "mohamedorigami-jpg",  # PR #32117 (cron storage root anchor; #32091)
+    "<REDACTED_EMAIL>": "sherman-yang",  # PR #32788 (cron per-job MCP merge; #23997)
+    "<REDACTED_EMAIL>": "rbrtbn",
+    "<REDACTED_EMAIL>": "VinciZhu",
+    "<REDACTED_EMAIL>": "rodrigoeqnit",
+    "<REDACTED_EMAIL>": "sgtworkman",
+    "<REDACTED_EMAIL>": "keepcalmqqf",
+    "<REDACTED_EMAIL>": "ai-ag2026",
+    "<REDACTED_EMAIL>": "YanzhongSu",
+    "<REDACTED_EMAIL>": "WanderWang",
+    "<REDACTED_EMAIL>": "yuehei",
+    "<REDACTED_EMAIL>": "Emidomenge",
+    "<REDACTED_EMAIL>": "BlackJulySnow",
+    "<REDACTED_EMAIL>": "helix4u",
+    "<REDACTED_EMAIL>": "flobo3",
+    "<REDACTED_EMAIL>": "dpaluy",
+    "<REDACTED_EMAIL>": "el-analista",
+    "<REDACTED_EMAIL>": "ms-alan",
+    "<REDACTED_EMAIL>": "johnisag",
+    "<REDACTED_EMAIL>": "explainanalyze",
+    "<REDACTED_EMAIL>": "hex-clawd",
+    "<REDACTED_EMAIL>": "LeonSGP43",
+    "<REDACTED_EMAIL>": "barteqpl",
+    "<REDACTED_EMAIL>": "pama0227",
+    "<REDACTED_EMAIL>": "ee-blog",
+    "<REDACTED_EMAIL>": "simplenamebox-ops",
+    "<REDACTED_EMAIL>": "alt-glitch",
+    "<REDACTED_EMAIL>": "foreverxdord",
+    "<REDACTED_EMAIL>": "QifengKuang",
+    "<REDACTED_EMAIL>": "jjjojoj",
+    "<REDACTED_EMAIL>": "valda",
+    "<REDACTED_EMAIL>": "M3RCUR2Y",
+    "<REDACTED_EMAIL>": "ygd58",
+    "<REDACTED_EMAIL>": "ideathinklab01-source",
+    "<REDACTED_EMAIL>": "zng8418",
+    "<REDACTED_EMAIL>": "DaniuXie",
+    "<REDACTED_EMAIL>": "ChanlerDev",
+    "<REDACTED_EMAIL>": "briandevans",
+    "<REDACTED_EMAIL>": "tcconnally",
+    "<REDACTED_EMAIL>": "mijanx",
+    "<REDACTED_EMAIL>": "h0tp-ftw",
+    "<REDACTED_EMAIL>": "chinadbo",
+    "<REDACTED_EMAIL>": "kshitijk4poor",
+    "<REDACTED_EMAIL>": "xyiy001",
+    "<REDACTED_EMAIL>": "CharlieKerfoot",
+    "<REDACTED_EMAIL>": "Grey0202",
+    "<REDACTED_EMAIL>": "vominh1919",
+    "<REDACTED_EMAIL>": "giwaov",
+    "<REDACTED_EMAIL>": "Yoimex",
+    "<REDACTED_EMAIL>": "atongrun",
+    "<REDACTED_EMAIL>": "MichaelWDanko",
+    "<REDACTED_EMAIL>": "YX234",
+    "<REDACTED_EMAIL>": "julysir",
+    "<REDACTED_EMAIL>": "JanCong",
+    "<REDACTED_EMAIL>": "e-shizz",
+    "<REDACTED_EMAIL>": "VinVC",
+    "<REDACTED_EMAIL>": "zons-zhaozhy",
+    "<REDACTED_EMAIL>": "JayGwod",
+    "<REDACTED_EMAIL>": "swithek",
+    "<REDACTED_EMAIL>": "PratikRai0101",
+    "<REDACTED_EMAIL>": "sasha-id",
+    "<REDACTED_EMAIL>": "chenyunbo411",
+    "openclaw@local": "Asce66",
+    "<REDACTED_EMAIL>": "0xsir0000",
+    "<REDACTED_EMAIL>": "lisanhu",
+    "<REDACTED_EMAIL>": "chenyunbo411",
+    "<REDACTED_EMAIL>": "stevenchanin",
+    "<REDACTED_EMAIL>": "halmisen",
+    "<REDACTED_EMAIL>": "yuqianma",
+    "<REDACTED_EMAIL>": "yuqianma",
+    "<REDACTED_EMAIL>": "bassings",
+    "<REDACTED_EMAIL>": "highland0971",
+    "<REDACTED_EMAIL>": "lewislulu",
+    "<REDACTED_EMAIL>": "Gaurav23V",
+    "<REDACTED_EMAIL>": "Tranquil-Flow",
+    "<REDACTED_EMAIL>": "albert748",
+    "<REDACTED_EMAIL>": "0xharryriddle",
+    "<REDACTED_EMAIL>": "lhysdl",
+    "<REDACTED_EMAIL>": "SherlockShemol",
+    "<REDACTED_EMAIL>": "eloklam",
+    "<REDACTED_EMAIL>": "eloklam",
+    "<REDACTED_EMAIL>": "fmercurio",
+    "<REDACTED_EMAIL>": "Ricardo-M-L",
+    "<REDACTED_EMAIL>": "leozeli",
+    "<REDACTED_EMAIL>": "LehaoLin",
+    "<REDACTED_EMAIL>": "I3eg1nner",
+    "<REDACTED_EMAIL>": "PeterBerthelsen",
+    "<REDACTED_EMAIL>": "lengxii",
+    "<REDACTED_EMAIL>": "priveperfumes",
+    "<REDACTED_EMAIL>": "sjz-ks",
+    "<REDACTED_EMAIL>": "topcheer",
+    "<REDACTED_EMAIL>": "walli",
+    "<REDACTED_EMAIL>": "Zhuofeng-Wang",
+    "<REDACTED_EMAIL>": "Contentment003111",
+    # April 2026 salvage-PR batch (#14920, #14986, #14966)
+    "<REDACTED_EMAIL>": "mrunmayee17",
+    "<REDACTED_EMAIL>": "camaragon",
+    "<REDACTED_EMAIL>": "shamork",
+    # April 2026 Discord Copilot /model salvage (#15030)
+    "<REDACTED_EMAIL>": "Nicecsh",
+    # no-github-match — keep as display names
+    "<REDACTED_EMAIL>": "Sisyphus",
+    "<REDACTED_EMAIL>": "Marco Rutsch",
+    "<REDACTED_EMAIL>": "Paul Bergeron",
+    "<REDACTED_EMAIL>": "zhangxicen",
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "chen1749144759",
+    "<REDACTED_EMAIL>": "MorAlekss",
+    "<REDACTED_EMAIL>": "ztexydt-cqh",
+    # v0.16.0 additions
+    "<REDACTED_EMAIL>": "teknium1",
+    "<REDACTED_EMAIL>": "alaamohanad169-ship-it",
+    "<REDACTED_EMAIL>": "Archerouyang",  # display name 欧阳
+    "<REDACTED_EMAIL>": "Sarbai",  # git email for PR #33438 author (display: Брагарник Дмитро)
+    "<REDACTED_EMAIL>": "aminvakil",
+    "<REDACTED_EMAIL>": "polnikale",
+    "<REDACTED_EMAIL>": "sarvesh1327",  # salvaged via #38655
+    "<REDACTED_EMAIL>": "wysie",
+    "<REDACTED_EMAIL>": "bedirhancode",
+    "<REDACTED_EMAIL>": "ash",
+    "<REDACTED_EMAIL>": "andrewhosf",
+    # April 2026 Honcho bug-fix consolidation (#15381)
+    "<REDACTED_EMAIL>": "HiddenPuppy",
+    "<REDACTED_EMAIL>": "sasha-id",
+    "<REDACTED_EMAIL>": "dontcallmejames",
+    "<REDACTED_EMAIL>": "hekaru-agent",
+    "<REDACTED_EMAIL>": "twozle",
+    "<REDACTED_EMAIL>": "rfilgueiras",
+    "<REDACTED_EMAIL>": "Leihb",
+    # ACP streaming fix salvage (PR #9428 + #16273)
+    "<REDACTED_EMAIL>": "ningfangbin",
+    "<REDACTED_EMAIL>": "Joseph19820124",
+    "<REDACTED_EMAIL>": "rugvedS07",
+    "<REDACTED_EMAIL>": "Heltman",
+    # v0.12.0 additions
+    "<REDACTED_EMAIL>": "ching-kaching",
+    "<REDACTED_EMAIL>": "Zjianru",  # salvage chain: code by codez, PR #15749 author @Zjianru
+    "<REDACTED_EMAIL>": "Siddharth Balyan",  # co-author only
+    "<REDACTED_EMAIL>": "zkl2333",
+    "<REDACTED_EMAIL>": "isaachuangGMICLOUD",
+    "<REDACTED_EMAIL>": "isaachuangGMICLOUD",  # salvage of PR #11955 → #16663
+    "<REDACTED_EMAIL>": "Octopus",  # co-author only
+    "<REDACTED_EMAIL>": "Versun",  # co-author only
+    "<REDACTED_EMAIL>": "kevin-ho",  # salvage: PR #15488 author @kevin-ho
+    "<REDACTED_EMAIL>": "Paperclip",  # co-author only
+    "teknium@hermes-agent": "teknium1",
+    "<REDACTED_EMAIL>": "web3blind",
+    "<REDACTED_EMAIL>": "chengoak",  # PR #17467
+    "<REDACTED_EMAIL>": "zwcf5200",  # PR #38661 (SSH remote cwd fix)
+    "<REDACTED_EMAIL>": "YuShu",  # co-author only
+    "<REDACTED_EMAIL>": "CharlieKerfoot",  # PR #18951
+    # Debug share upload-time redaction (May 2026)
+    "<REDACTED_EMAIL>": "GodsBoy",  # PR #19318
+    "<REDACTED_EMAIL>": "ruangraung",  # PR #42308
+    "<REDACTED_EMAIL>": "mrcoferland",  # PR #19023
+    "<REDACTED_EMAIL>": "noOne-list",  # PR #19050
+    "<REDACTED_EMAIL>": "likejudy",  # PR #19052
+    "<REDACTED_EMAIL>": "leon7609",  # PR #19069
+    "<REDACTED_EMAIL>": "nouseman666",  # PR #19088
+    "<REDACTED_EMAIL>": "GinWU05",  # PR #19093
+    "<REDACTED_EMAIL>": "shashwatgokhe",  # PR #19196
+    "<REDACTED_EMAIL>": "cypres0099",  # PR #25935 salvage (mixed-attachment image routing)
+    "<REDACTED_EMAIL>": "stevenchouai",  # PR #19221
+    "<REDACTED_EMAIL>": "agilejava",  # PR #19346
+    "<REDACTED_EMAIL>": "acc001k",  # PR #19358
+    "<REDACTED_EMAIL>": "kowenhaoai",  # PR #19376
+    "<REDACTED_EMAIL>": "hedirman",  # PR #19410
+    "<REDACTED_EMAIL>": "LucianoSP",  # PR #19412
+    "<REDACTED_EMAIL>": "paul-tian",  # PR #19423
+    "<REDACTED_EMAIL>": "glesperance",  # PR #19443
+    "<REDACTED_EMAIL>": "EvilDrag0n",  # PR #20651
+    # v0.13.0 additions
+    "<REDACTED_EMAIL>": "jackey8616",  # via PR salvage
+    "<REDACTED_EMAIL>": "jrusso1020",  # via PR salvage
+    "<REDACTED_EMAIL>": "LeonSGP43",  # PR #18739 salvage of #14570
+    "<REDACTED_EMAIL>": "Foolafroos",  # PR #20329 French locale
+    "<REDACTED_EMAIL>": "Montbra",  # PR #20897 salvage of #16189 (TUI voice PTT)
+    "<REDACTED_EMAIL>": "paulb26",  # PR #24135 salvage (pty-bridge killpg)
+    "<REDACTED_EMAIL>": "firefly",  # PR #18123 salvage of #16660 (ContextVars)
+    "<REDACTED_EMAIL>": "WuTianyi123",  # PR #20275 salvage of #13723 (feishu markdown)
+    "<REDACTED_EMAIL>": "hanzckernel",  # PR #20311 (api-server approval events)
+    "<REDACTED_EMAIL>": "oferlaor",  # PR #22356 salvage (cron origin sender identity)
+    "<REDACTED_EMAIL>": "leehack",  # PR #22053 salvage (telegram DM topic reply fallback)
+    "<REDACTED_EMAIL>": "caojiguang",  # PR #35117 carries #31853 (weixin _api_post/_api_get wait_for)
+    "<REDACTED_EMAIL>": "goku94123",  # PR #46609 salvage (MiniMax reasoning extra_body)
+    # pander: empty email, salvaged via PR #19665 from #16126 by @ms-alan
+    "<REDACTED_EMAIL>": "chaithanyak42",  # PR #15624
+    "<REDACTED_EMAIL>": "kartik-mem0",  # PR #15624
+    "<REDACTED_EMAIL>": "A-kamal",  # PR #18678 (xAI image resolution fix)
+    # Kanban bug-fix batch salvage (May 2026)
+    "<REDACTED_EMAIL>": "Frowtek",  # salvage of #23206 (gateway --board auto-subscribe)
+    "<REDACTED_EMAIL>": "Sylw3ster",  # salvage of #23252 (HERMES_KANBAN_BOARD restore)
+    "<REDACTED_EMAIL>": "dmnkhorvath",  # salvage of #23358 (kanban worker send_message)
+    "<REDACTED_EMAIL>": "smwbev",  # salvage of #23659 (aria-label colLabel)
+    "<REDACTED_EMAIL>": "TurgutKural",  # salvage of #23356 (HERMES_HOME inject)
+    "<REDACTED_EMAIL>": "29206394",  # PR #22194 salvage (sudo -S brute-force guard, #9590)
+    "<REDACTED_EMAIL>": "fr33d3m0n",  # PR #21128 salvage (sudo stdin/askpass DANGEROUS, #17873 cat 4)
+    "<REDACTED_EMAIL>": "VinceZcrikl",  # PR #23647 salvage (npm UTF-8 decode on GBK Windows)
+    "<REDACTED_EMAIL>": "JabberELF",  # PR #20238 seed (session_search dual-mode, evolved into single-shape)
+    "<REDACTED_EMAIL>": "ZeterMordio",  # PR #11754 salvage (zsh completion compdef + _arguments syntax)
+    "<REDACTED_EMAIL>": "iuyup",  # PR #6155 salvage (shell=True hardening)
+    "<REDACTED_EMAIL>": "1RB",  # PR #25462 salvage (discord forwarded messages)
+    "<REDACTED_EMAIL>": "ayushere",  # PR #25342 salvage (memory teardown leak)
+    "<REDACTED_EMAIL>": "domtriola",  # PR #25424 salvage (docs tirith link)
+    "<REDACTED_EMAIL>": "tuancookiez-hub",  # PR #34865 salvage (LSP Windows .cmd shim spawn, #34864)
+    "<REDACTED_EMAIL>": "ephron-ren",  # PR #25358 salvage (MiMo reasoning echo-back)
+    "<REDACTED_EMAIL>": "freqyfreqy",  # PR #25423 salvage (docs LSP worktree -> repo)
+    "<REDACTED_EMAIL>": "fu576",  # PR #25369 salvage (api_mode not inherited cross-provider)
+    "<REDACTED_EMAIL>": "kfa-ai",  # PR #25398 salvage (whatsapp quoted reply metadata)
+    "<REDACTED_EMAIL>": "magic524",  # PR #25361 salvage (QQBot reconnect loop)
+    "<REDACTED_EMAIL>": "PaTTeeL",  # PR #25359 salvage (custom_providers in compression length)
+    "<REDACTED_EMAIL>": "pearjelly",  # PR #25388 salvage (feishu ws connect override sync)
+    "<REDACTED_EMAIL>": "raymaylee",  # PR #25394 salvage (context compaction status)
+    "<REDACTED_EMAIL>": "Tianyu199509",  # PR #25421 salvage (gateway PID Windows)
+    "<REDACTED_EMAIL>": "HxT9",  # PR #25760 salvage (web sync-assets cross-platform)
+    "<REDACTED_EMAIL>": "evgyur",  # PR #25651 salvage (docs media session context)
+    "<REDACTED_EMAIL>": "AsoTora",  # PR #25624 salvage (MCP auth no-retry)
+    "<REDACTED_EMAIL>": "oxngon",  # PR #25603 salvage (forward image attachments to bg tasks)
+    "<REDACTED_EMAIL>": "yifengingit",  # PR #25589 salvage (AUTOINCREMENT id ordering)
+    "<REDACTED_EMAIL>": "vanthinh6886",  # PR #25562 salvage (.env 0600 perms)
+    "<REDACTED_EMAIL>": "Arkmusn",  # PR #25559 salvage (approvals.timeout from config)
+    "<REDACTED_EMAIL>": "nidhi-singh02",  # PR #2752 salvage (slack whitespace-only IndexError guard)
+    "<REDACTED_EMAIL>": "nidhi-singh02",
+    "<REDACTED_EMAIL>": "Jaaneek",  # PR #26457 (xAI Grok OAuth provider)
+    # v0.14.0 additions
+    "<REDACTED_EMAIL>": "wuwuzhijing",  # PR #21063 salvage (gateway docs mention Weixin)
+    "<REDACTED_EMAIL>": "nightcityblade",  # PR #24138 (docs voice/tts table)
+    "<REDACTED_EMAIL>": "polkn",  # PR #6136 salvage (skill_view collision refusal)
+    "<REDACTED_EMAIL>": "rewbs",
+    # batch salvage (May 2026 LHF run)
+    "<REDACTED_EMAIL>": "Saurav0989",  # PR #27071 (docs: hermes-eval community link)
+    "<REDACTED_EMAIL>": "Saurav0989",
+    "<REDACTED_EMAIL>": "avifenesh",  # PR #25902 (docs: computer-use-linux MCP)
+    "<REDACTED_EMAIL>": "avifenesh",
+    "<REDACTED_EMAIL>": "BROCCOLO1D",  # PR #26796 (docs: spotify + HA)
+    "<REDACTED_EMAIL>": "matthewlai",  # PR #25293 (feat: gemma 4 reasoning allowlist)
+    "<REDACTED_EMAIL>": "matthewlai",
+    "<REDACTED_EMAIL>": "0xchainer",  # PR #27154/27138/27147 salvage
+    "<REDACTED_EMAIL>": "kronexoi",  # PR #27167 salvage (Teams port fallback)
+    "<REDACTED_EMAIL>": "EloquentBrush0x",  # PR #26642 salvage (post_setup parity)
+    # batch salvage (May 2026 LHF run, group 2)
+    "<REDACTED_EMAIL>": "shellybotmoyer",  # PR #26661 (kanban --severity >=)
+    "<REDACTED_EMAIL>": "shellybotmoyer",  # PR #25576 (credential_pool ISO rehydrate)
+    "<REDACTED_EMAIL>": "shellybotmoyer",
+    "<REDACTED_EMAIL>": "ether-btc",  # PR #26632 (memory provider whitespace guard)
+    "<REDACTED_EMAIL>": "LifeJiggy",  # PR #26516 (paste collapse logging)
+    "<REDACTED_EMAIL>": "LifeJiggy",
+    "<REDACTED_EMAIL>": "LifeJiggy",  # stale salvage commit alias (PR #28315)
+    "<REDACTED_EMAIL>": "nekwo",  # PR #26481 (PS5.1 UTF-8 BOM)
+    "<REDACTED_EMAIL>": "nekwo",
+    "<REDACTED_EMAIL>": "stepanov1975",  # PR #22074 (setup config picker writes)
+    "<REDACTED_EMAIL>": "devsart95",  # PR #23249 (cron Telegram DM topic delivery)
+    "<REDACTED_EMAIL>": "flooryyyy",  # PR #26374 (tool_trace error detection)
+    "<REDACTED_EMAIL>": "dgians",  # PR #26034 (.ts/.py/.sh docs types)
+    "<REDACTED_EMAIL>": "dgians",  # PR #26034 (bot-committed by zealy-tzco under dgians' PR)
+    "<REDACTED_EMAIL>": "flanny7",  # PR #27030 (setup_open_webui python var)
+    "<REDACTED_EMAIL>": "flanny7",
+    "<REDACTED_EMAIL>": "hermesagent26",  # PR #26438 (kimi model-name reasoning pad)
+    "<REDACTED_EMAIL>": "hermesagent26",
+    "<REDACTED_EMAIL>": "kriscolab",  # PR #26926 (deepseek default_aux_model)
+    # batch salvage (May 2026 LHF run, group 3)
+    "<REDACTED_EMAIL>": "darvsum",  # PR #26766 (preserve discover_models in normalize)
+    "<REDACTED_EMAIL>": "hueilau",  # PR #26498 (strip image parts for non-vision)
+    "<REDACTED_EMAIL>": "hueilau",
+    "<REDACTED_EMAIL>": "Timur00Kh",  # PR #27114 (telegram DM topic for synthetic events)
+    "<REDACTED_EMAIL>": "Grogger",  # PR #27061 (windows console flash suppress)
+    "<REDACTED_EMAIL>": "Grogger",
+    "<REDACTED_EMAIL>": "Grogger",  # stale salvage commit alias (PR #28330)
+    "<REDACTED_EMAIL>": "lemassykoi",  # PR #27042 (model-switch probe keyless providers)
+    "<REDACTED_EMAIL>": "lemassykoi",
+    "<REDACTED_EMAIL>": "draplater",  # PR #26707 (goal judge current time)
+    "<REDACTED_EMAIL>": "draplater",
+    "<REDACTED_EMAIL>": "pr7426",  # PR #27048 (cron parallel job loss)
+    "<REDACTED_EMAIL>": "therahul-yo",  # PR #26215 (mock keychain in tests)
+    "<REDACTED_EMAIL>": "flamiinngo",  # PR #27205 (UnicodeEncodeError footgun checker)
+    # batch salvage (May 2026 LHF run, group 4)
+    "<REDACTED_EMAIL>": "EloquentBrush0x",  # PR #26657 (trust_env aiohttp)
+    "<REDACTED_EMAIL>": "subtract0",  # PR #25658 (zsh $status -> $rc)
+    "<REDACTED_EMAIL>": "zwolniony",  # PR #26961 (gemini x-goog-api-key)
+    "<REDACTED_EMAIL>": "zwolniony",
+    "<REDACTED_EMAIL>": "that-ambuj",  # PR #26582 (preserve underscores)
+    "<REDACTED_EMAIL>": "zccyman",  # PR #25294 (custom provider api_key_env alias)
+    # xAI cluster batch salvage (May 2026)
+    "<REDACTED_EMAIL>": "Fewmanism",  # PR #27420 (threaded xAI OAuth callback)
+    "<REDACTED_EMAIL>": "Slimydog21",  # PR #28021 (strip slash enums xAI Responses)
+    "<REDACTED_EMAIL>": "Slimydog21",  # PR #28021 salvage (noreply form)
+    "<REDACTED_EMAIL>": "lidge-jun",  # PR #26814 (api server browser security headers)
+    "<REDACTED_EMAIL>": "phoenixshen",  # PR #26768 (respect user-configured vision model)
+    "<REDACTED_EMAIL>": "phoenixshen",
+    "<REDACTED_EMAIL>": "AhmetArif0",  # PR #26635 (line proxy env vars)
+    # batch salvage (May 2026 LHF run, group 5)
+    "<REDACTED_EMAIL>": "haran2001",  # PR #27070 (i18n catalog test)
+    "<REDACTED_EMAIL>": "haran2001",  # PR #27068 (qwen3.6-plus 1M context)
+    "<REDACTED_EMAIL>": "haran2001",
+    "<REDACTED_EMAIL>": "ms-alan",  # PR #26443 (reload-skills tab completion)
+    "<REDACTED_EMAIL>": "godlin-gh",  # PR #26118 (ACP polished tools)
+    "<REDACTED_EMAIL>": "wesleysimplicio",  # PR #25777 (xterm.js native selection)
+    "<REDACTED_EMAIL>": "wesleysimplicio",
+    "<REDACTED_EMAIL>": "Carry00",  # PR #26851 (doctor SSH env vars)
+    "<REDACTED_EMAIL>": "alaamohanad169-ship-it",  # PR #26036 (telegram typing after send)
+    "vigo@hermes": "hawknewton",  # PR #26294 (bedrock boto3 lazy_deps)
+    "<REDACTED_EMAIL>": "hawknewton",
+    "<REDACTED_EMAIL>": "QuenVix",  # PR #26761/26772 salvage
+    "<REDACTED_EMAIL>": "QuenVix",
+    "<REDACTED_EMAIL>": "Mind-Dragon",  # PR #26966 salvage
+    "<REDACTED_EMAIL>": "soynchux",  # PR #27060 salvage
+    "<REDACTED_EMAIL>": "soynchux",
+    # batch salvage (May 2026 LHF run, group 6 — final)
+    "<REDACTED_EMAIL>": "bird",  # PR #25219 (gateway docker exit-75 restart)
+    "<REDACTED_EMAIL>": "davidcampbelldc",  # PR #26834 (web_server proxy_headers=False)
+    "<REDACTED_EMAIL>": "davidcampbelldc",
+    "<REDACTED_EMAIL>": "chazmaniandinkle",  # PR #43888 (launchd /restart detection)
+    "<REDACTED_EMAIL>": "nodejun",  # PR #21112 (anthropic keychain/file credential desync)
+    "<REDACTED_EMAIL>": "hehehe0803",  # PR #26212 salvage (codex kanban writable root)
+    "<REDACTED_EMAIL>": "hehehe0803",
+    "<REDACTED_EMAIL>": "kasunvinod",  # PR #24126 salvage (codex timeout propagation)
+    "<REDACTED_EMAIL>": "kasunvinod",
+    "<REDACTED_EMAIL>": "vaddisrinivas",  # PR #26394 salvage (Docker messaging extra)
+    # batch salvage (May 2026 LHF run, group 7)
+    "<REDACTED_EMAIL>": "02356abc",  # PR #28286 salvage (wecom CLOSING)
+    "<REDACTED_EMAIL>": "burjorjee",  # PR #28201 salvage (inline-shell timeout guard)
+    "<REDACTED_EMAIL>": "burjorjee",
+    "<REDACTED_EMAIL>": "oseftg",  # PR #28168 salvage (natural ending emoji/caret)
+    "<REDACTED_EMAIL>": "oseftg",
+    "<REDACTED_EMAIL>": "rudi193-cmd",  # PR #28241 salvage (empty credential pool)
+    "<REDACTED_EMAIL>": "rudi193-cmd",
+    "<REDACTED_EMAIL>": "sadiksaifi",  # PR #27982 salvage (kanban horiz scroll)
+    "<REDACTED_EMAIL>": "sadiksaifi",
+    "<REDACTED_EMAIL>": "vynxevainglory-ai",  # PR #29233 salvage (kanban scrollbar + body overflow)
+    "<REDACTED_EMAIL>": "vynxevainglory-ai",
+    # batch salvage (May 2026 LHF run, group 8)
+    "<REDACTED_EMAIL>": "AceWattGit",  # PR #28159 salvage (_pool_may_recover NameError)
+    "<REDACTED_EMAIL>": "YuanHanzhong",  # PR #28032 salvage (x.com status link-like)
+    "<REDACTED_EMAIL>": "colin-chang",  # PR #28245/#28249/#28251 salvage
+    "<REDACTED_EMAIL>": "colin-chang",
+    "<REDACTED_EMAIL>": "felix-windsor",  # PR #28019 salvage (cron asterisks)
+    "<REDACTED_EMAIL>": "felix-windsor",
+    "<REDACTED_EMAIL>": "houenyang-momo",  # PR #28205 salvage (charizard contrast)
+    "<REDACTED_EMAIL>": "sir-ad",  # PR #31941 salvage (compaction noise)
+    "<REDACTED_EMAIL>": "sir-ad",
+    "<REDACTED_EMAIL>": "rdasilva1016-ui",  # PR #31098 salvage (Telegram /start ping)
+    "<REDACTED_EMAIL>": "rdasilva1016-ui",
+    "<REDACTED_EMAIL>": "iqdoctor",  # PR #28095 salvage (windows installer docs)
+    "<REDACTED_EMAIL>": "joe102084",  # PR #28151 salvage (whitespace cron responses)
+    "<REDACTED_EMAIL>": "joe102084",
+    "<REDACTED_EMAIL>": "jvinals",  # PR #27936 salvage (Slack U-IDs)
+    "<REDACTED_EMAIL>": "maxmilian",  # PR #28267 salvage (Change Model portal)
+    "<REDACTED_EMAIL>": "maxmilian",
+    "<REDACTED_EMAIL>": "samggggflynn",  # PR #27952 salvage (dingtalk pre_start)
+    "<REDACTED_EMAIL>": "samggggflynn",
+    "<REDACTED_EMAIL>": "yannsunn",  # PR #28064 salvage (xai proxy upstream)
+    "<REDACTED_EMAIL>": "yannsunn",
+    "<REDACTED_EMAIL>": "asdlem",  # PR #27852 salvage (clarify full text in body)
+    # batch salvage (May 2026 LHF run, group 9)
+    "<REDACTED_EMAIL>": "jdelmerico",  # PR #28278 salvage (signal require_mention)
+    "<REDACTED_EMAIL>": "justemu",  # PR #27996 salvage (matrix thread_require_mention)
+    "<REDACTED_EMAIL>": "justemu",
+    "<REDACTED_EMAIL>": "YuanHanzhong",  # PR #28029 salvage (dashboard scrollback)
+    "<REDACTED_EMAIL>": "YuanHanzhong",
+    "<REDACTED_EMAIL>": "noctilust",  # PR #28080 salvage (stale TUI resume env)
+    "<REDACTED_EMAIL>": "noctilust",
+    "<REDACTED_EMAIL>": "MoonJuhan",  # PR #28288 salvage (unreadable JSONL transcripts)
+    "<REDACTED_EMAIL>": "MoonJuhan",
+    "<REDACTED_EMAIL>": "outsourc-e",  # PR #28164 salvage (cron emoji ZWJ)
+    "<REDACTED_EMAIL>": "outsourc-e",  # PR #28177 salvage (Teams recording path traversal)
+    "<REDACTED_EMAIL>": "Zyrixtrex",  # PR #28275 salvage (Google OAuth timeout)
+    "<REDACTED_EMAIL>": "Zyrixtrex",
+    "<REDACTED_EMAIL>": "ooovenenoso",  # PR #28256 salvage (tool loop recovery hints)
+    "<REDACTED_EMAIL>": "ooovenenoso",
+    "<REDACTED_EMAIL>": "vanthinh6886",  # PR #28018 salvage (yaml/flock/atomic write guards)
+    "<REDACTED_EMAIL>": "erikengervall",  # PR #28774 (firecrawl integration tag)
+    "<REDACTED_EMAIL>": "egilewski",  # PR #30432 (MEDIA path traversal fix, GHSA-jmf9-9729-7pp8)
+    "<REDACTED_EMAIL>": "andrewhomeyer",  # PR #20056 (snapshot owner-only perms, co-author on #57386 salvage)
+    "<REDACTED_EMAIL>": "McClean-Edison",  # PR #29817 (register_auxiliary_task plugin API)
+    "<REDACTED_EMAIL>": "OYLFLMH",  # PR #48312 salvage (cli_refresh_interval config, #48309)
+    "<REDACTED_EMAIL>": "SamuelZ12",  # PR #7480 (show recap after in-session resume)
+    "<REDACTED_EMAIL>": "daizhonggeng",  # PR #9020 (numbered /resume selection)
+    "<REDACTED_EMAIL>": "wanwan2qq",  # PR #10215 (strip brackets/quotes from /resume; gateway session-ID lookup)
+    "<REDACTED_EMAIL>": "SimoKiihamaki",  # PR #30773 (Windows /reset+/new freeze; stdin fallback for modal)
+    "<REDACTED_EMAIL>": "Tranquil-Flow",  # PR #27518 (bracketed-paste timeout)
+    "<REDACTED_EMAIL>": "riyas22",  # PR #43687 salvage (strip cronjob toolset from delegated children, #43466)
+    "<REDACTED_EMAIL>": "8bit64k",  # PR #14681 (TUI /q alias from quit to queue)
+    "<REDACTED_EMAIL>": "hclsys",  # PR #31985 (TUI /q alias regression test)
+    "dearmayo@localhost": "ffr31mr",  # PR #32103 (SubdirectoryHintTracker workspace boundary)
+    "<REDACTED_EMAIL>": "TheOnlyMika",  # PR #32155 (dashboard XSS + defusedxml)
+    "<REDACTED_EMAIL>": "krislidimo",  # PR #29775 (tighten Telegram table row-group spacing; drop redundant first bullet)
+    "<REDACTED_EMAIL>": "Codename-11",  # PR #29302 (API server session controls — sessions/chat/fork/stream)
+    "<REDACTED_EMAIL>": "Schwartz10",  # PR #29302 sub-PR (multimodal media in session chat API)
+    "<REDACTED_EMAIL>": "JohnC1009",  # PR #32020 salvage (auth: global auth.json fallback in _load_provider_state)
+    "<REDACTED_EMAIL>": "bisko",  # PR #33784 salvage (re-pad reasoning_content on cross-provider fallback to require-side providers)
+    # v0.15.0 additions
+    "<REDACTED_EMAIL>": "sgtworkman",
+    "<REDACTED_EMAIL>": "jfuenmayor",
+    "<REDACTED_EMAIL>": "joshuadow",  # PR #43004 salvage (desktop WS session rebind)
+    "<REDACTED_EMAIL>": "emonty",
+    "<REDACTED_EMAIL>": "rodrigoeqnit",
+    "<REDACTED_EMAIL>": "jonpol01",
+    "<REDACTED_EMAIL>": "yu-xin-c",  # PR #51875 salvage (protect external_dirs skills from curator)
+    "<REDACTED_EMAIL>": "BaxBit",  # PR #30200 (Svix webhook signature validation)
+    "<REDACTED_EMAIL>": "duyua9",  # PR #10949 (render object config values structurally)
+    "ethie@nous": "ethernet8023",  # PR #29342 (TUI clipboard copy on linux/wayland)
+    "<REDACTED_EMAIL>": "Jiahui-Gu",  # PR #29276 (guard pickle.loads in darwinian-evolver)
+    "<REDACTED_EMAIL>": "justincc",  # PR #28914 (set tool_name on tool-result messages)
+    "<REDACTED_EMAIL>": "slowtokki0409",  # PR #29025 (ignore local Hermes runtime files)
+    "<REDACTED_EMAIL>": "WuKongAI-CMU",  # PR #10082 (reject symlinked audio inputs)
+    "<REDACTED_EMAIL>": "Sunil123135",  # PR #31031 (Windows Docker Desktop compose)
+    "<REDACTED_EMAIL>": "ChyuWei",  # PR #30987 (TUI TTS env var on voice off)
+    # batch salvage PR #35758 (perf micro-fixes)
+    "<REDACTED_EMAIL>": "amathxbt",  # PR #22155 (cache tool_output_limits)
+    "<REDACTED_EMAIL>": "ErnestHysa",  # PRs #32636/#32708 (MCP asyncio.sleep + O(n^2) watcher drain)
+    "<REDACTED_EMAIL>": "alastraz",  # PR #41383 salvage (cua EAGAIN CLI-transport fallback)
+    "<REDACTED_EMAIL>": "SiTaggart",  # PR #35583 (docker_forward_env empty-secret .env fallback)
+    "<REDACTED_EMAIL>": "x1am1",  # PR #35098 (chown root-owned top-level HERMES_HOME state files)
+    "<REDACTED_EMAIL>": "polnikale",  # PR #35717 (discover Playwright headless_shell browser)
+    "<REDACTED_EMAIL>": "whyhkzk",  # PR #32407 (sandbox-mirror inner-container guard; commits authored as whyhkzk + zhukun)
+    "<REDACTED_EMAIL>": "leonardsellem",  # PR #37405 (desktop WS origin guard on remote/Tailscale binds)
+    "<REDACTED_EMAIL>": "ohMyJason",  # PR #29810 (discover_models in custom_providers section 4)
+    "<REDACTED_EMAIL>": "sanidhyasin",  # PR #40403 salvage (model.default_headers for custom OpenAI-compatible providers, #40033)
+    "<REDACTED_EMAIL>": "JoelJJohnson",  # PR #39913 salvage (Windows ConPTY dashboard chat bridge)
+    "<REDACTED_EMAIL>": "Nea74",  # PR #40022 co-author credit (same Windows ConPTY bridge design)
+    "<REDACTED_EMAIL>": "joel611",  # PR #33958 salvage (DISCORD_ALLOWED_ROLES role_authorized gateway flag)
+    "<REDACTED_EMAIL>": "dschnurbusch",  # PR #42373 salvage (archive compressed conversation lineages)
+    "<REDACTED_EMAIL>": "bcsmith528",  # PR #20589 salvage (register_slack_action_handler plugin API)
+    "<REDACTED_EMAIL>": "liuhao1024",  # PR #45494 salvage (claim session slot before auto-resume task; #45456)
+    "<REDACTED_EMAIL>": "capt-marbles",  # PR #38440 salvage (resolve xAI OAuth credentials across profiles; #43589)
+    "<REDACTED_EMAIL>": "infinitycrew39",  # PR #47945 salvage (scope langfuse trace state by turn/request ids; #48292)
+    "<REDACTED_EMAIL>": "huangxun375-stack",  # PR #37251 / #48894 structured OpenViking sync
+    "<REDACTED_EMAIL>": "koshaji",  # PR #49832 salvage (OpenViking runtime autostart shutdown drain)
+    "<REDACTED_EMAIL>": "wgd753",  # PR #59454 salvage (OpenViking trusted-mode retry matching)
+    "<REDACTED_EMAIL>": "Sahil-SS9",  # PR #48466/#44919/#44909/#42209 salvage (cron/checkpoint/kanban/skill)
+    "<REDACTED_EMAIL>": "max-chen",  # PR #51194 salvage (single-pass list_profiles alias map + skill-count cache; #54751)
+    # v0.17.0 additions
+    "<REDACTED_EMAIL>": "pengyuyanITYU",  # PR #43618 (harden local file tree paths)
+    "<REDACTED_EMAIL>": "AIalliAI",  # PR #44159 (desktop hover-reveal inset)
+    "<REDACTED_EMAIL>": "ameobius",  # PR #44383 co-author (discord gateway task recovery)
+    "<REDACTED_EMAIL>": "mollusk",  # PR #44493 (desktop assistant-ui recovery)
+    "<REDACTED_EMAIL>": "bionicbutterfly13",  # direct email match
+    "<REDACTED_EMAIL>": "enesilhaydin",  # direct email match
+    "<REDACTED_EMAIL>": "Evisolpxe",  # direct email match
+    "<REDACTED_EMAIL>": "fyzanshaik",  # direct email match
+    "<REDACTED_EMAIL>": "AMIK-coorporations",  # PR #40578 (Urdu README) co-author
+    "<REDACTED_EMAIL>": "AMIK-coorporations",  # PR #40578 (Urdu README)
+    "<REDACTED_EMAIL>": "kyssta-exe",  # PR #44282 (Windows dashboard re-exec)
+    "<REDACTED_EMAIL>": "Elshayib",  # PR #48351 (custom-provider misattribution guard; #48305)
+    "<REDACTED_EMAIL>": "loongfay",  # PR #43508 (Yuanbao wechat forward msg)
+    "<REDACTED_EMAIL>": "BROCCOLO1D",  # PR #42733 (lazy-parse docker env config)
+    "<REDACTED_EMAIL>": "underthestars-zhy",  # PR #46907 co-author (Photon Spectrum project ids)
+    "<REDACTED_EMAIL>": "OmarB97",  # PR #43977 (desktop session model metadata)
+    "<REDACTED_EMAIL>": "OmarB97",  # PR #43977 (desktop session model metadata)
+    "<REDACTED_EMAIL>": "szafranski",  # PR #36020 (Telegram voice/audio duration)
+    "<REDACTED_EMAIL>": "PhilipAD",  # direct email match
+    "<REDACTED_EMAIL>": "qingshan89",  # PR #46895 co-author (desktop remote artifact download)
+    "<REDACTED_EMAIL>": "AJ",  # PR #44510 co-author (desktop named-profile boot loop)
+    "<REDACTED_EMAIL>": "steveonjava",  # PR #29669 (redact secrets in kanban tool payloads)
+    "<REDACTED_EMAIL>": "Afnath-max",  # PR #49129 salvage (opencode-zen catalog refresh + uncapped/live-first picker)
+    "<REDACTED_EMAIL>": "ipriyaaanshu",  # PR #51488 salvage (clear stale base_url on gateway model switches; #25107)
+    "<REDACTED_EMAIL>": "mrparker0980",  # @file context-ref expansion anchored to canonical read deny-list
+    # v0.18.0 additions
+    "<REDACTED_EMAIL>": "AetherAgents",  # direct email match
+    "<REDACTED_EMAIL>": "lEWFkRAD",  # PR #45610 (Windows scheduled task reboot survival)
+    "<REDACTED_EMAIL>": "p-andhika",  # PR #53312 co-author (setup guide button)
+    "<REDACTED_EMAIL>": "annguyenNous",  # PR #52844 co-author
+    "<REDACTED_EMAIL>": "talmax1124",  # direct email match
+    "<REDACTED_EMAIL>": "chrispersico",  # commit 135f2351 PR author
+    "<REDACTED_EMAIL>": "KeyArgo",  # co-author
+    "<REDACTED_EMAIL>": "spjoes",  # direct email match
+    "<REDACTED_EMAIL>": "KeyArgo",  # PR #45638 author
+    "<REDACTED_EMAIL>": "Lucas Nicolas",  # PR #54210 co-author (display name)
+    "<REDACTED_EMAIL>": "maxpetrusenko",  # PR #54128 co-author
+    "<REDACTED_EMAIL>": "wnuuee1",  # commit 9fd2b2cb PR author
+    "<REDACTED_EMAIL>": "Eji4h",  # direct email match
+    "<REDACTED_EMAIL>": "designnotdrum",  # PR #56480 salvage (toolset static-inference fix)
+    "<REDACTED_EMAIL>": "LavyaTandel",  # PR #57893 salvage local git identity (envelope-layout cache markers on tool/empty-assistant messages; #57845)
+    "<REDACTED_EMAIL>": "SquabbyZ",  # PR #59682 salvage (in-container dashboard WS loopback host; #58993)
+    "<REDACTED_EMAIL>": "0disoft",  # PR #53511 salvage (gateway PID probe TTL cache)
+    "<REDACTED_EMAIL>": "0-CYBERDYNE-SYSTEMS-0",  # PR #53966 salvage (session DB reads off event loop)
+    "<REDACTED_EMAIL>": "sebastianlutycz",  # PR #39140 salvage (descendant CTE); bare noreply (no NNN+ prefix) needs explicit mapping
+    "<REDACTED_EMAIL>": "BobClawblaw",  # PR #77870 salvage (output-cap compression on retry path; #55546)
+    "<REDACTED_EMAIL>": "mahdiwafy",  # PR #60347 salvage (session messages pagination)
+    "<REDACTED_EMAIL>": "CodeForgeNet",  # PR #47437 salvage (compact_rows blob skip)
+    "<REDACTED_EMAIL>": "dexhunter",  # PR #60339 salvage (skills snapshot manifest speedup)
+    "<REDACTED_EMAIL>": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
+    "<REDACTED_EMAIL>": "8294",  # PR #50572 salvage (honor config context_length on banner)
+    "<REDACTED_EMAIL>": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+}

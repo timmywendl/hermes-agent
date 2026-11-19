@@ -1,0 +1,223 @@
+"""Telegram control-routing contract: short queries stay inline, real work gets a task.
+
+The behavioural requirements this pins (they are the acceptance criteria for the
+port, not symbol presence):
+
+* a normal status question never creates a task;
+* an explicit long-work request creates exactly ONE native Kanban task, with an
+  origin notification subscription written for the requesting chat;
+* the same inbound message twice is idempotent (no duplicate task);
+* a non-Telegram source is never routed;
+* an interrupted creation never falls back to inline execution.
+
+Everything here is synthetic: a fake transport, a temporary HERMES_HOME and a
+temporary Kanban home. No real bot token, no real board.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import pathlib
+import sqlite3
+
+import pytest
+
+from gateway.remote_work import (
+    build_bounded_execution_packet,
+    classify_long_work_intent,
+    classify_long_work_request,
+    remote_work_idempotency_key,
+)
+from gateway.semantic_control import normalize_control_text, resolve_control_intent
+
+
+# --------------------------------------------------------------------------- intent
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "请帮我实现 v0.22.3 的升级候选",
+        "帮我修复 Kanban 的 stale base 问题",
+        "继续推进候选移植",
+    ],
+)
+def test_explicit_long_work_requests_are_routed(text):
+    assert classify_long_work_request(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "现在什么状态？",
+        "进度怎么样",
+        "你有几个项目",
+        "Codex 现在是哪个执行者",
+        "你好",
+        "",
+    ],
+)
+def test_status_questions_and_small_talk_are_not_long_work(text):
+    """A status query must never be promoted into a task."""
+    assert classify_long_work_request(text) is False
+
+
+def test_long_work_intent_carries_the_objective():
+    intent = classify_long_work_intent("请帮我实现通知附件边界")
+    assert intent is not None
+    assert intent.objective
+
+
+def test_packet_is_bounded_and_excludes_the_transcript():
+    packet = build_bounded_execution_packet("请帮我实现一个很长的需求" * 200, task_id="k1")
+    assert packet
+    assert len(packet) < 4000
+
+
+def test_idempotency_key_is_stable_for_the_same_message():
+    a = remote_work_idempotency_key(platform="telegram", chat_id="1", message_id="m1", objective="x")
+    b = remote_work_idempotency_key(platform="telegram", chat_id="1", message_id="m1", objective="x")
+    c = remote_work_idempotency_key(platform="telegram", chat_id="1", message_id="m2", objective="x")
+    assert a == b
+    assert a != c
+
+
+# --------------------------------------------------------------- semantic control
+
+
+@pytest.fixture()
+def synthetic_registry(tmp_path, monkeypatch):
+    """A synthetic portfolio registry, so these tests never read the machine's real one."""
+    registry = tmp_path / "portfolio-projects.yaml"
+    registry.write_text(
+        "projects:\n"
+        "  - name: ai-colleague\n"
+        "    repository: spareribes/ai-colleague\n"
+        "    authority: GitHub Issue #82\n",
+        encoding="utf-8",
+    )
+    import gateway.semantic_control as _sc
+    monkeypatch.setattr(_sc, "default_registry_path", lambda: registry)
+    return registry
+
+
+@pytest.mark.parametrize(
+    ("text", "expected_kind"),
+    [
+        # A status question NAMING the project resolves to a read-only portfolio projection.
+        ("ai-colleague 有哪些需要我处理的？", "HUMAN_ATTENTION"),
+        ("petlibro-cloud-test 有哪些需要我处理的？", "HUMAN_ATTENTION"),
+    ],
+)
+def test_status_queries_resolve_to_a_read_only_intent(synthetic_registry, text, expected_kind):
+    intent = resolve_control_intent(text)
+    assert intent is not None, text
+    assert intent.kind == expected_kind
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        # Mutation markers must never be answered by the read-only projection.
+        "继续 ai-colleague",
+        "帮我实现通知边界",
+        "ai-colleague 提交一下",
+    ],
+)
+def test_mutation_requests_do_not_resolve_to_a_control_intent(synthetic_registry, text):
+    """A mutating request must never be answered by the read-only projection."""
+    assert resolve_control_intent(text) is None
+
+
+def test_unnamed_status_question_is_not_treated_as_control_traffic(synthetic_registry):
+    """No project named -> not a portfolio query; it stays a normal agent turn."""
+    assert resolve_control_intent("现在什么状态？") is None
+
+
+# ------------------------------------------------------------ native task creation
+
+
+@pytest.fixture()
+def isolated_kanban(tmp_path, monkeypatch):
+    """Temporary HERMES_HOME + Kanban home so no real board is ever touched."""
+    home = tmp_path / ".hermes"
+    khome = tmp_path / "kanban-home"
+    home.mkdir()
+    khome.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(khome))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb.init_db()
+    return home, khome
+
+
+class _Source:
+    platform = "telegram"
+    chat_id = "424242"
+    thread_id = None
+    user_id = "u1"
+    user_id_alt = None
+    chat_type = "dm"
+    profile = None
+
+
+def _db_path(khome: pathlib.Path) -> pathlib.Path:
+    return khome / "kanban.db"
+
+
+def test_creating_a_remote_task_writes_one_task_and_one_subscription(isolated_kanban):
+    """The owner is the native Kanban task + notify subscription; we add no other state."""
+    from gateway.remote_work import create_native_remote_task
+
+    task_id, subscribed = create_native_remote_task(
+        source=_Source(),
+        packet="bounded packet",
+        objective="请帮我实现通知边界",
+        session_id="sess-1",
+        idempotency_key="idem-1",
+        delivery_metadata={"thread_id": None},
+    )
+    assert subscribed is True
+
+    _home, khome = isolated_kanban
+    conn = sqlite3.connect(_db_path(khome))
+    conn.row_factory = sqlite3.Row
+    try:
+        tasks = conn.execute("SELECT id, status FROM tasks").fetchall()
+        subs = conn.execute(
+            "SELECT task_id, platform, chat_id FROM kanban_notify_subs"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    assert [row["id"] for row in tasks] == [task_id]
+    assert [(row["task_id"], row["platform"], row["chat_id"]) for row in subs] == [
+        (task_id, "telegram", "424242")
+    ]
+
+
+def test_same_idempotency_key_never_creates_a_second_task(isolated_kanban):
+    from gateway.remote_work import create_native_remote_task
+
+    kwargs = dict(
+        source=_Source(),
+        packet="bounded packet",
+        objective="请帮我实现通知边界",
+        session_id="sess-1",
+        idempotency_key="idem-dup",
+        delivery_metadata={"thread_id": None},
+    )
+    first, _ = create_native_remote_task(**kwargs)
+    second, _ = create_native_remote_task(**kwargs)
+
+    assert first == second
+    _home, khome = isolated_kanban
+    conn = sqlite3.connect(_db_path(khome))
+    try:
+        count = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+    assert count == 1

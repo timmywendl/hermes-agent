@@ -1,0 +1,295 @@
+"""Read-only portfolio projection used by semantic control queries.
+
+A status question ("what needs me?") must never enter the chat session turn or create a task,
+so the answer comes from a bounded projection: a deterministic projection first, then a
+one-shot agent that is never mirrored into the human conversation. Extracted from the
+``run_turn`` facade to keep that module under its line ratchet.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import logging
+import subprocess
+import sys
+
+from pathlib import Path
+from typing import Any, Optional
+
+from gateway.media_repair import repair_explicit_computer_use_media_paths
+
+logger = logging.getLogger(__name__)
+
+# The ONLY tools a control-query fallback agent may use. A status question must not be able to
+# mutate a repository, a task, the Kanban board, or the host while a Human waits for the answer,
+# so the allowance is an allowlist of read surfaces rather than a denylist of writers: a new
+# mutating tool added later is excluded by default instead of silently admitted.
+READ_ONLY_CONTROL_TOOLSET = "control_query_read_only"
+
+_READ_ONLY_CONTROL_TOOLS = frozenset({
+    "read_file", "search_files", "web_search", "web_extract", "vision_analyze",
+    "skills_list", "skill_view", "session_search", "todo_list",
+    "kanban_show", "kanban_list", "kanban_attachments",
+    "process_manage", "kanban_heartbeat",
+})
+
+
+def _read_only_control_allowance(enabled_toolsets, disabled_toolsets):
+    """Narrow a resolved toolset to the read-only control allowance.
+
+    Enabling is by TOOLSET NAME, so the enabled set is REPLACED by the single built-in
+    ``control_query_read_only`` toolset whose tool list IS the allowance. That replacement is the
+    whole bound: naming tools in ``disabled_toolsets`` could not have achieved it, because a
+    disable list only subtracts from a set nobody bounded (and ``_apply_toolset_selection``
+    resolves those names against toolsets, not tools).
+    """
+    return [READ_ONLY_CONTROL_TOOLSET], list(disabled_toolsets or ())
+
+
+class ReadonlyControlProjectionMixin:
+    @staticmethod
+    def _portfolio_key(value: object) -> str:
+        """Normalize a project slug/name for root lookups."""
+        return str(value or "").strip().casefold().replace("_", "-").replace(" ", "-")
+
+    def _portfolio_roots(self) -> dict[str, Path]:
+        """Map normalized project identity -> configured root path."""
+        from hermes_cli.projects_db import connect_closing, list_projects
+
+        try:
+            with connect_closing() as conn:
+                configured = list_projects(conn)
+        except Exception:  # health: allow BLE001 -- a status read must degrade, never raise
+            logger.debug("Unable to load Hermes project roots for semantic control", exc_info=True)
+            return {}
+
+        roots: dict[str, Path] = {}
+        for project in configured:
+            raw_root = project.primary_path or next(
+                (folder.path for folder in project.folders if folder.is_primary),
+                project.folders[0].path if project.folders else None,
+            )
+            if not raw_root:
+                continue
+            root = Path(raw_root).expanduser()
+            for identity in (project.slug, project.name):
+                roots[self._portfolio_key(identity)] = root
+        return roots
+
+    @staticmethod
+    def _has_mobile_renderer(candidate: Path) -> bool:
+        """True when *candidate* is a readable script exposing the accepted renderer."""
+        try:
+            return (
+                candidate.is_file()
+                and "def render_mobile" in candidate.read_text(encoding="utf-8-sig", errors="replace")
+            )
+        except (OSError, UnicodeError):
+            return False
+
+    def _linked_checkout_renderer(self, ai_root: Path) -> Optional[Path]:
+        """Find the renderer in a linked checkout when the primary one predates it.
+
+        A dirty primary checkout may not carry the accepted renderer while a linked
+        worktree already does. Prefer that existing checkout and never write to it.
+        """
+        try:
+            worktrees = subprocess.run(
+                ["git", "worktree", "list", "--porcelain"],
+                cwd=ai_root,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=3.0,
+                check=False,
+            ).stdout.splitlines()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        for line in worktrees:
+            if not line.startswith("worktree "):
+                continue
+            candidate = Path(line.removeprefix("worktree ").strip()) / "scripts" / "portfolio_recover.py"
+            if self._has_mobile_renderer(candidate):
+                return candidate
+        return None
+
+    def _resolve_portfolio_script(self, ai_root: Optional[Path]) -> Optional[Path]:
+        """The portfolio_recover.py to execute, or None when no accepted renderer exists."""
+        if ai_root is None:
+            return None
+        primary = ai_root / "scripts" / "portfolio_recover.py"
+        if self._has_mobile_renderer(primary):
+            return primary
+        return self._linked_checkout_renderer(ai_root)
+
+    @staticmethod
+    def _parse_projection_prompt(prompt: str) -> tuple[str, str]:
+        """Extract (intent, target) from the canonical control prompt."""
+        intent = "PORTFOLIO_STATUS"
+        target = ""
+        for line in str(prompt).splitlines():
+            if line.startswith("Canonical intent:"):
+                intent = line.split(":", 1)[1].strip()
+            elif line.startswith("Canonical target:"):
+                target = line.split(":", 1)[1].split("(", 1)[0].strip()
+        return intent, target
+
+    @staticmethod
+    def _render_projection(module, snapshots, configs, intent: str, target: str) -> str:
+        """Render the snapshots for one canonical intent."""
+        if intent == "HUMAN_ATTENTION":
+            return module.render_mobile(snapshots, attention_only=True)
+        if intent == "PROJECT_DETAIL":
+            selected = [s for s in snapshots if s.project_id == target]
+            return module.render_mobile(selected or snapshots, details=True)
+        if intent == "CURRENT_EXECUTOR":
+            selected = [s for s in snapshots if s.project_id == target]
+            if not selected:
+                return ""
+            snapshot = selected[0]
+            executor = snapshot.executor
+            if executor in {module.UNKNOWN, module.NONE, ""}:
+                config = next((item for item in configs if item.project_id == target), None)
+                executor = config.default_executor if config else module.UNKNOWN
+            return (
+                f"{module._mobile_project_name(snapshot)} "
+                f"当前执行者：{module._safe_human_label(executor)}"
+            )
+        return module.render_mobile(snapshots)
+
+    def _deterministic_portfolio_projection(self, prompt: str) -> str:
+        """Render the accepted mobile projection without a model/tool loop.
+
+        Semantic control is read-only, so the answer can use the same bounded portfolio
+        recovery renderer that owns the Human-facing contract. Keeping this path
+        deterministic prevents a side query from expanding into a tool-using agent turn.
+        """
+        from gateway.semantic_control import default_registry_path
+
+        registry = default_registry_path()
+        if not registry.is_file():
+            return ""
+        roots = self._portfolio_roots()
+        script_path = self._resolve_portfolio_script(roots.get(self._portfolio_key("ai-colleague")))
+        if script_path is None:
+            return ""
+
+        module_name = "_hermes_live_portfolio_recover"
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        if spec is None or spec.loader is None:
+            return ""
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+            configs = module.parse_registry(registry)
+            root_bindings = {
+                config.project_id: roots.get(self._portfolio_key(config.project_id))
+                for config in configs
+                if roots.get(self._portfolio_key(config.project_id)) is not None
+            }
+            snapshots = [
+                module.recover_project(
+                    config,
+                    root_bindings.get(config.project_id),
+                    github_enabled=True,
+                )
+                for config in configs
+            ]
+            intent, target = self._parse_projection_prompt(prompt)
+            return self._render_projection(module, snapshots, configs, intent, target)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    async def _run_readonly_control_projection(
+        self,
+        prompt: str,
+        source: Any,
+        task_id: str,
+        event_message_id: Optional[str] = None,
+    ) -> str:
+        """Run one bounded fresh read-only projection without entering the chat session turn."""
+        try:
+            deterministic = await self._run_in_executor_with_context(
+                lambda: self._deterministic_portfolio_projection(prompt)
+            )
+        except Exception:
+            logger.warning("Deterministic semantic control projection failed", exc_info=True)
+            deterministic = ""
+        if deterministic:
+            return deterministic
+
+        from gateway.run import (
+            _checkpoint_agent_kwargs, _current_max_iterations, _load_gateway_config,
+            _platform_config_key,
+        )
+        from run_agent import AIAgent
+
+        user_config = _load_gateway_config()
+        model, runtime_kwargs = self._resolve_session_agent_runtime(source=source, user_config=user_config)
+        if not runtime_kwargs.get("api_key"):
+            return ""
+
+        platform_key = _platform_config_key(source.platform)
+        enabled_toolsets, disabled_toolsets = self._resolve_turn_toolsets(user_config, source, platform_key)
+        # A control query is answered while a Human waits, so the fallback is narrowed to a
+        # read-only tool allowance instead of the platform's ordinary toolset: without this the
+        # agent could mutate a repository, a task, or the host while answering a status question.
+        # The enabled set is REPLACED by that allowance; the operator's own disables still apply.
+        enabled_toolsets, disabled_toolsets = _read_only_control_allowance(
+            enabled_toolsets, disabled_toolsets
+        )
+        provider_routing = self._provider_routing
+        max_iterations = max(1, min(int(_current_max_iterations()), 12))
+        reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
+        self._reasoning_config = reasoning_config
+        self._service_tier = self._resolve_session_service_tier(source=source)
+        turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+
+        def run_sync():
+            agent = AIAgent(
+                model=turn_route["model"],
+                **turn_route["runtime"],
+                **_checkpoint_agent_kwargs(user_config),
+                max_iterations=max_iterations,
+                quiet_mode=True,
+                verbose_logging=False,
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                reasoning_config=reasoning_config,
+                service_tier=self._service_tier,
+                request_overrides=turn_route.get("request_overrides"),
+                providers_allowed=provider_routing.get("only"),
+                providers_ignored=provider_routing.get("ignore"),
+                providers_order=provider_routing.get("order"),
+                provider_sort=provider_routing.get("sort"),
+                provider_require_parameters=provider_routing.get("require_parameters", False),
+                provider_data_collection=provider_routing.get("data_collection"),
+                session_id=task_id,
+                platform=platform_key,
+                **{k: getattr(source, k) for k in (
+                    "user_id", "user_id_alt", "user_name", "chat_id", "chat_name", "chat_type", "thread_id",
+                )},
+                fallback_model=self._refresh_fallback_model(),
+            )
+            # A control query is a read-only side query: it must not mint a durable session row
+            # or write the prompt as a user message. background_review's isolation is the
+            # precedent — _persist_disabled plus no session DB, so _ensure_db_session and
+            # _flush_messages_to_session_db are both no-ops, and close() cannot finalize a row.
+            agent._persist_disabled = True
+            agent._end_session_on_close = False
+            agent._session_db = None
+            try:
+                return agent.run_conversation(user_message=prompt, task_id=task_id)
+            finally:
+                self._cleanup_agent_resources(agent)
+
+        result = await self._run_in_executor_with_context(run_sync)
+        response = result.get("final_response", "") if result else ""
+        if not response and result and result.get("error"):
+            logger.warning("Read-only semantic control projection returned an agent error")
+            return ""
+        if response:
+            response = repair_explicit_computer_use_media_paths(response, result.get("messages", []))
+        return response

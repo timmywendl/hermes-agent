@@ -1,0 +1,140 @@
+"""The control-query fallback must not be able to mutate anything while a Human waits.
+
+Round-2 review finding: the fallback agent was persistence-isolated but kept the platform's
+ordinary toolset, so it could have written files or tasks while answering a status question.
+
+These tests exercise the real narrowing function and the real tool resolver, so a change that
+stops controlling a mutating tool fails here rather than in an audit.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gateway.run_turn_control_projection import (
+    READ_ONLY_CONTROL_TOOLSET,
+    _READ_ONLY_CONTROL_TOOLS,
+    _read_only_control_allowance,
+)
+
+# Every tool that can change durable state, a repository, the host, or outbound reach.
+MUTATING = (
+    "terminal", "write_file", "patch", "execute_code", "delegate_task",
+    "kanban_create", "kanban_complete", "kanban_comment", "kanban_block",
+    "kanban_request_review", "kanban_request_changes", "kanban_unblock",
+    "kanban_link", "kanban_attach", "kanban_attach_url",
+    "skill_manage", "memory", "cronjob_manage", "browser_exec", "browser_click",
+    "browser_type", "image_generate", "text_to_speech",
+)
+
+# `process_manage` is deliberately allowed: a control query may INSPECT or stop the background job
+# it is answering about, and it cannot start work or write anything. It is listed apart from
+# MUTATING so the distinction is visible rather than an unstated subtraction.
+INSPECTIVE_BUT_STATEFUL = ("process_manage",)
+
+
+def _reachable_tools(enabled) -> set:
+    from toolsets import TOOLSETS
+
+    reachable = set()
+    for name in enabled or ():
+        entry = TOOLSETS.get(name)
+        if isinstance(entry, dict):
+            reachable.update(entry.get("tools") or ())
+    return reachable
+
+
+def test_the_allowance_toolset_itself_carries_no_writer() -> None:
+    """The bound lives in the ALLOWANCE: the toolset the fallback enables is read-only by content.
+
+    This is the invariant that survives a future core-default or plugin addition: nothing outside
+    this toolset can be reached, so a writer added elsewhere can never appear here.
+    """
+    assert _READ_ONLY_CONTROL_TOOLS == set(_allowance_toolset_tools())
+    assert not (_READ_ONLY_CONTROL_TOOLS & set(MUTATING)), (
+        f"the allowance itself admits a writer: {sorted(_READ_ONLY_CONTROL_TOOLS & set(MUTATING))}"
+    )
+    # The one stateful allowance is the declared exception, not an accident of the list.
+    assert set(_READ_ONLY_CONTROL_TOOLS) & set(INSPECTIVE_BUT_STATEFUL) == set(INSPECTIVE_BUT_STATEFUL)
+    # Sanity: it must still carry read surfaces, or it could not answer at all.
+    assert {"read_file", "search_files"} <= _READ_ONLY_CONTROL_TOOLS
+
+
+def test_a_platform_bundle_full_of_writers_narrows_to_the_allowance() -> None:
+    """Whatever the platform bundle offers, the plan enables only the allowance toolset."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    bundle = sorted(_get_platform_tools({}, "telegram"))
+    enabled, _disabled = _read_only_control_allowance(bundle, [])
+    assert enabled == [READ_ONLY_CONTROL_TOOLSET]
+    # The bundle itself must really carry writers, or this proves nothing.
+    assert set(_reachable_tools(bundle)) & set(MUTATING), "bundle exposes no writer"
+
+
+def _allowance_toolset_tools() -> list:
+    from toolsets import TOOLSETS
+
+    return list(TOOLSETS[READ_ONLY_CONTROL_TOOLSET]["tools"])
+
+
+def test_allowance_never_readmits_a_tool_the_operator_disabled() -> None:
+    """The operator's own disables are passed through, not discarded."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    enabled = sorted(_get_platform_tools({}, "telegram"))
+    # A read surface the operator disabled must stay disabled even though it is in the allowance.
+    _enabled, disabled = _read_only_control_allowance(enabled, ["web_search", "vision_analyze"])
+    assert "web_search" in disabled
+    assert "vision_analyze" in disabled
+
+
+def test_allowance_keeps_read_surfaces_usable() -> None:
+    """The answer still needs read access, or the fallback could not answer at all."""
+    from hermes_cli.tools_config import _get_platform_tools
+
+    enabled = sorted(_get_platform_tools({}, "telegram"))
+    _enabled, disabled = _read_only_control_allowance(enabled, [])
+    for tool in ("read_file", "search_files", "web_search", "kanban_show"):
+        assert tool not in disabled
+
+
+def test_resolved_toolsets_actually_exclude_the_writers() -> None:
+    """End-to-end through `model_tools`: the resolved schema list carries no mutating tool."""
+    from model_tools import get_tool_definitions
+
+    from hermes_cli.tools_config import _get_platform_tools
+
+    enabled, disabled = _read_only_control_allowance(sorted(_get_platform_tools({}, "telegram")), [])
+    definitions = get_tool_definitions(
+        enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True,
+    )
+    names = {tool["function"]["name"] for tool in definitions}
+    leaked = names & set(MUTATING)
+    assert not leaked, f"control-query agent would have been offered: {sorted(leaked)}"
+
+
+def test_unknown_enabled_set_never_widens_the_allowance() -> None:
+    """An unresolved toolset set must not become 'everything allowed'.
+
+    An unknown/empty enabled set resolves to no toolset at all, so the agent would be offered the
+    core default. The narrowing still refuses to readmit anything that is not a read surface.
+    """
+    from model_tools import get_tool_definitions
+
+    enabled, disabled = _read_only_control_allowance(None, None)
+    definitions = get_tool_definitions(enabled_toolsets=enabled, disabled_toolsets=disabled, quiet_mode=True)
+    names = {tool["function"]["name"] for tool in definitions}
+    leaked = names & set(MUTATING)
+    assert not leaked, f"unresolved toolset set leaked writers: {sorted(leaked)}"
+
+
+def test_the_enabled_set_is_the_allowlist_toolset_itself() -> None:
+    """The narrowed plan must ENABLE only the read-only toolset, never the platform bundle.
+
+    Enabling is by toolset name, so leaving the platform bundle enabled would re-admit every
+    tool it carries no matter what the disable list says.
+    """
+    from hermes_cli.tools_config import _get_platform_tools
+
+    enabled, _disabled = _read_only_control_allowance(sorted(_get_platform_tools({}, "telegram")), [])
+    assert enabled == [READ_ONLY_CONTROL_TOOLSET]

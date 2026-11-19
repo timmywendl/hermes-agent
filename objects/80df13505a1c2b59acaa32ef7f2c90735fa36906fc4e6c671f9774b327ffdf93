@@ -1,0 +1,106 @@
+"""Notifier attachment gate: legacy prose may only publish files it really owns.
+
+The summary/result prose of a Kanban worker is untrusted text. Before the port,
+whatever absolute path it mentioned was passed to ``filter_local_delivery_paths``,
+which only applies a credential/system denylist -- a ``../`` traversal or a symlink
+leading outside the task's workspace was uploaded to the Human.
+
+These tests pin the real-path containment gate, and equally pin that legitimate
+in-workspace deliverables are still delivered.
+"""
+
+from __future__ import annotations
+
+import os
+import pathlib
+
+import pytest
+
+from gateway.kanban_watchers import _prose_path_belongs_to_task
+
+
+class _Task:
+    def __init__(self, workspace_path, result: str | None = None):
+        self.workspace_path = workspace_path
+        self.result = result
+
+
+@pytest.fixture()
+def tree(tmp_path):
+    ws = tmp_path / "workspaces" / "task-1"
+    ws.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    secret = outside / "secret.txt"
+    secret.write_text("do not leak", encoding="utf-8")
+    deliverable = ws / "report.txt"
+    deliverable.write_text("ok", encoding="utf-8")
+    return ws, outside, secret, deliverable
+
+
+def test_plain_file_inside_the_workspace_is_allowed(tree):
+    ws, _outside, _secret, deliverable = tree
+    assert _prose_path_belongs_to_task(str(deliverable), _Task(ws)) is True
+
+
+def test_nested_file_inside_the_workspace_is_allowed(tree):
+    ws, _outside, _secret, _deliverable = tree
+    nested = ws / "out" / "deep" / "nested.txt"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("ok", encoding="utf-8")
+    assert _prose_path_belongs_to_task(str(nested), _Task(ws)) is True
+
+
+def test_dotdot_traversal_out_of_the_workspace_is_blocked(tree):
+    ws, _outside, secret, _deliverable = tree
+    traversal = f"{ws}/../../outside/{secret.name}"
+    assert _prose_path_belongs_to_task(traversal, _Task(ws)) is False
+
+
+def test_direct_absolute_path_outside_the_workspace_is_blocked(tree):
+    ws, _outside, secret, _deliverable = tree
+    assert _prose_path_belongs_to_task(str(secret), _Task(ws)) is False
+
+
+def test_symlink_inside_the_workspace_pointing_out_is_blocked(tree):
+    ws, _outside, secret, _deliverable = tree
+    link = ws / "innocent.txt"
+    os.symlink(secret, link)
+    assert _prose_path_belongs_to_task(str(link), _Task(ws)) is False
+
+
+def test_sibling_prefix_directory_is_blocked(tree):
+    """``<ws>-evil/`` shares the workspace string prefix but is a different tree."""
+    ws, _outside, _secret, _deliverable = tree
+    sibling = pathlib.Path(str(ws) + "-evil")
+    sibling.mkdir()
+    evil = sibling / "x.txt"
+    evil.write_text("x", encoding="utf-8")
+    assert _prose_path_belongs_to_task(str(evil), _Task(ws)) is False
+
+
+def test_task_without_a_workspace_fails_closed(tree):
+    _ws, _outside, _secret, deliverable = tree
+    assert _prose_path_belongs_to_task(str(deliverable), _Task(None)) is False
+
+
+def test_no_task_fails_closed(tree):
+    _ws, _outside, _secret, deliverable = tree
+    assert _prose_path_belongs_to_task(str(deliverable), None) is False
+
+
+def test_workspace_that_is_itself_a_symlink_still_allows_its_own_file(tmp_path):
+    """Resolution must be symmetric, or a symlinked workspace would lose real deliverables."""
+    real_root = tmp_path / "real-root"
+    real_ws = real_root / "ws"
+    real_ws.mkdir(parents=True)
+    doc = real_ws / "doc.txt"
+    doc.write_text("ok", encoding="utf-8")
+    linked_ws = tmp_path / "linked-ws"
+    os.symlink(real_ws, linked_ws)
+
+    assert _prose_path_belongs_to_task(str(doc), _Task(linked_ws)) is True
+    # And it must still reject something genuinely outside.
+    outside = tmp_path / "outside.txt"
+    outside.write_text("nope", encoding="utf-8")
+    assert _prose_path_belongs_to_task(str(outside), _Task(linked_ws)) is False

@@ -1,0 +1,84 @@
+"""Regression tests for scanner-safe GitHub credential extraction (#22722)."""
+
+from pathlib import Path
+import subprocess
+import sys
+
+import pytest
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+HELPER = REPO_ROOT / "skills/software-development/github/scripts/git-credential-token.py"
+
+
+def _extract(path: Path) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(HELPER), str(path)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def _credential_file(tmp_path: Path, value: str) -> Path:
+    credentials = tmp_path / "credentials"
+    credentials.write_text(value, encoding="utf-8", newline="")
+    return credentials
+
+
+@pytest.mark.parametrize(
+    ("credential", "token"),
+    [
+        ("https://octocat:<REDACTED_EMAIL>\n", "password-form-token"),
+        ("https://oauth-token:<REDACTED_EMAIL>\n", "oauth-token"),
+        ("https://<REDACTED_EMAIL>\n", "ghp_token_only"),
+        ("https://<REDACTED_EMAIL>\n", "github_pat_token_only"),
+    ],
+)
+def test_extracts_supported_git_credential_url_forms(tmp_path, credential, token):
+    result = _extract(_credential_file(tmp_path, credential))
+
+    assert result.returncode == 0
+    assert result.stdout == f"{token}\n"
+    assert result.stderr == ""
+
+
+def test_extracts_password_from_exact_github_https_credential(tmp_path):
+    credentials = _credential_file(
+        tmp_path,
+        "https://ignored:<REDACTED_EMAIL>\n"
+        "https://octocat:<REDACTED_EMAIL>\n",
+    )
+
+    result = _extract(credentials)
+
+    assert result.returncode == 0
+    assert result.stdout == "secret/token\n"
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    "credential",
+    [
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://<REDACTED_EMAIL>\n",
+        "https://<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>%2eattacker.example\n",
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://<REDACTED_EMAIL>\n",
+        "https://<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>\n",
+        "https://octocat:<REDACTED_EMAIL>:bogus\n",
+        "http://octocat:<REDACTED_EMAIL>\n",
+    ],
+)
+def test_rejects_ambiguous_lookalike_or_malformed_credentials(tmp_path, credential):
+    result = _extract(_credential_file(tmp_path, credential))
+
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == ""

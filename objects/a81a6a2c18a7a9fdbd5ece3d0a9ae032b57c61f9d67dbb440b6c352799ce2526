@@ -1,0 +1,69 @@
+"""Profile-scoped wrappers for the callbacks that bypass the message handler.
+
+A busy follow-up or a pre-guard control message never passes through the message handler, so
+the routed profile scope and the transport-home authorization must be re-established here or
+the callback runs in whatever scope happens to be ambient (#103717).
+
+Two families, one per adapter ownership model:
+
+* a **profile-owned** adapter (secondary under multiplex) canonicalizes first, then runs the
+  callback under the routed profile's home;
+* a **primary** adapter admits the source against the transport home and runs the callback
+  under the resolved profile scope.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+from typing import Optional
+
+
+class GatewayAdapterScopeMixin:
+    def _make_profile_runner(self, profile_name: str, handler):
+        """Canonicalize FIRST, then run *handler* under the routed profile's scope.
+
+        Shared by the busy and long-work paths: both bypass the message handler, and auth must
+        run against the profile's own allowlist (same as the cold-path message handler).
+        """
+        from gateway.run import _async_profile_runtime_scope
+        profile_home = self._routed_profile_home(profile_name)
+
+        async def _handler(event, _session_key):
+            self._canonicalize(event.source, transport_profile=profile_name)
+            async with self._async_scope_or_null(_async_profile_runtime_scope, profile_home):
+                return await handler(event, self._session_key_for_source(event.source))
+
+        return _handler
+
+    def _make_profile_busy_session_handler(self, profile_name: str):
+        """Busy-path twin of the profile message handler."""
+        return self._make_profile_runner(profile_name, self._handle_active_session_busy_message)
+
+    def _make_profile_long_work_handler(self, profile_name: str):
+        """Long-work twin of ``_make_profile_busy_session_handler``."""
+        return self._make_profile_runner(profile_name, self._handle_long_work_request)
+
+    def _scoped_primary_handler(self, handler):
+        """Wrap *handler* so a routed primary source runs under its own profile scope.
+
+        Busy, long-work and other callbacks that bypass the message handler must re-establish
+        the routed scope and transport-home authorization here, or they are authorized in
+        whatever scope is ambient (#103717).
+        """
+        from gateway.run import _async_profile_runtime_scope, get_hermes_home
+        default_home = Path(get_hermes_home())
+
+        async def _wrapped(event, _session_key):
+            source = event.source
+            profile_home = self._admit_primary_source(source, default_home)
+            if profile_home is None:
+                return True  # rejected route: swallow, same disposition as the ingress gate
+            async with _async_profile_runtime_scope(profile_home):
+                return await handler(event, self._session_key_for_source(source))
+
+        return _wrapped
+
+    def _make_default_profile_busy_session_handler(self):
+        """Busy-path twin of ``_make_default_profile_message_handler``."""
+        return self._scoped_primary_handler(self._handle_active_session_busy_message)

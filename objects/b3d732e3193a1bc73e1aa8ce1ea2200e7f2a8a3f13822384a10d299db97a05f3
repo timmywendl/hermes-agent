@@ -1,0 +1,231 @@
+"""Kanban artifact delivery accepts only task-owned files.
+
+The worker's ``metadata["artifacts"]`` is a declaration, not an operator grant.
+The notifier may deliver a file from the current task workspace or a durable
+attachment row owned by that task, but never an arbitrary local path.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from gateway.config import Platform
+from gateway.kanban_watchers_notifier import _KanbanNotification
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.run import GatewayRunner
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
+from hermes_cli import kanban_db_workspace as kbw
+
+
+@pytest.fixture()
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+    kb.init_db()
+    return home
+
+
+def _task_with_workspace(conn, title: str):
+    task_id = kb.create_task(conn, title=title, assignee="worker1")
+    task = kb.get_task(conn, task_id)
+    workspace = kbw.resolve_workspace(task)
+    kbw.set_workspace_path(conn, task_id, workspace)
+    task = kb.get_task(conn, task_id)
+    workspace = Path(task.workspace_path)
+    workspace.mkdir(parents=True, exist_ok=True)
+    return task_id, task, workspace
+
+
+def _adapter():
+    adapter = MagicMock()
+    adapter.send_document = AsyncMock()
+    adapter.send_video = AsyncMock()
+    adapter.send_multiple_images = AsyncMock()
+    adapter.extract_local_files = BasePlatformAdapter.extract_local_files
+    return adapter
+
+
+def _runner():
+    return object.__new__(GatewayRunner)
+
+
+async def _deliver(runner, adapter, task, path: str | Path, *, event_payload=None):
+    await runner._deliver_kanban_artifacts(
+        adapter=adapter,
+        chat_id="chat-1",
+        metadata={},
+        event_payload=event_payload or {"artifacts": [str(path)]},
+        task=task,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "method"),
+    [
+        ("report.pdf", "send_document"),
+        ("preview.png", "send_multiple_images"),
+        ("demo.mp4", "send_video"),
+    ],
+)
+async def test_current_task_workspace_files_are_delivered(kanban_home, filename, method):
+    with kbc.connect() as conn:
+        _task_id, task, workspace = _task_with_workspace(conn, "workspace delivery")
+        deliverable = workspace / filename
+        deliverable.write_bytes(b"owned")
+
+    adapter = _adapter()
+    await _deliver(_runner(), adapter, task, deliverable)
+
+    assert getattr(adapter, method).await_count == 1
+    for name in ("send_document", "send_multiple_images", "send_video"):
+        if name != method:
+            assert getattr(adapter, name).await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_task_owned_staged_attachment_is_delivered_after_workspace_cleanup(kanban_home):
+    with kbc.connect() as conn:
+        task_id, _task, workspace = _task_with_workspace(conn, "completed attachment")
+        scratch = workspace / "report.pdf"
+        scratch.write_bytes(b"staged")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="complete",
+            metadata={"artifacts": [str(scratch)]},
+            expected_run_id=run_id,
+        )
+        attachment = kb.list_attachments(conn, task_id)[0]
+        task = kb.get_task(conn, task_id)
+
+    assert not scratch.exists()
+    assert Path(attachment.stored_path).is_file()
+    adapter = _adapter()
+    await _deliver(_runner(), adapter, task, attachment.stored_path)
+
+    adapter.send_document.assert_awaited_once()
+    assert adapter.send_document.await_args.kwargs["file_path"] == attachment.stored_path
+
+
+@pytest.mark.asyncio
+async def test_review_staged_attachment_is_delivered_after_scratch_cleanup(kanban_home):
+    with kbc.connect() as conn:
+        task_id, _task, workspace = _task_with_workspace(conn, "review attachment")
+        scratch = workspace / "review.pdf"
+        scratch.write_bytes(b"review")
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+        assert kb.request_review(
+            conn,
+            task_id,
+            summary="ready",
+            metadata={"artifacts": [str(scratch)]},
+            expected_run_id=run_id,
+        )
+        event = [e for e in kb.list_events(conn, task_id) if e.kind == "review_requested"][-1]
+        attachment = kb.list_attachments(conn, task_id)[0]
+        task = kb.get_task(conn, task_id)
+
+    scratch.unlink()
+    assert Path(attachment.stored_path).is_file()
+    adapter = _adapter()
+    await _deliver(_runner(), adapter, task, event.payload["artifacts"][0])
+
+    adapter.send_document.assert_awaited_once()
+    assert adapter.send_document.await_args.kwargs["file_path"] == attachment.stored_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["external", "other-task", "forged-current-task", "traversal", "symlink"])
+async def test_worker_declared_non_owned_files_are_rejected(kanban_home, shape, tmp_path, caplog):
+    with kbc.connect() as conn:
+        task_id, task, workspace = _task_with_workspace(conn, "authorization boundary")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        secret.write_text("must not leave", encoding="utf-8")
+
+        if shape == "external":
+            declared = secret
+        elif shape == "other-task":
+            other_id = kb.create_task(conn, title="other task", assignee="worker2")
+            other_blob = kb.store_attachment_bytes(conn, other_id, "other.txt", b"other")
+            declared = kb.get_attachment(conn, other_blob).stored_path
+        elif shape == "forged-current-task":
+            kb.add_attachment(
+                conn,
+                task_id,
+                filename="forged.txt",
+                stored_path=str(secret),
+                size=secret.stat().st_size,
+            )
+            declared = secret
+        elif shape == "traversal":
+            declared = workspace / ".." / ".." / ".." / ".." / "outside" / secret.name
+        else:
+            declared = workspace / "alias.txt"
+            os.symlink(secret, declared)
+
+        assert kb.claim_task(conn, task_id) is not None
+        run_id = kb.get_task(conn, task_id).current_run_id
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="completed",
+            metadata={"artifacts": [str(declared)]},
+            expected_run_id=run_id,
+        )
+        event = [e for e in kb.list_events(conn, task_id) if e.kind == "completed"][-1]
+        task = kb.get_task(conn, task_id)
+        if shape == "symlink":
+            workspace.mkdir(parents=True, exist_ok=True)
+            os.symlink(secret, declared)
+
+    adapter = _adapter()
+    await _deliver(_runner(), adapter, task, declared, event_payload=event.payload)
+    await _deliver(_runner(), adapter, task, declared, event_payload=event.payload)
+
+    assert adapter.send_document.await_count == 0
+    assert adapter.send_video.await_count == 0
+    assert adapter.send_multiple_images.await_count == 0
+    assert str(secret) not in caplog.text
+    assert task_id in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_kind", ["completed", "review_requested"])
+async def test_rejected_artifacts_do_not_retry_through_either_terminal_event(kanban_home, tmp_path, event_kind):
+    with kbc.connect() as conn:
+        _task_id, task, _workspace = _task_with_workspace(conn, "terminal event boundary")
+    external = tmp_path / "external.pdf"
+    external.write_bytes(b"not owned")
+
+    adapter = _adapter()
+    adapter.send = AsyncMock(return_value=None)
+    sub = {"task_id": task.id, "platform": "telegram", "chat_id": "chat-1"}
+    event = SimpleNamespace(id=1, kind=event_kind, payload={"artifacts": [str(external)]})
+    delivery = {"sub": sub, "task": task, "board": "default", "events": [event], "cursor": 1, "old_cursor": 0}
+    notification = _KanbanNotification(_runner(), delivery, platform_cls=Platform, sub_fail_counts={})
+    notification.adapter = adapter
+    notification.is_push_adapter = True
+
+    await notification._send_event(event, "terminal event")
+    await notification._send_event(event, "terminal event retry")
+
+    assert adapter.send_document.await_count == 0
+    assert adapter.send_video.await_count == 0
+    assert adapter.send_multiple_images.await_count == 0
+    assert adapter.send.await_count == 2

@@ -1,0 +1,14 @@
+{
+  "packages": {
+    "venv": {
+      "environment": "<HOME>/.hermes/installs/409872f96daabba8/environments/8e521d45420d4814919f157aa5e2ea6c/venv",
+      "extras": [
+        "anthropic",
+        "telegram"
+      ],
+      "resolved_lock": "<HOME>/.hermes/installs/409872f96daabba8/environments/8e521d45420d4814919f157aa5e2ea6c/workspace/uv.lock",
+      "stamp": "40a47239b6eed64ddb01b137d9b53f062893bfbbc91c4779061fbd19fce37445"
+    }
+  },
+  "schema": 1
+}

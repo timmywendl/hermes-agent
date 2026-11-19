@@ -1,0 +1,67 @@
+"""Read-only runtime and Provider checks; safe to run under the gateway launchd session."""
+
+import importlib.metadata as metadata
+import json
+import os
+from pathlib import Path
+import sys
+
+
+home = Path(os.environ["HERMES_HOME"])
+workspace = Path(
+    "<HOME>/.hermes/installs/409872f96daabba8/environments/"
+    "8e521d45420d4814919f157aa5e2ea6c/workspace"
+)
+os.chdir(workspace)
+sys.path.insert(0, str(workspace))
+
+from pm.environments import running_from_selected_environment
+from pm.paths import repo_root
+
+import agent
+import anthropic
+import gateway
+import hermes_state_telegram
+import telegram
+
+
+from hermes_cli.config_effective import load_user_config_effective
+
+config = load_user_config_effective()
+main_model = config.get("model") or {}
+fallbacks = [
+    {key: item.get(key) for key in ("provider", "model", "base_url", "api_mode")}
+    for item in config.get("fallback_providers", [])
+    if isinstance(item, dict)
+]
+
+settings = (config.get("security") or {}).get("allow_lazy_installs")
+result = {
+    "executable": sys.executable,
+    "prefix": sys.prefix,
+    "base_prefix": sys.base_prefix,
+    "python_path": sys.path,
+    "workspace": str(repo_root()),
+    "running_from_selected": running_from_selected_environment(repo_root()),
+    "anthropic": {
+        "file": str(anthropic.__file__),
+        "version": metadata.version("anthropic"),
+    },
+    "telegram": {
+        "file": str(telegram.__file__),
+        "version": metadata.version("python-telegram-bot"),
+    },
+    "loaded_source": {
+        "agent": str(agent.__file__),
+        "gateway": str(gateway.__file__),
+        "telegram_state": str(hermes_state_telegram.__file__),
+    },
+    "main_route": {
+        key: main_model.get(key)
+        for key in ("provider", "default", "api_mode", "base_url")
+    },
+    "fallback_routes": fallbacks,
+    "lazy_install_policy": settings,
+    "app_version": metadata.version("hermes-agent"),
+}
+print(json.dumps(result, indent=2))

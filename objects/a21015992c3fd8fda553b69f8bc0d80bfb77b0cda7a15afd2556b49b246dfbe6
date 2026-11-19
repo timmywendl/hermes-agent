@@ -1,0 +1,15 @@
+"""Dashboard chat start failures distinguish missing Node from missing TUI assets."""
+
+from hermes_cli.web_routers.chat_ws_errors import (
+    CHAT_NEEDS_NODE,
+    CHAT_TUI_UNAVAILABLE,
+    chat_start_failure_message,
+)
+
+
+def test_generic_tui_exit_does_not_claim_node_is_missing():
+    assert chat_start_failure_message(SystemExit(1)) == CHAT_TUI_UNAVAILABLE
+
+
+def test_missing_node_still_names_the_node_remedy():
+    assert chat_start_failure_message(FileNotFoundError(2, "No such file", "node")) == CHAT_NEEDS_NODE

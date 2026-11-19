@@ -1,0 +1,164 @@
+"""The control-query routes must authorize the SENDER before answering anything.
+
+Regression for the round-2 review's first MAJOR: the pre-guard semantic-control route answered a
+Telegram message before the cold path's ingress gate ran the sender authorization check, so a
+sender outside the operator's authorized set could receive a rendered portfolio projection. The
+busy path already authorized first, so the two routes disagreed.
+
+These tests drive the REAL routing entry (`_handle_long_work_request`, i.e. what the adapter's
+control handler calls) and the REAL projection, with the projection swapped for a recorder only so
+the test can observe whether it ran. Authorization itself is never stubbed.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run_inbound_control import GatewayInboundControlMixin
+from gateway.session import SessionSource
+
+QUERY = "项目都咋样"
+
+
+class _Adapter:
+    name = "telegram"
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append(str(content))
+
+
+class _Runner(GatewayInboundControlMixin):
+    """A runner whose authorization decision is the variable under test."""
+
+    def __init__(self, *, authorized: bool, registry: Path) -> None:
+        self.adapter = _Adapter()
+        self.authorized = authorized
+        self.registry = registry
+        self.projection_calls = 0
+        self.bot_loop_calls = 0
+        self.ingress_gate_calls = 0
+
+    # --- authorization: the seam the fix adds -------------------------------------------------
+    def _is_user_authorized_for_source(self, source):
+        return self.authorized
+
+    def _admit_bot_message_for_source(self, source):
+        self.bot_loop_calls += 1
+        return True
+
+    # --- routing seams ------------------------------------------------------------------------
+    def _delivery_adapter_for(self, source):
+        return self.adapter
+
+    def _thread_metadata_for_source(self, source, anchor=None):
+        return {"reply_to": anchor}
+
+    def _reply_anchor_for_event(self, event):
+        return str(event.message_id or "")
+
+    def _reply_metadata(self, event):
+        return {}
+
+    def _semantic_control_intent_for_event(self, event):
+        from gateway.semantic_control import resolve_control_intent
+        return resolve_control_intent(event.text, registry_path=self.registry)
+
+    async def _run_readonly_control_projection(self, prompt, source, task_id, event_message_id=None):
+        self.projection_calls += 1
+        return "总体：3 个项目正常推进。"
+
+    async def _hm_admit_event(self, event):
+        """The cold path's ingress gate. Here it declines like the real one does for an
+        unauthorized sender, so the test proves the control route handed the event back."""
+        self.ingress_gate_calls += 1
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Path:
+    path = tmp_path / "portfolio-projects.yaml"
+    path.write_text("projects:\n  - name: ai-colleague\n    repository: example/ai-colleague\n", encoding="utf-8")
+    return path
+
+
+def _event(text: str = QUERY) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm", user_id="user-1",
+    )
+    return MessageEvent(text=text, source=source, message_id="m1", message_type=MessageType.TEXT)
+
+
+@pytest.mark.asyncio
+async def test_authorized_sender_still_gets_the_projection(registry: Path) -> None:
+    """Positive direction: the fix must not break the feature for an authorized sender."""
+    runner = _Runner(authorized=True, registry=registry)
+    handled = await runner._handle_long_work_request(_event(), "session-1")
+    assert handled is True
+    assert runner.projection_calls == 1
+    assert len(runner.adapter.sent) == 1
+    assert "总体" in runner.adapter.sent[0]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_sender_gets_no_answer_and_starts_no_projection(registry: Path) -> None:
+    """Negative direction: no reply, no projection run, and the event is not consumed."""
+    runner = _Runner(authorized=False, registry=registry)
+    handled = await runner._handle_long_work_request(_event(), "session-1")
+    # Declined, so the ordinary ingress gate (pairing/decline policy) still sees the event.
+    assert handled is False
+    assert runner.projection_calls == 0
+    assert runner.adapter.sent == []
+    # Authorization runs before the bot-loop budget gate, so an unauthorized hit costs nothing.
+    assert runner.bot_loop_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_sender_is_refused_even_when_intent_does_not_match(registry: Path) -> None:
+    """Authorization precedes classification: a non-control message is also declined here.
+
+    The request path must not answer for an unauthorized sender at all; the message then falls
+    through to the normal ingress gate rather than being silently swallowed by this route.
+    """
+    runner = _Runner(authorized=False, registry=registry)
+    handled = await runner._handle_long_work_request(_event("hello there, please fix the tests"), "session-1")
+    assert handled is True  # the long-work route consumed it after its own gate declined it
+    assert runner.projection_calls == 0
+    assert runner.adapter.sent == []
+    # It reached the ordinary ingress gate, which owns the pairing/decline policy.
+    assert runner.ingress_gate_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_authorization_failure_fails_closed(registry: Path) -> None:
+    """An exception while authorizing must refuse, never answer."""
+
+    class _Broken(_Runner):
+        def _is_user_authorized_for_source(self, source):
+            raise RuntimeError("authorization backend unavailable")
+
+    runner = _Broken(authorized=True, registry=registry)
+    handled = await runner._handle_long_work_request(_event(), "session-1")
+    assert handled is False
+    assert runner.adapter.sent == []
+    assert runner.projection_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bot_loop_budget_refusal_blocks_the_answer(registry: Path) -> None:
+    """The same budget gate as the ordinary path applies before answering."""
+
+    class _Exhausted(_Runner):
+        def _admit_bot_message_for_source(self, source):
+            return False
+
+    runner = _Exhausted(authorized=True, registry=registry)
+    handled = await runner._handle_long_work_request(_event(), "session-1")
+    assert handled is False
+    assert runner.adapter.sent == []
+    assert runner.projection_calls == 0

@@ -1,0 +1,184 @@
+"""Prose-discovered artifacts must belong to the task's own scratch workspace.
+
+A legacy worker names deliverables only by path in its summary/result prose. Those names are
+promoted into ``metadata["artifacts"]`` and then uploaded to the chat, so the ownership check
+is a delivery authorization, not a convenience. A lexical prefix match against the workspace
+is not containment:
+
+* ``<workspace>/../../other/x.txt`` spells the prefix but resolves outside it;
+* ``<workspace>/link.txt`` is a symlink living inside the workspace whose target is outside.
+
+Both reached ``complete_task`` / ``request_review`` and were delivered. These are the
+regressions; the in-workspace case must keep working.
+"""
+
+from __future__ import annotations
+
+import json
+import pathlib
+import sqlite3
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+
+
+@pytest.fixture()
+def board(tmp_path, monkeypatch):
+    """Isolated HERMES_HOME with one scratch task and its managed workspace."""
+    home = tmp_path / ".hermes"
+    (home / "kanban" / "workspaces").mkdir(parents=True)
+    (home / "kanban" / "boards").mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    kb.init_db()
+    conn = kbc.connect()
+    task_id = kb.create_task(conn, title="scratch boundary")
+    workspace = home / "kanban" / "workspaces" / task_id
+    workspace.mkdir(parents=True, exist_ok=True)
+    conn.execute(
+        "UPDATE tasks SET workspace_kind='scratch', workspace_path=?, status='running' WHERE id=?",
+        (str(workspace), task_id),
+    )
+    conn.commit()
+
+    outside = tmp_path / "outside-the-workspace"
+    outside.mkdir()
+    secret = outside / "synthetic-private.txt"
+    secret.write_text("SYNTHETIC-PRIVATE\n", encoding="utf-8")
+    return conn, task_id, workspace, secret
+
+
+def _completed_event_artifacts(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='completed' ORDER BY id DESC",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return []
+    payload = row["payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    return payload.get("artifacts", [])
+
+
+def _review_event_artifacts(conn: sqlite3.Connection, task_id: str) -> list[str]:
+    """``request_review`` carries staged artifacts on its own ``review_requested`` event."""
+    row = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind='review_requested' "
+        "ORDER BY id DESC",
+        (task_id,),
+    ).fetchone()
+    if not row:
+        return []
+    payload = row["payload"]
+    payload = json.loads(payload) if isinstance(payload, str) else payload
+    return payload.get("artifacts", [])
+
+
+def test_parent_traversal_out_of_the_workspace_is_not_promoted(board):
+    conn, task_id, workspace, secret = board
+    summary = f"SUMMARY: wrote {workspace}/../../../../outside-the-workspace/{secret.name}"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is None or not merged.get("artifacts")
+
+
+def test_symlink_escaping_the_workspace_is_not_promoted(board):
+    conn, task_id, workspace, secret = board
+    (workspace / "link-to-outside.txt").symlink_to(secret)
+    summary = f"SUMMARY: see {workspace}/link-to-outside.txt"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is None or not merged.get("artifacts")
+
+
+def test_file_inside_the_workspace_is_still_promoted(board):
+    """The legitimate legacy path must keep working: in-workspace files are promoted."""
+    conn, task_id, workspace, _secret = board
+    good = workspace / "report.txt"
+    good.write_text("deliverable\n", encoding="utf-8")
+    summary = f"SUMMARY: wrote {good}"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is not None
+    assert str(good) in merged["artifacts"]
+
+
+def test_nested_file_inside_the_workspace_is_still_promoted(board):
+    conn, task_id, workspace, _secret = board
+    nested = workspace / "out" / "deep" / "nested.txt"
+    nested.parent.mkdir(parents=True)
+    nested.write_text("nested\n", encoding="utf-8")
+    summary = f"SUMMARY: produced {nested}"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is not None
+    assert str(nested) in merged["artifacts"]
+
+
+def test_in_workspace_symlink_to_an_in_workspace_file_is_promoted(board):
+    """A symlink whose TARGET is still owned must not be rejected by the stricter rule."""
+    conn, task_id, workspace, _secret = board
+    real = workspace / "real.txt"
+    real.write_text("owned\n", encoding="utf-8")
+    link = workspace / "alias.txt"
+    link.symlink_to(real)
+    summary = f"SUMMARY: see {link}"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is not None
+    assert str(link) in merged["artifacts"]
+
+
+def test_sibling_directory_sharing_the_workspace_prefix_is_not_promoted(board):
+    """``<workspace>-evil`` shares the string prefix but is a different directory."""
+    conn, task_id, workspace, _secret = board
+    sibling = workspace.parent / (workspace.name + "-evil")
+    sibling.mkdir()
+    planted = sibling / "x.txt"
+    planted.write_text("not yours\n", encoding="utf-8")
+    summary = f"SUMMARY: wrote {workspace}/../{sibling.name}/{planted.name}"
+
+    merged = kb._merge_completion_prose_artifacts(conn, task_id, None, summary=summary, result=None)
+
+    assert merged is None or not merged.get("artifacts")
+
+
+def test_complete_task_does_not_publish_an_escaped_prose_path(board):
+    conn, task_id, workspace, secret = board
+    summary = f"SUMMARY: wrote {workspace}/../../../../outside-the-workspace/{secret.name}"
+
+    kb.complete_task(conn, task_id, summary=summary, result=None)
+
+    assert _completed_event_artifacts(conn, task_id) == []
+
+
+def test_request_review_does_not_publish_an_escaped_prose_path(board):
+    conn, task_id, workspace, secret = board
+    summary = f"SUMMARY: wrote {workspace}/../../../../outside-the-workspace/{secret.name}"
+
+    kb.request_review(conn, task_id, summary=summary)
+
+    assert _review_event_artifacts(conn, task_id) == []
+
+
+def test_request_review_still_publishes_an_owned_prose_path(board):
+    """The review handoff must keep promoting an in-workspace deliverable.
+
+    The payload names the STAGED copy (staged under ``kanban/attachments/<task>/``), so the
+    contract asserted here is that the deliverable is published at all, not where it came from.
+    """
+    conn, task_id, workspace, _secret = board
+    good = workspace / "review-me.txt"
+    good.write_text("handoff\n", encoding="utf-8")
+
+    kb.request_review(conn, task_id, summary=f"SUMMARY: wrote {good}")
+
+    published = _review_event_artifacts(conn, task_id)
+    assert [pathlib.Path(p).name for p in published] == ["review-me.txt"]

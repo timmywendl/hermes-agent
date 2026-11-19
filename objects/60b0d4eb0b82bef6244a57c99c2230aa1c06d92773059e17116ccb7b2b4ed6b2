@@ -1,0 +1,136 @@
+"""Hot multiplex activation must re-bind EVERY adapter handler, including the control route.
+
+Regression for the round-2 review's second MAJOR: `_multiplex_for_added_profile` re-wired the
+message, busy and platform-event handlers but not the long-work handler, so an adapter wired while
+the process was standalone kept the standalone-scoped control route. That route runs under the
+LAUNCH profile's scope, so a routed long-work request would create its Kanban task and notify
+subscription under the wrong profile home.
+
+The handler bindings here are REAL (`GatewayRunner._primary_*_handler`), so the test proves the
+activation produces the multiplex-scoped variants rather than merely that some attribute changed.
+"""
+
+from __future__ import annotations
+
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from gateway.config import GatewayConfig, Platform
+from gateway.run import GatewayRunner
+
+
+class _RecordingAdapter:
+    """Records what the activation installs, and nothing else."""
+
+    platform = Platform.DISCORD
+
+    def __init__(self) -> None:
+        self.message_handler = None
+        self.busy_session_handler = None
+        self.platform_event_handler = None
+        self._long_work_handler = "standalone-scoped-route"  # what a standalone boot leaves here
+
+    def set_message_handler(self, handler):
+        self.message_handler = handler
+
+    def set_busy_session_handler(self, handler):
+        self.busy_session_handler = handler
+
+    def set_platform_event_handler(self, handler):
+        self.platform_event_handler = handler
+
+    async def disconnect(self):
+        pass
+
+    async def cancel_background_tasks(self):
+        pass
+
+
+def _runner(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    (home / "profiles").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    runner = object.__new__(GatewayRunner)
+    # Explicitly standalone before activation: this is the state the bug needed.
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    runner.session_authorities = None
+    runner._running = True
+    runner._primary_profile_name = "default"
+    runner.adapters = {Platform.DISCORD: _RecordingAdapter()}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    runner._failed_platforms = {}
+    runner._agent_cache = {}
+    runner._agent_cache_lock = None
+    runner.session_runtime_descriptor = {"state": "ready", "served_profiles": [], "capabilities": []}
+    runner.session_ticket_store = None
+    # `_multiplex_for_added_profile` only flips a gateway whose LIVE record says it stayed
+    # standalone for the two reasons that a new profile can invalidate. Publish exactly that:
+    # a running record owned by this process, carrying the guard refusal.
+    from hermes_cli.gateway_multiplex_mode import SINGLE_PROFILE_REASON
+    from gateway.status import write_runtime_status
+    write_runtime_status(
+        reload_existing=True,
+        gateway_state="running",
+        multiplex_standalone_reason=SINGLE_PROFILE_REASON,
+    )
+    return runner, home
+
+
+def _mkprofile(home, name):
+    d = home / "profiles" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+    (d / ".env").write_text("", encoding="utf-8")
+    return d
+
+
+@pytest.fixture(autouse=True)
+def _release_reservations():
+    from gateway.runtime_ownership import process_ownership
+    yield
+    for reserved in process_ownership.homes:
+        process_ownership.release(reserved)
+
+
+@pytest.mark.asyncio
+async def test_activation_rebinds_the_control_route_alongside_the_other_handlers(tmp_path, monkeypatch):
+    runner, home = _runner(tmp_path, monkeypatch)
+    _mkprofile(home, "alpha")
+    adapter = runner.adapters[Platform.DISCORD]
+    assert adapter._long_work_handler == "standalone-scoped-route"
+
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        activated = await runner._multiplex_for_added_profile()
+
+    assert activated is True
+    # All four handlers were re-bound by the same activation...
+    assert adapter.message_handler is not None
+    assert adapter.busy_session_handler is not None
+    assert adapter.platform_event_handler is not None
+    # ...including the one the bug left behind. A stale standalone closure would still be truthy,
+    # so assert identity against the multiplex-scoped product instead of mere presence.
+    assert adapter._long_work_handler != "standalone-scoped-route"
+    assert adapter._long_work_handler is not None
+    assert callable(adapter._long_work_handler)
+
+
+@pytest.mark.asyncio
+async def test_rebound_control_route_is_the_multiplex_scoped_variant(tmp_path, monkeypatch):
+    """The rebound route must be the one that resolves a routed profile, not the launch scope."""
+    runner, home = _runner(tmp_path, monkeypatch)
+    _mkprofile(home, "alpha")
+    adapter = runner.adapters[Platform.DISCORD]
+
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        await runner._multiplex_for_added_profile()
+
+    expected = runner._primary_long_work_handler()
+    # _primary_long_work_handler() branches on _multiplex_on(): after activation it must be the
+    # multiplex-scoped wrapper. Compare the code object so two closures of the same function match.
+    assert adapter._long_work_handler.__code__ is expected.__code__
+    assert runner._multiplex_on() is True

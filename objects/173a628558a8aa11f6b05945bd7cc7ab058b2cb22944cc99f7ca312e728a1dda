@@ -1,0 +1,112 @@
+"""Origin-subscription persistence: the notify subscription must survive a restart.
+
+The capability being preserved (Telegram long-work -> task -> completion notification)
+depends on the subscription living in the native Kanban database, not in process
+memory. This proves durability across a fresh connection and a fresh process, which is
+exactly what the pre-port "restart/recovery" requirement asks for.
+"""
+
+from __future__ import annotations
+
+import pathlib
+import sqlite3
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+
+class _Source:
+    platform = "telegram"
+    chat_id = "777001"
+    thread_id = "42"
+    user_id = "u9"
+    user_id_alt = None
+    chat_type = "dm"
+    profile = None
+
+
+@pytest.fixture()
+def kanban_home(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    khome = tmp_path / "khome"
+    home.mkdir()
+    khome.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(khome))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    monkeypatch.setattr(pathlib.Path, "home", lambda: tmp_path)
+    from hermes_cli import kanban_db as kb
+    kb.init_db()
+    return khome
+
+
+def _create() -> str:
+    from gateway.remote_work import create_native_remote_task
+    task_id, subscribed = create_native_remote_task(
+        source=_Source(),
+        packet="packet",
+        objective="请帮我实现通知持久化",
+        session_id="sess-persist",
+        idempotency_key="idem-persist",
+        delivery_metadata={"thread_id": "42"},
+    )
+    assert subscribed is True
+    return task_id
+
+
+def test_subscription_survives_a_new_connection(kanban_home):
+    task_id = _create()
+    db = kanban_home / "kanban.db"
+
+    # A brand-new connection (what a restarted gateway gets) must still see it.
+    conn = sqlite3.connect(db)
+    try:
+        rows = conn.execute(
+            "SELECT task_id, platform, chat_id, thread_id FROM kanban_notify_subs"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(task_id, "telegram", "777001", "42")]
+
+
+def test_subscription_survives_a_fresh_process(kanban_home):
+    """Not just a new connection: a genuinely separate interpreter."""
+    task_id = _create()
+    db = kanban_home / "kanban.db"
+    code = textwrap.dedent(
+        f"""
+        import sqlite3
+        conn = sqlite3.connect({str(db)!r})
+        rows = conn.execute(
+            "SELECT task_id, platform, chat_id FROM kanban_notify_subs"
+        ).fetchall()
+        conn.close()
+        print(rows)
+        """
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=120,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "HERMES_KANBAN_HOME": str(kanban_home)},
+    )
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert task_id in out.stdout
+    assert "telegram" in out.stdout
+
+
+def test_recreating_the_task_does_not_duplicate_the_subscription(kanban_home):
+    task_id = _create()
+    again = _create()
+    assert again == task_id
+
+    conn = sqlite3.connect(kanban_home / "kanban.db")
+    try:
+        count = conn.execute("SELECT count(*) FROM kanban_notify_subs").fetchone()[0]
+        tasks = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+    assert (tasks, count) == (1, 1)

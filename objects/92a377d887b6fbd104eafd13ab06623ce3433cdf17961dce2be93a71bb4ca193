@@ -1,0 +1,118 @@
+"""A busy-path control query must charge the bot-loop budget exactly once.
+
+The busy path charges ``_admit_bot_message_for_source`` on arrival and stamps
+``event._bot_loop_admitted``; the control route it then hands the event to must honour that
+stamp instead of charging a second time. Two charges per inbound message would silently halve
+a sender's budget and, at the limit, drop a legitimate status query.
+
+The tests drive the REAL busy entry (``_handle_active_session_busy_message``) and the REAL
+control route; only the transport, the projection and the guard's settings are stand-ins.
+"""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run_busy import GatewayBusySessionMixin
+from gateway.run_inbound_control import GatewayInboundControlMixin
+from gateway.session import SessionSource
+
+QUERY = "项目都咋样"
+
+
+class _Adapter:
+    name = "telegram"
+
+    def __init__(self) -> None:
+        self.sent: list[str] = []
+
+    async def send(self, chat_id, content, metadata=None):
+        self.sent.append(str(content))
+
+
+class _Runner(GatewayBusySessionMixin, GatewayInboundControlMixin):
+    """Busy-path runner with a counting budget gate.
+
+    ``charges`` records every budget charge so a second one is observable; authorization and the
+    projection are the only other stand-ins.
+    """
+
+    def __init__(self, *, registry: Path, draining: bool = False) -> None:
+        self.adapter = _Adapter()
+        self.registry = registry
+        self.charges: list[str] = []
+        self.projection_calls = 0
+        self._draining = draining
+
+    # --- authorization / budget: the behaviour under test -------------------------------------
+    def _is_user_authorized_for_source(self, source):
+        return True
+
+    def _admit_bot_message_for_source(self, source):
+        self.charges.append("charge")
+        return True
+
+    # --- routing seams ------------------------------------------------------------------------
+    def _semantic_control_intent_for_event(self, event):
+        from gateway.semantic_control import resolve_control_intent
+        return resolve_control_intent(event.text, registry_path=self.registry)
+
+    async def _run_readonly_control_projection(self, prompt, source, task_id, event_message_id=None):
+        self.projection_calls += 1
+        return "总体：3 个项目正常推进。"
+
+    def _delivery_adapter_for(self, source):
+        return self.adapter
+
+    def _thread_metadata_for_source(self, source, anchor=None):
+        return {"reply_to": anchor}
+
+    def _reply_anchor_for_event(self, event):
+        return str(event.message_id or "")
+
+    def _reply_metadata(self, event):
+        return {}
+
+    def _effective_busy_input_mode(self, source):
+        return "queue"
+
+    def _send_busy_reply(self, *args, **kwargs):
+        raise AssertionError("a control query must not emit a busy ack")
+
+
+@pytest.fixture
+def registry(tmp_path: Path) -> Path:
+    path = tmp_path / "portfolio-projects.yaml"
+    path.write_text(
+        "projects:\n  - name: ai-colleague\n    repository: example/ai-colleague\n", encoding="utf-8"
+    )
+    return path
+
+
+def _event(text: str = QUERY) -> MessageEvent:
+    source = SessionSource(
+        platform=Platform.TELEGRAM, chat_id="chat-1", chat_type="dm", user_id="user-1",
+    )
+    return MessageEvent(text=text, source=source, message_id="m1", message_type=MessageType.TEXT)
+
+
+def test_busy_control_query_charges_the_budget_exactly_once(registry: Path) -> None:
+    """The busy path charges on arrival; the control route must not charge again."""
+    runner = _Runner(registry=registry)
+    event = _event()
+
+    handled = asyncio.run(runner._handle_active_session_busy_message(event, "session-1"))
+
+    assert handled is True
+    # The answer really happened (not a refusal that would trivially satisfy the count).
+    assert runner.projection_calls == 1
+    assert len(runner.adapter.sent) == 1
+    assert "总体" in runner.adapter.sent[0]
+    # Exactly one charge for one inbound message, and the stamp is what makes it so.
+    assert runner.charges == ["charge"]
+    assert getattr(event, "_bot_loop_admitted", False) is True

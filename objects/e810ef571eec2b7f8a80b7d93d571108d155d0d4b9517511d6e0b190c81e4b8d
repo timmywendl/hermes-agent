@@ -1,0 +1,249 @@
+"""Telegram long-work routing and read-only portfolio control queries.
+
+Two separate decisions, both admitted before the agent turn:
+
+* a short **read-only status query** about a portfolio project is answered from a bounded
+  projection -- it never starts work and never creates a task;
+* an explicit **long-work request** becomes exactly one native Kanban task, owned by the
+  Kanban DB, with an origin notify subscription so completion reaches the requesting chat.
+
+Ownership stays native (``tasks`` + ``kanban_notify_subs``); this module adds no scheduler,
+host, or second state store. Routing details and the classifier live in
+``gateway.remote_work`` / ``gateway.semantic_control``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+import uuid
+from contextlib import suppress
+from typing import Optional
+
+from gateway.config import Platform
+from gateway.platforms.event import MessageEvent, MessageType
+
+# The routing helpers are imported inside the handlers that use them, matching the
+# facade's shape: gateway.semantic_control / gateway.remote_work pull in the Kanban DB,
+# and this module is imported at gateway start-up.
+
+logger = logging.getLogger("gateway.run")
+
+
+class GatewayInboundControlMixin:
+    async def _handle_long_work_request(self, event: MessageEvent, _session_key: str) -> bool:
+        """Route explicit Telegram long-work language to the native Kanban dispatcher before either session guard.
+
+        The detached task receives a bounded packet, not the control conversation. Returning True
+        means the original event is consumed even when admission rejects it (auth/pairing has already
+        handled that case), preventing a second inline attempt.
+        """
+        from gateway.remote_work import (
+            LONG_WORK_ACK,
+            build_bounded_execution_packet,
+            classify_long_work_request,
+            create_native_remote_task,
+            remote_work_idempotency_key,
+        )
+
+        source = getattr(event, "source", None)
+        if getattr(source, "platform", None) != Platform.TELEGRAM:
+            return False
+        # A short read-only status query is answered here, before either session guard, so it
+        # never opens a turn and never creates a task.
+        if await self._route_semantic_control_query(event, _session_key):
+            return True
+        objective = str(getattr(event, "text", "") or "")
+        if not classify_long_work_request(objective):
+            return False
+
+        try:
+            admitted = await self._hm_admit_event(event)
+        except Exception:
+            logger.exception("Long-work admission failed; refusing inline fallback")
+            return True
+        if admitted is None:
+            return True
+        event, source, is_internal = admitted
+        if is_internal:
+            return False
+        paused = self._hm_estop_gate(event, source, False)
+        adapter = self._delivery_adapter_for(source)
+        metadata = dict(self._reply_metadata(event) or {})
+        metadata["_interim_send"] = True
+        if paused is not None:
+            if adapter is not None:
+                with suppress(Exception):
+                    await adapter.send(source.chat_id, paused, metadata=metadata)
+            return True
+
+        message_id = str(getattr(event, "message_id", "") or "")
+        idempotency_key = remote_work_idempotency_key(
+            platform=str(getattr(source.platform, "value", source.platform)),
+            chat_id=str(source.chat_id),
+            message_id=message_id,
+            objective=objective,
+        )
+        try:
+            session_store = self.async_session_store
+            session_entry = await session_store.get_or_create_session(source)
+            session_id = str(session_entry.session_id)
+            packet = build_bounded_execution_packet(objective, task_id=idempotency_key)
+            delivery_metadata = {k: v for k, v in metadata.items() if k != "_interim_send"}
+            task_id, subscribed = await asyncio.to_thread(
+                create_native_remote_task,
+                source=source,
+                packet=packet,
+                objective=objective,
+                session_id=session_id,
+                idempotency_key=idempotency_key,
+                delivery_metadata=delivery_metadata,
+            )
+        except Exception:
+            logger.exception("Could not create native detached long-work task; refusing inline fallback")
+            if adapter is not None:
+                with suppress(Exception):
+                    await adapter.send(
+                        source.chat_id,
+                        "❌ 后台任务创建失败，未执行任何项目操作。",
+                        metadata=metadata,
+                    )
+            return True
+        if adapter is not None:
+            started = time.perf_counter()
+            with suppress(Exception):
+                await adapter.send(source.chat_id, LONG_WORK_ACK, metadata=metadata)
+            logger.info(
+                "Telegram long-work request created native task=%s subscribed=%s control_session=%s ack_route_latency_ms=%.1f",
+                task_id, subscribed,
+                session_id,
+                (time.perf_counter() - started) * 1000,
+            )
+        else:
+            logger.warning("Native detached Telegram task %s has no delivery adapter", task_id)
+        return True
+
+    def _semantic_control_intent_for_event(self, event: MessageEvent):
+        """Resolve Telegram read-only control language before ordinary session routing."""
+        source = getattr(event, "source", None)
+        if source is None or getattr(source.platform, "value", source.platform) != "telegram":
+            return None
+        if getattr(event, "message_type", None) != MessageType.TEXT or getattr(event, "internal", False):
+            return None
+        if getattr(event, "is_command", lambda: False)():
+            return None
+        from gateway.semantic_control import resolve_control_intent
+        return resolve_control_intent(event.text or "")
+
+    def _control_sender_is_authorized(self, event: MessageEvent, session_key: str) -> bool:
+        """Authorize the ACTUAL sender before any control reply is produced or sent.
+
+        This route answers before the cold path's ingress gate (``_hm_admit_event``), so it must
+        run the same check itself. The busy path authorizes before its control route; without this
+        the two paths would disagree, and an unauthorized sender in any chat the bot delivers to
+        would receive rendered project status. An unauthorized event is declined (``False``), so it
+        falls through to the ordinary ingress gate, which applies the pairing/decline policy.
+        """
+        source = getattr(event, "source", None)
+        if source is None:
+            return False
+        try:
+            authorized = self._is_user_authorized_for_source(source)
+        except Exception:
+            logger.exception("Semantic control authorization check failed; refusing the query")
+            return False
+        if not authorized:
+            logger.warning(
+                "Dropping semantic control query from unauthorized user: user=%s (%s), platform=%s, session=%s",
+                getattr(source, "user_id", None), getattr(source, "user_name", None),
+                getattr(getattr(source, "platform", None), "value", None), session_key,
+            )
+            return False
+        # Same budget gate the ordinary path applies, under the authorizing profile. The busy path
+        # already charged this event on arrival and stamped the flag, so honour it instead of
+        # paying for one control query twice.
+        try:
+            already_charged = getattr(event, "_bot_loop_admitted", False)
+            if not already_charged and not self._admit_bot_message_for_source(source):
+                return False
+        except Exception:
+            logger.exception("Semantic control bot-loop admission failed; refusing the query")
+            return False
+        event._bot_loop_admitted = True
+        return True
+
+    async def _route_semantic_control_query(self, event: MessageEvent, session_key: str) -> bool:
+        """Run one bounded read-only projection without touching the active user turn."""
+        # Authorization precedes classification: an unauthorized sender must not be able to learn
+        # whether their text matched a control intent, nor trigger a projection run.
+        if not self._control_sender_is_authorized(event, session_key):
+            return False
+        from gateway.semantic_control import (
+            build_control_projection_prompt,
+            sanitize_control_response,
+        )
+
+        intent = self._semantic_control_intent_for_event(event)
+        if intent is None:
+            return False
+        adapter = self._delivery_adapter_for(event.source)
+        if adapter is None:
+            return False
+
+        source = event.source
+        chat_key = (
+            getattr(source.platform, "value", source.platform),
+            str(source.chat_id),
+            str(getattr(source, "thread_id", "") or ""),
+            intent.key,
+        )
+        inflight = getattr(self, "_semantic_control_inflight", None)
+        if inflight is None:
+            inflight = self._semantic_control_inflight = {}
+        existing = inflight.get(chat_key)
+        if existing is not None and not existing.done():
+            logger.info("Coalescing duplicate semantic control query for session=%s intent=%s", session_key, intent.key)
+            await asyncio.shield(existing)
+            event._gateway_accepted = True
+            return True
+
+        prompt = build_control_projection_prompt(intent, event.text or "")
+        task_id = f"semantic-control-{uuid.uuid4().hex}"
+        metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+
+        async def _produce() -> None:
+            try:
+                # Read the timeout off the facade at call time: the facade is the documented seam
+                # for operator/test overrides (a sibling must not freeze its own copy).
+                from gateway import run_inbound as _inbound_facade
+
+                response = await asyncio.wait_for(
+                    self._run_readonly_control_projection(
+                        prompt,
+                        source,
+                        task_id,
+                        event_message_id=self._reply_anchor_for_event(event),
+                    ),
+                    timeout=_inbound_facade._SEMANTIC_CONTROL_TIMEOUT_SECONDS,
+                )
+                response = sanitize_control_response(response, details=intent.details)
+            except Exception:
+                logger.exception("Semantic control projection failed for intent=%s", intent.key)
+                response = ""
+            if not response:
+                response = "当前无法读取最新项目状态，请稍后再试。"
+            try:
+                await adapter.send(source.chat_id, response, metadata=metadata)
+            except Exception:
+                logger.warning("Semantic control response delivery failed for intent=%s", intent.key, exc_info=True)
+
+        task = asyncio.create_task(_produce(), name=f"{task_id}-delivery")
+        inflight[chat_key] = task
+        try:
+            await task
+        finally:
+            if inflight.get(chat_key) is task:
+                inflight.pop(chat_key, None)
+        event._gateway_accepted = True
+        return True

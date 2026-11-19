@@ -1,0 +1,111 @@
+"""The deterministic portfolio projection must RUN, not be stubbed away.
+
+A prior review found the whole semantic-control capability dead: the extracted
+``ReadonlyControlProjectionMixin`` called ``_portfolio_key`` / ``_portfolio_roots`` /
+``_resolve_portfolio_script``, which the line-ratchet refactor dropped, so every query raised
+``AttributeError``, the ``except`` below swallowed it, and the user was told the read failed.
+Every existing test replaced or skipped this method, so the suite stayed green.
+
+These tests exercise the REAL method on a bare runner, so a dropped helper cannot recur.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+from pathlib import Path
+
+import pytest
+
+from gateway.run_turn_control_projection import ReadonlyControlProjectionMixin
+
+
+def _renderer_source() -> str:
+    return (
+        "UNKNOWN = 'unknown'\n"
+        "NONE = 'none'\n"
+        "def parse_registry(path):\n"
+        "    return [type('Cfg', (), {'project_id': 'ai-colleague', 'default_executor': 'hermes'})()]\n"
+        "def recover_project(config, root, github_enabled=True):\n"
+        "    return type('Snap', (), {'project_id': config.project_id, 'executor': 'hermes'})()\n"
+        "def render_mobile(snapshots, attention_only=False, details=False):\n"
+        "    return 'PROJECTION:' + ','.join(s.project_id for s in snapshots)\n"
+        "def _mobile_project_name(snapshot):\n"
+        "    return snapshot.project_id\n"
+        "def _safe_human_label(value):\n"
+        "    return str(value)\n"
+    )
+
+
+@pytest.fixture
+def projection(tmp_path, monkeypatch):
+    """A bare runner whose only project root is a temp checkout holding a real renderer."""
+    ai_root = tmp_path / "ai-colleague"
+    (ai_root / "scripts").mkdir(parents=True)
+    (ai_root / "scripts" / "portfolio_recover.py").write_text(_renderer_source(), encoding="utf-8")
+
+    registry = tmp_path / "portfolio-projects.yaml"
+    registry.write_text("projects:\n  - name: ai-colleague\n    repository: example/ai-colleague\n", encoding="utf-8")
+
+    class Runner(ReadonlyControlProjectionMixin):
+        _session_db = None
+
+        def _portfolio_roots(self):
+            return {self._portfolio_key("ai-colleague"): ai_root}
+
+    monkeypatch.setattr("gateway.semantic_control.default_registry_path", lambda: registry)
+    return Runner()
+
+
+def test_projection_renders_through_the_real_helpers(projection) -> None:
+    """The real method must produce a rendered answer — not "" after a swallowed AttributeError."""
+    assert projection._deterministic_portfolio_projection("Canonical intent: PORTFOLIO_STATUS") == (
+        "PROJECTION:ai-colleague"
+    )
+
+
+def test_projection_honours_the_registry_absence(projection, tmp_path, monkeypatch) -> None:
+    """No registry file is an empty answer, not an exception."""
+    monkeypatch.setattr(
+        "gateway.semantic_control.default_registry_path", lambda: tmp_path / "missing.yaml"
+    )
+    assert projection._deterministic_portfolio_projection("Canonical intent: PORTFOLIO_STATUS") == ""
+
+
+def test_every_self_call_in_the_mixin_resolves() -> None:
+    """Every ``self._x`` the mixin calls must exist on the mixin itself.
+
+    This is the structural net: the drop that shipped was invisible to ruff, ``scripts/check``
+    and the focused suite because attribute access on ``self`` is unchecked statically. The
+    mixin is only ever mixed into ``GatewayRunner``, so a name it calls has to live here or be
+    a documented runner member.
+    """
+    # Runner members the mixin legitimately borrows (gateway/run*.py).
+    borrowed = {
+        "_run_in_executor_with_context", "_cleanup_agent_resources",
+        "_resolve_session_agent_runtime", "_resolve_turn_toolsets", "_provider_routing",
+        "_resolve_session_reasoning_config", "_resolve_session_service_tier",
+        "_resolve_turn_agent_config", "_refresh_fallback_model", "_session_db",
+        "_reasoning_config", "_service_tier",
+    }
+    source = Path(importlib.util.find_spec(ReadonlyControlProjectionMixin.__module__).origin).read_text(
+        encoding="utf-8"
+    )
+    tree = ast.parse(source)
+    defined = {
+        node.name
+        for cls in ast.walk(tree)
+        if isinstance(cls, ast.ClassDef) and cls.name == ReadonlyControlProjectionMixin.__name__
+        for node in cls.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    called = {
+        node.func.attr
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "self"
+    }
+    missing = called - defined - borrowed
+    assert not missing, f"mixin calls undefined self members: {sorted(missing)}"

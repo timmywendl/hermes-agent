@@ -83,6 +83,7 @@ func request(_ descriptor: Descriptor, _ operation: String, _ sequence: Int64, p
             try suite.rejects(.invalidFrame) { _ = try decodeJSON(Data(raw.utf8)) }
         }
         try suite.rejects(.invalidFrame) { _ = try decodeJSON(Data([0xff])) }
+        try suite.rejects(.invalidFrame) { _ = try decodeJSON(Data("{\"TASK_ID\":1}".utf8)) }
         try suite.rejects(.invalidFrame) {
             _ = try decodeJSON(Data((String(repeating: "[", count: 9) + String(repeating: "]", count: 9)).utf8))
         }

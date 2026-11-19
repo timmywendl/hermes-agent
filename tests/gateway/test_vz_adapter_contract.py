@@ -152,6 +152,20 @@ def test_duplicate_valid_binding_key_is_not_erased(check: Check) -> None:
     assert code(check, raw) == "INVALID_FRAME"
 
 
+@pytest.mark.parametrize("where", ["frame", "descriptor"])
+@pytest.mark.parametrize("key", ["TASK_ID", "SOCKET_ENDPOINT"])
+@pytest.mark.parametrize("escaped", [False, True])
+def test_unicode_field_alias_is_not_an_exact_schema_key(check: Check, where: str, key: str, escaped: bool) -> None:
+    value = frame() if where == "frame" else descriptor()
+    binding = value["binding"]
+    binding[key.replace("K", "\u212a")] = binding.pop(key)
+    raw = json.dumps(value, ensure_ascii=escaped)
+    if where == "frame":
+        assert code(check, raw) == "INVALID_FRAME"
+    else:
+        assert check(desc=raw)["error"] == "INVALID_DESCRIPTOR"
+
+
 def test_frame_byte_boundary_and_trailing_bytes(check: Check) -> None:
     raw = json.dumps(frame())
     exact = raw + " " * (65_536 - len(raw.encode()))

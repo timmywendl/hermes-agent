@@ -109,6 +109,9 @@ struct StrictJSON {
         repeat {
             whitespace()
             let key = try string()
+            // All protocol fields are ASCII. Reject Unicode aliases before Swift's
+            // canonically equivalent String dictionary/Set equality can erase them.
+            guard key.utf8.allSatisfy({ $0 < 128 }) else { throw ContractError.invalidFrame }
             guard result[key] == nil, consume(58) else { throw ContractError.invalidFrame }
             result[key] = try value(depth: depth + 1)
             if consume(125) { return .object(result) }

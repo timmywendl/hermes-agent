@@ -1,6 +1,6 @@
 """Q1 native VZ qualification candidate; authoring is not execution authorization.
 
-No import/collection action starts a process or opens a socket. Every test first
+No import/collection action starts a process or opens a socket. Every native test first
 requires BOTH Q1_VZ_EXECUTION=HUMAN_AUTHORIZED_DISPOSABLE_V1 and a protected JSON
 Q1_VZ_MANIFEST whose SHA256 equals Q1_VZ_MANIFEST_SHA256. The marker is deliberate
 operator opt-in, not a cryptographic proof of Human approval. A future signed-off

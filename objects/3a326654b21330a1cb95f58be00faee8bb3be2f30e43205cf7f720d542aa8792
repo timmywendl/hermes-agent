@@ -1,0 +1,162 @@
+"""Bounded control-chat routing for long work.
+
+The gateway already owns a native Kanban dispatcher. This module only decides
+which ordinary Telegram messages should use it and builds the small packet given to
+the fresh worker; it never copies the control-session transcript.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+
+LONG_WORK_ACK = "已接手，正在后台推进。只有真正需要你决定时才会通知。"
+DEFAULT_PROJECT = "spareribes/ai-colleague"
+DEFAULT_AUTHORITY = "GitHub Issue #82"
+_MAX_OBJECTIVE_CHARS = 640
+_MAX_PACKET_CHARS = 2400
+
+
+@dataclass(frozen=True)
+class LongWorkIntent:
+    """A classified request whose execution must not occupy the control chat."""
+
+    objective: str
+
+
+_SHORT_STATUS_RE = re.compile(
+    r"(?:什么状态|当前状态|发生什么|当前\s*executor|项目.*状态|\b(?:status|what happened|current executor)\b)",
+    re.IGNORECASE,
+)
+_LONG_WORK_RE = re.compile(
+    r"(?:"
+    r"继续(?:推进|处理|做|完成)?\s*\S+"
+    r"|把.{0,80}(?:task|任务|做完|完成)"
+    r"|执行.{0,100}(?:实现|测试|review|审查|pr)"
+    r"|(?:implement|finish|complete|continue|keep going|run tests|review|open a pr)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _clean_text(text: str) -> str:
+    return " ".join(str(text or "").replace("\x00", " ").split())
+
+
+def classify_long_work_request(text: str) -> bool:
+    """Return True only for explicit long-work language, not status/attention questions."""
+    normalized = _clean_text(text)
+    if not normalized or normalized.startswith(("/", "!")):
+        return False
+    if _SHORT_STATUS_RE.search(normalized) and not re.search(
+        r"(?:继续|执行|做完|完成|implement|finish|complete|continue|review|run tests|open a pr)",
+        normalized,
+        re.IGNORECASE,
+    ):
+        return False
+    return bool(_LONG_WORK_RE.search(normalized))
+
+
+def build_bounded_execution_packet(
+    objective: str,
+    *,
+    task_id: str,
+    project: str = DEFAULT_PROJECT,
+    authority: str = DEFAULT_AUTHORITY,
+) -> str:
+    """Build the worker prompt without importing the giant control transcript."""
+    objective = _clean_text(objective)[:_MAX_OBJECTIVE_CHARS]
+    project = _clean_text(project)[:200] or DEFAULT_PROJECT
+    authority = _clean_text(authority)[:200] or DEFAULT_AUTHORITY
+    fixture_scope = bool(re.search(r"(?:fixture|safe local|本地|本地化)", objective, re.IGNORECASE))
+    mutation_boundary = (
+        "MUTATION: reference-only local fixture; do not commit, push, open a PR, merge, or contact external product repos."
+        if fixture_scope
+        else "MUTATION: do not touch external product repos or open/merge PRs unless the bounded Objective explicitly authorizes it."
+    )
+    packet = f"""T4 BOUNDED REMOTE WORK PACKET
+PROJECT: {project}
+OBJECTIVE: {objective}
+TASK: {task_id}
+AUTHORITY: {authority}
+EXECUTION: Run as a detached worker using the assigned Hermes execution path. Do not run inside the Telegram control session.
+CONTEXT: Recover only the named Project, Objective, Task, repository authority, and current durable state. Do not copy or depend on the Telegram transcript.
+BOUNDARIES: External product repositories remain READ_ONLY unless the Human explicitly authorizes an exact Project/Task. Do not expose filesystem paths, session IDs, provider names, credentials, tokens, or raw logs.
+{mutation_boundary}
+RESULT: Return only a concise structured result with STATE (OUTCOME_READY, WAITING_HUMAN, WAITING_CAPACITY, or EXCEPTION), PROJECT, OUTCOME, HUMAN_ACTION, and NEXT_STEP. No raw logs.
+"""
+    return packet[:_MAX_PACKET_CHARS]
+
+
+def classify_long_work_intent(text: str) -> LongWorkIntent | None:
+    """Return a bounded intent object or None for inline control-chat handling."""
+    return LongWorkIntent(_clean_text(text)) if classify_long_work_request(text) else None
+
+
+def remote_work_idempotency_key(*, platform: str, chat_id: str, message_id: str, objective: str) -> str:
+    """Stable, non-secret key so Telegram redelivery cannot create a second task."""
+    material = "|".join((str(platform), str(chat_id), str(message_id or objective)))
+    return "telegram-remote-work-v2:" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def create_native_remote_task(
+    *,
+    source,
+    packet: str,
+    objective: str,
+    session_id: str,
+    idempotency_key: str,
+    delivery_metadata: dict,
+) -> str:
+    """Create and subscribe one native Kanban task for the originating chat.
+
+    The dispatcher/notifier already provide durable worker execution and terminal delivery; this
+    function only supplies their existing task and subscription records.
+    """
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    from hermes_cli import projects_db as pdb
+    from hermes_cli.profiles import get_active_profile_name
+
+    assignee = get_active_profile_name() or "default"
+    project = None
+    with pdb.connect_closing() as project_conn:
+        project = pdb.get_project(project_conn, DEFAULT_PROJECT.split("/")[-1])
+    project_id = project.id if project is not None else None
+    board = project.slug if project is not None else None
+    workspace_kind = "worktree" if project_id else "scratch"
+    task_title = "Telegram detached: " + _clean_text(objective)[:100]
+    conn = kbc.connect(board=board)
+    try:
+        task_id = kb.create_task(
+            conn,
+            title=task_title,
+            body=packet,
+            assignee=assignee,
+            created_by=assignee,
+            workspace_kind=workspace_kind,
+            project_id=project_id,
+            idempotency_key=idempotency_key,
+            max_runtime_seconds=1800,
+            session_id=session_id,
+            completion_contract="local-only",
+            initial_status="running",
+        )
+        kbn.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=str(getattr(source.platform, "value", source.platform)),
+            chat_id=str(source.chat_id),
+            thread_id=getattr(source, "thread_id", None),
+            user_id=getattr(source, "user_id", None),
+            user_id_alt=getattr(source, "user_id_alt", None),
+            chat_type=getattr(source, "chat_type", None),
+            notifier_profile=getattr(source, "profile", None) or assignee,
+            delivery_mode="notify",
+            delivery_metadata=delivery_metadata,
+        )
+    finally:
+        conn.close()
+    return task_id

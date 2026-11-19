@@ -1,0 +1,70 @@
+"""Gateway replies for detached Task Human-answer routing."""
+
+from __future__ import annotations
+
+import asyncio
+from types import SimpleNamespace
+
+from gateway.config import Platform
+from gateway.run_inbound import GatewayInboundMixin
+from hermes_cli import kanban_human_input
+
+
+def _source():
+    return SimpleNamespace(
+        platform=Platform.TELEGRAM,
+        chat_id="chat-1",
+        thread_id=None,
+        user_id="human",
+        profile="main",
+    )
+
+
+def test_gateway_acknowledges_exact_answer(monkeypatch):
+    seen = []
+
+    def route(**kwargs):
+        seen.append(kwargs)
+        return {"outcome": "accepted", "task_id": "t_exact"}
+
+    monkeypatch.setattr(kanban_human_input, "route_answer_from_source", route)
+    mixin = GatewayInboundMixin()
+    reply = asyncio.run(mixin._hm_kanban_human_reply(SimpleNamespace(text="1"), _source()))
+
+    assert reply == "收到，任务已继续。"
+    assert seen == [{
+        "platform": "telegram",
+        "chat_id": "chat-1",
+        "thread_id": None,
+        "user_id": "human",
+        "profile": "main",
+        "text": "1",
+    }]
+
+
+def test_gateway_reports_ambiguity_and_stale_without_guessing(monkeypatch):
+    outcomes = iter([
+        {
+            "outcome": "ambiguous",
+            "tasks": [
+                {"task_id": "t_one", "project": "One", "question": "Choose one?"},
+                {"task_id": "t_two", "project": "Two", "question": "Choose two?"},
+            ],
+        },
+        {"outcome": "stale"},
+    ])
+    monkeypatch.setattr(
+        kanban_human_input, "route_answer_from_source", lambda **_kwargs: next(outcomes),
+    )
+    mixin = GatewayInboundMixin()
+
+    ambiguous = asyncio.run(
+        mixin._hm_kanban_human_reply(SimpleNamespace(text="1"), _source()),
+    )
+    stale = asyncio.run(
+        mixin._hm_kanban_human_reply(SimpleNamespace(text="1"), _source()),
+    )
+
+    assert "未自动猜测目标" in ambiguous
+    assert "t_one" in ambiguous and "t_two" in ambiguous
+    assert stale == "这条回答对应的问题已经处理；任务不会重复恢复。"

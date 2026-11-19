@@ -3,12 +3,17 @@
   "kind": "hermes",
   "base_hermes_main": "60344574963861ee5d50b980338878be4f5b73af",
   "historical_hermes_commit_manifests": [
+    "0428605038d3bd63be3dae709675a236b93c7e9b.json",
     "09cf64ed8c3903edbe0a9fba8c68243b6fe2766b.json",
     "11ac50d56d0280f5ca50a40c25524a0563a12cbb.json",
     "1fd159291fe799fd0118480b136bf9950bf941e8.json",
+    "208ea188529a972b049cc2202e02ad44e13c9110.json",
     "24099ef7bfb348757fb02f6d11d9196734ebca1e.json",
+    "27f4156ca0d43398a37ca6a2f650013d1cbab22a.json",
     "3045f6ff00eafcf82d797e92ce0d5fff6a49a053.json",
     "31f9324df6225203e7676df938dcfa648b36fa39.json",
+    "33a30fdd815a965b59dd38aae74a67ecec7b0cca.json",
+    "35ff423bf5721cebca0726b4ba1fe23d728124ef.json",
     "36a1488be1351163a441f3868f602d04ef1d666b.json",
     "39610b4e9db83bee8d05f5738915ca1e5bf55e7a.json",
     "3f41e4095473bed671ca6e579e0f7bd6ef15848c.json",
@@ -20,21 +25,28 @@
     "5d6854ef162b4a89715541ce7ee0ea9f10e9c5a7.json",
     "613f7ac5d59d928c80650244185bd98218783801.json",
     "6226dcaf4ca26a271384ba581158530f71546a25.json",
+    "70a1af647855a278f808efd97d8c2cc05e0af96f.json",
     "725a51461f5d0089699fb9dc2aa3f2cfbf32f424.json",
+    "7ce2a84ab2a72c65cfab78e3cc3e97ecf6723f19.json",
     "8009e277d82328dbc7e98538fa9ec6fbec2f330f.json",
     "8592e14150a96afb9295262f08eda44177cc4785.json",
     "8d32080d0612c0c7e40f80b2367e22575eb5cf33.json",
+    "91f85eabbb46cb00f57887ffb9faede776a40596.json",
     "acc3cada0da86c81efc8aa6c5a291989549ca900.json",
+    "ad2841fe37c7e37480e28119893d21e4adaeca37.json",
     "adebb5ebb3ba3627be003de2211927c486c08ba3.json",
     "b0aef86df71065ac7c4e879a4113bc455634d58f.json",
     "b1dd8968068e3768ff46e8a7cbe8432017af72a8.json",
+    "bedc87034e2156a5df8b354a323201272d971632.json",
     "c3dee076e94b18df289cdc7910dbfec6a37c0494.json",
     "d91108050e3226eb306e445609247daf184929aa.json",
     "df363d4e02ead558088da05ed1a9d9bf93720a9b.json",
     "e249d393d93e21a3bb7635b6756a32381249e9a4.json",
+    "e32a90e9f11c5130897839c0292fa321ddc47b5e.json",
     "e6575193d44c6ce67ade9914a445ed1da90f2162.json",
     "ef75bc708867e3884cb40a91363be6dc6fddc034.json",
-    "f017baf2a4527935ba339165407a7a92dc21737b.json"
+    "f017baf2a4527935ba339165407a7a92dc21737b.json",
+    "f56160f5e4c2728cd3712bd95731bab04809ef9d.json"
   ],
   "working_overlays": [
     "hermes-working-4163e56283d0.json",
@@ -43,7 +55,8 @@
     "hermes-working-e1ba3cae6fcd.json",
     "hermes-working-84a21bb67ea0.json"
   ],
-  "object_count": 13498,
+  "object_count": 13862,
   "blocked_source_read_count": 0,
-  "credential_like_literals_redacted_before_publication": true
+  "credential_like_literals_redacted_before_publication": true,
+  "all_local_hermes_branches_indexed": 49
 }

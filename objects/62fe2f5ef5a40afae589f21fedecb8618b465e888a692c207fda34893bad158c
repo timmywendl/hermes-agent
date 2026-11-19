@@ -1,0 +1,457 @@
+"""Durable Human-input bridge for detached Kanban workers.
+
+Codex app-server can pause a turn with ``item/tool/requestUserInput``.  A
+dispatcher worker is a separate ``hermes chat -q`` process, so the gateway's
+in-memory clarify queue cannot own that request.  This module records the
+question and its answer in the task's existing event stream.  The worker polls
+that stream while the gateway notifier delivers and routes the answer.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Optional
+
+
+REQUESTED = "human_question_requested"
+DELIVERED = "human_question_delivered"
+UNDELIVERED = "human_question_undelivered"
+ANSWERED = "human_question_answered"
+RESUMED = "human_question_resumed"
+_QUESTION_KINDS = (REQUESTED, DELIVERED, UNDELIVERED, ANSWERED, RESUMED)
+
+
+class HumanQuestionError(RuntimeError):
+    """The detached task cannot safely publish or resume a Human question."""
+
+
+@dataclass(frozen=True)
+class PendingHumanQuestion:
+    task_id: str
+    run_id: int
+    event_id: int
+    board: str
+    envelope: dict[str, Any]
+    delivery_state: str
+    answer: Optional[dict[str, Any]] = None
+
+    @property
+    def question_identity(self) -> str:
+        return str(self.envelope["question_identity"])
+
+
+def _kb():
+    from hermes_cli import kanban_db
+
+    return kanban_db
+
+
+def _event_rows(conn, task_id: str, run_id: int) -> list[Any]:
+    marks = ",".join("?" for _ in _QUESTION_KINDS)
+    return conn.execute(
+        f"SELECT id, kind, payload FROM task_events "
+        f"WHERE task_id = ? AND run_id = ? AND kind IN ({marks}) ORDER BY id ASC",
+        (task_id, int(run_id), *_QUESTION_KINDS),
+    ).fetchall()
+
+
+def _payload(row: Any) -> dict[str, Any]:
+    raw = row["payload"]
+    if isinstance(raw, dict):
+        return dict(raw)
+    try:
+        parsed = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _question_state(conn, task_id: str, run_id: int) -> tuple[Optional[Any], Optional[dict], str, Optional[dict]]:
+    """Latest request row/envelope, delivery state, and answer for one run."""
+    request_row = None
+    envelope = None
+    delivery_state = "PENDING_DELIVERY"
+    answer = None
+    for row in _event_rows(conn, task_id, run_id):
+        payload = _payload(row)
+        if row["kind"] == REQUESTED:
+            request_row, envelope = row, payload
+            delivery_state, answer = "PENDING_DELIVERY", None
+            continue
+        if envelope is None or payload.get("question_identity") != envelope.get("question_identity"):
+            continue
+        if row["kind"] == DELIVERED:
+            delivery_state = "DELIVERED"
+        elif row["kind"] == UNDELIVERED:
+            delivery_state = "HUMAN_QUESTION_UNDELIVERED"
+        elif row["kind"] == ANSWERED:
+            answer = payload
+        elif row["kind"] == RESUMED:
+            answer = payload.get("answer") or answer
+    return request_row, envelope, delivery_state, answer
+
+
+def pending_question(conn, task_id: str, run_id: Optional[int] = None, *, board: str = "default") -> Optional[PendingHumanQuestion]:
+    task = _kb().get_task(conn, task_id)
+    if task is None or task.status != "running" or task.current_run_id is None:
+        return None
+    active_run = int(task.current_run_id)
+    if run_id is not None and active_run != int(run_id):
+        return None
+    row, envelope, delivery_state, answer = _question_state(conn, task_id, active_run)
+    if row is None or envelope is None or answer is not None:
+        return None
+    return PendingHumanQuestion(
+        task_id=task_id, run_id=active_run, event_id=int(row["id"]), board=board,
+        envelope=envelope, delivery_state=delivery_state,
+    )
+
+
+def task_projection(conn, task_id: str) -> Optional[dict[str, Any]]:
+    """Human-facing derived state for portfolio/dashboard readers."""
+    pending = pending_question(conn, task_id)
+    if pending is None:
+        return None
+    return {
+        "state": "WAITING_HUMAN",
+        "delivery_state": pending.delivery_state,
+        "project": pending.envelope.get("project"),
+        "question_identity": pending.question_identity,
+        "question": pending.envelope.get("question_text"),
+        "choices": pending.envelope.get("choices") or [],
+        "created_at": pending.envelope.get("created_at"),
+    }
+
+
+def _answered_question(conn, task_id: str, run_id: int, *, board: str = "default") -> Optional[PendingHumanQuestion]:
+    row, envelope, delivery_state, answer = _question_state(conn, task_id, run_id)
+    if row is None or envelope is None or answer is None:
+        return None
+    return PendingHumanQuestion(
+        task_id=task_id, run_id=run_id, event_id=int(row["id"]), board=board,
+        envelope=envelope, delivery_state=delivery_state, answer=answer,
+    )
+
+
+def _clean_question(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise HumanQuestionError("Codex request_user_input question is not an object")
+    question = str(raw.get("question") or "").strip()
+    qid = str(raw.get("id") or "").strip()
+    if not question or not qid:
+        raise HumanQuestionError("Codex request_user_input question requires id and question")
+    if raw.get("isSecret"):
+        raise HumanQuestionError("Secret input cannot be delivered through a Kanban notification")
+    options = raw.get("options")
+    clean_options = []
+    if options is not None:
+        if not isinstance(options, list):
+            raise HumanQuestionError("Codex request_user_input options must be a list")
+        for option in options:
+            if not isinstance(option, dict) or not str(option.get("label") or "").strip():
+                raise HumanQuestionError("Codex request_user_input option requires a label")
+            clean_options.append({
+                "label": str(option["label"]).strip()[:200],
+                "description": str(option.get("description") or "").strip()[:400],
+            })
+    return {
+        "id": qid[:200], "header": str(raw.get("header") or "").strip()[:120],
+        "question": question[:4000], "options": clean_options,
+        "is_other": bool(raw.get("isOther")),
+    }
+
+
+def _identity(task_id: str, run_id: int, params: dict[str, Any], questions: list[dict[str, Any]]) -> str:
+    material = {
+        "task": task_id, "run": int(run_id), "thread": params.get("threadId"),
+        "turn": params.get("turnId"), "item": params.get("itemId"), "questions": questions,
+    }
+    digest = hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"hq_{digest[:24]}"
+
+
+def _explicit_recommended_choice(options: list[dict[str, str]]) -> Optional[str]:
+    """Return a recommendation only when the executor actually marked one."""
+    for option in options:
+        marker = f"{option.get('label', '')} {option.get('description', '')}".casefold()
+        if "recommended" in marker or "推荐" in marker:
+            return option["label"]
+    return None
+
+
+def publish_codex_question(conn, task_id: str, run_id: int, params: dict[str, Any], *, board: str) -> PendingHumanQuestion:
+    """Publish one blocking Codex request, deduping replay of the same request."""
+    if not params.get("isBlocking"):
+        raise HumanQuestionError("Non-blocking Codex input requests are not Human blockers")
+    questions = [_clean_question(q) for q in (params.get("questions") or [])]
+    if len(questions) != 1:
+        raise HumanQuestionError("Detached Task Human input currently requires exactly one question")
+    task = _kb().get_task(conn, task_id)
+    if task is None or task.status != "running" or task.current_run_id != int(run_id):
+        raise HumanQuestionError("Kanban Task/run ownership changed before Human input was published")
+    existing = pending_question(conn, task_id, run_id, board=board)
+    question_identity = _identity(task_id, run_id, params, questions)
+    if existing is not None:
+        if existing.question_identity == question_identity:
+            return existing
+        raise HumanQuestionError("Task already has a different pending Human question")
+
+    q = questions[0]
+    envelope = {
+        "project": task.project_id or task.title,
+        "task_identity": task_id,
+        "question_identity": question_identity,
+        "question_text": q["question"],
+        "question_id": q["id"],
+        "header": q["header"],
+        "choices": q["options"],
+        "recommended_choice": _explicit_recommended_choice(q["options"]),
+        "answer_type": "choice_or_text" if q["options"] else "free_text",
+        "origin": "codex_app_server",
+        "created_at": int(time.time()),
+        "run_id": int(run_id),
+        "board": board,
+        "is_other": q["is_other"],
+    }
+    with _kb().write_txn(conn):
+        _kb()._append_event(conn, task_id, REQUESTED, envelope, run_id=int(run_id))
+    pending = pending_question(conn, task_id, run_id, board=board)
+    if pending is None:
+        raise HumanQuestionError("Human question did not become durable")
+    count = conn.execute("SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?", (task_id,)).fetchone()[0]
+    if not count:
+        mark_delivery(
+            conn, task_id, run_id, question_identity, delivered=False,
+            error="no notification subscription for this Task",
+        )
+        pending = pending_question(conn, task_id, run_id, board=board) or pending
+    return pending
+
+
+def mark_delivery(
+    conn, task_id: str, run_id: int, question_identity: str, *, delivered: bool, error: Optional[str] = None,
+) -> bool:
+    pending = pending_question(conn, task_id, run_id)
+    if pending is None or pending.question_identity != question_identity:
+        return False
+    kind = DELIVERED if delivered else UNDELIVERED
+    payload = {"question_identity": question_identity, "at": int(time.time())}
+    if error:
+        payload["error"] = str(error)[:500]
+    with _kb().write_txn(conn):
+        _kb()._append_event(conn, task_id, kind, payload, run_id=int(run_id))
+    return True
+
+
+def _coerce_answer(envelope: dict[str, Any], raw: str) -> tuple[Optional[dict[str, Any]], Optional[str]]:
+    text = str(raw or "").strip()
+    if not text:
+        return None, "empty answer"
+    choices = envelope.get("choices") or []
+    selected = None
+    if choices:
+        if text.isdigit():
+            index = int(text) - 1
+            selected = choices[index]["label"] if 0 <= index < len(choices) else None
+            if selected is None:
+                return None, f"请选择 1–{len(choices)}，或回复选项文字。"
+        else:
+            folded = text.casefold()
+            selected = next((c["label"] for c in choices if c["label"].casefold() == folded), None)
+            if selected is None and not envelope.get("is_other"):
+                return None, f"请选择 1–{len(choices)}，或回复选项文字。"
+    answer_text = selected or text
+    return {
+        "question_identity": envelope["question_identity"],
+        "question_id": envelope["question_id"],
+        "answer": answer_text,
+        "input_raw": text,
+        "codex_response": {"answers": {envelope["question_id"]: {"answers": [answer_text]}}},
+        "answered_at": int(time.time()),
+    }, None
+
+
+def accept_answer(conn, task_id: str, run_id: int, question_identity: str, raw: str) -> tuple[str, Optional[str]]:
+    """Atomically answer one exact Task/run/question. Returns (outcome, detail)."""
+    with _kb().write_txn(conn):
+        pending = pending_question(conn, task_id, run_id)
+        if pending is None:
+            answered = _answered_question(conn, task_id, run_id)
+            return ("stale", None) if answered is not None else ("missing", None)
+        if pending.question_identity != question_identity:
+            return "missing", None
+        answer, error = _coerce_answer(pending.envelope, raw)
+        if answer is None:
+            return "invalid", error
+        _kb()._append_event(conn, task_id, ANSWERED, answer, run_id=int(run_id))
+    return "accepted", answer["answer"]
+
+
+def mark_resumed(conn, task_id: str, run_id: int, question_identity: str, answer: dict[str, Any]) -> bool:
+    with _kb().write_txn(conn):
+        answered = _answered_question(conn, task_id, run_id)
+        if answered is None or answered.question_identity != question_identity:
+            return False
+        if any(row["kind"] == RESUMED and _payload(row).get("question_identity") == question_identity
+               for row in _event_rows(conn, task_id, run_id)):
+            return False
+        _kb()._append_event(
+            conn, task_id, RESUMED,
+            {"question_identity": question_identity, "answer": answer, "resumed_at": int(time.time())},
+            run_id=int(run_id),
+        )
+    return True
+
+
+def wait_for_answer(conn, pending: PendingHumanQuestion, *, poll_seconds: float = 0.5) -> dict[str, Any]:
+    """Wait for the durable answer while keeping the worker heartbeat fresh."""
+    last_heartbeat = 0.0
+    while True:
+        answered = _answered_question(conn, pending.task_id, pending.run_id, board=pending.board)
+        if answered is not None and answered.question_identity == pending.question_identity and answered.answer:
+            response = answered.answer.get("codex_response")
+            if not isinstance(response, dict):
+                raise HumanQuestionError("Stored Human answer has no Codex response payload")
+            mark_resumed(conn, pending.task_id, pending.run_id, pending.question_identity, answered.answer)
+            return response
+        task = _kb().get_task(conn, pending.task_id)
+        if task is None or task.status != "running" or task.current_run_id != pending.run_id:
+            raise HumanQuestionError("Kanban Task/run ended while waiting for Human input")
+        now = time.monotonic()
+        if now - last_heartbeat >= 30:
+            from hermes_cli import kanban_db_dispatch
+
+            kanban_db_dispatch.heartbeat_worker(
+                conn, pending.task_id, note="waiting for Human answer", expected_run_id=pending.run_id,
+            )
+            last_heartbeat = now
+        time.sleep(max(0.05, float(poll_seconds)))
+
+
+def codex_user_input_callback_from_env():
+    """Return the detached Kanban callback, or ``None`` outside an owned worker."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    board = (os.environ.get("HERMES_KANBAN_BOARD") or "default").strip() or "default"
+    if not task_id or not run_raw:
+        return None
+    try:
+        run_id = int(run_raw)
+    except ValueError:
+        return None
+
+    def callback(params: dict[str, Any]) -> dict[str, Any]:
+        from hermes_cli import kanban_db_connect
+
+        conn = kanban_db_connect.connect(board=board)
+        try:
+            pending = publish_codex_question(conn, task_id, run_id, params, board=board)
+            return wait_for_answer(conn, pending)
+        finally:
+            conn.close()
+
+    return callback
+
+
+def _route_candidates(conn, *, board: str, platform: str, chat_id: str, thread_id: str,
+                      user_id: Optional[str], profile: Optional[str]) -> list[PendingHumanQuestion]:
+    rows = conn.execute(
+        "SELECT task_id, user_id, notifier_profile FROM kanban_notify_subs "
+        "WHERE LOWER(platform) = LOWER(?) AND chat_id = ? AND thread_id = ?",
+        (platform, chat_id, thread_id),
+    ).fetchall()
+    out = []
+    for row in rows:
+        if user_id and row["user_id"] and str(row["user_id"]) != user_id:
+            continue
+        if profile and row["notifier_profile"] and str(row["notifier_profile"]) != profile:
+            continue
+        pending = pending_question(conn, row["task_id"], board=board)
+        if pending is not None:
+            out.append(pending)
+    return out
+
+
+def _is_recent_duplicate(conn, *, platform: str, chat_id: str, thread_id: str,
+                         user_id: Optional[str], profile: Optional[str], text: str) -> bool:
+    """Whether this route already accepted the same raw answer in the last day."""
+    rows = conn.execute(
+        "SELECT e.payload FROM task_events e JOIN kanban_notify_subs s ON s.task_id = e.task_id "
+        "WHERE e.kind = ? AND LOWER(s.platform) = LOWER(?) AND s.chat_id = ? AND s.thread_id = ? "
+        "AND (? IS NULL OR s.user_id IS NULL OR s.user_id = ?) "
+        "AND (? IS NULL OR s.notifier_profile IS NULL OR s.notifier_profile = ?) "
+        "AND e.created_at >= ? ORDER BY e.id DESC LIMIT 20",
+        (ANSWERED, platform, chat_id, thread_id, user_id, user_id, profile, profile,
+         int(time.time()) - 86400),
+    ).fetchall()
+    return any(str(_payload(row).get("input_raw") or "").strip() == str(text).strip() for row in rows)
+
+
+def route_answer_from_source(*, platform: str, chat_id: str, thread_id: Optional[str],
+                             user_id: Optional[str], profile: Optional[str], text: str) -> dict[str, Any]:
+    """Route one inbound answer across boards; ambiguity always fails closed."""
+    from hermes_cli import kanban_db, kanban_db_connect
+
+    candidates: list[PendingHumanQuestion] = []
+    conns: dict[str, Any] = {}
+    recent_duplicate = False
+    try:
+        seen_paths: set[Path] = set()
+        for meta in kanban_db.list_boards(include_archived=False):
+            board = meta.get("slug") or kanban_db.DEFAULT_BOARD
+            db_path = Path(kanban_db.kanban_db_path(board=board)).resolve()
+            if db_path in seen_paths:
+                continue
+            seen_paths.add(db_path)
+            conn = kanban_db_connect.connect(board=board)
+            conns[board] = conn
+            candidates.extend(_route_candidates(
+                conn, board=board, platform=str(platform), chat_id=str(chat_id),
+                thread_id=str(thread_id or ""), user_id=str(user_id) if user_id is not None else None,
+                profile=str(profile) if profile else None,
+            ))
+            recent_duplicate = recent_duplicate or _is_recent_duplicate(
+                conn, platform=str(platform), chat_id=str(chat_id), thread_id=str(thread_id or ""),
+                user_id=str(user_id) if user_id is not None else None,
+                profile=str(profile) if profile else None, text=text,
+            )
+        unique = {(c.board, c.task_id, c.run_id, c.question_identity): c for c in candidates}
+        candidates = list(unique.values())
+        if not candidates:
+            return {"outcome": "stale" if recent_duplicate else "none"}
+        answer_text = text
+        if len(candidates) > 1:
+            stripped = str(text).strip()
+            targeted = []
+            for candidate in candidates:
+                for separator in (":", "：", " "):
+                    prefix = candidate.task_id + separator
+                    if stripped.startswith(prefix):
+                        targeted.append(candidate)
+                        answer_text = stripped[len(prefix):].strip()
+                        break
+            if len(targeted) == 1 and answer_text:
+                candidates = targeted
+        if len(candidates) > 1:
+            return {
+                "outcome": "ambiguous",
+                "tasks": [{"project": c.envelope.get("project"), "task_id": c.task_id,
+                           "question": c.envelope.get("question_text")} for c in candidates],
+            }
+        candidate = candidates[0]
+        outcome, detail = accept_answer(
+            conns[candidate.board], candidate.task_id, candidate.run_id,
+            candidate.question_identity, answer_text,
+        )
+        return {
+            "outcome": outcome, "detail": detail, "task_id": candidate.task_id,
+            "question_identity": candidate.question_identity,
+        }
+    finally:
+        for conn in conns.values():
+            conn.close()

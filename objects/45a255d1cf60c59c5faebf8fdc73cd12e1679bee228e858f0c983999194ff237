@@ -1,0 +1,144 @@
+"""Regression tests for Telegram control-chat long-work routing (Issue #82)."""
+
+import asyncio
+
+from gateway.remote_work import (
+    LONG_WORK_ACK,
+    build_bounded_execution_packet,
+    classify_long_work_request,
+)
+from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.event import MessageEvent
+from gateway.config import Platform
+from gateway.session import SessionSource
+
+
+def test_long_work_language_is_detached_but_status_questions_stay_inline():
+    assert classify_long_work_request("继续推进 cloud-test，真正需要我决定再找我") is True
+    assert classify_long_work_request("把这个 Task 做完，执行实现、测试、review、PR") is True
+    assert classify_long_work_request("现在几个项目什么状态？") is False
+    assert classify_long_work_request("这个项目当前 executor 是谁？") is False
+
+
+def test_bounded_packet_has_authority_and_no_transcript_dependency():
+    packet = build_bounded_execution_packet(
+        "继续推进 ai-colleague 的安全本地 fixture",
+        task_id="bg_test_123",
+        project="spareribes/ai-colleague",
+        authority="GitHub Issue #82",
+    )
+
+    assert "PROJECT: spareribes/ai-colleague" in packet
+    assert "OBJECTIVE: 继续推进 ai-colleague 的安全本地 fixture" in packet
+    assert "TASK: bg_test_123" in packet
+    assert "AUTHORITY: GitHub Issue #82" in packet
+    assert "Do not copy or depend on the Telegram transcript" in packet
+    assert "Do not expose filesystem paths" in packet
+    assert "reference-only local fixture" in packet
+    assert "do not commit, push, open a PR, merge" in packet
+    assert len(packet) <= 2400
+
+
+def test_ack_is_immediate_and_does_not_relay_worker_details():
+    assert LONG_WORK_ACK == "已接手，正在后台推进。只有真正需要你决定时才会通知。"
+    assert "session" not in LONG_WORK_ACK.lower()
+    assert "worktree" not in LONG_WORK_ACK.lower()
+    assert "provider" not in LONG_WORK_ACK.lower()
+
+
+def test_base_adapter_routes_long_work_before_active_session_guard():
+    class StubAdapter(BasePlatformAdapter):
+        async def connect(self):
+            return None
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, **kwargs):
+            return None
+
+        async def get_chat_info(self, chat_id):
+            return None
+
+    async def run_case():
+        adapter = object.__new__(StubAdapter)
+        calls = []
+        adapter._message_handler = object()
+        adapter._no_message_handler_logged = False
+        adapter._long_work_handler = lambda event, key: asyncio.sleep(0, result=True)
+        adapter._drop_unresolved = lambda event: False
+        adapter._event_session_key = lambda event: "agent:main:telegram:dm:chat"
+        adapter._active_sessions = {"agent:main:telegram:dm:chat": object()}
+        adapter._heal_stale_session_lock = lambda key: calls.append(("heal", key))
+        adapter._handle_message_while_active = lambda event, key: calls.append(("busy", key))
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+        event = MessageEvent(text="继续推进 ai-colleague fixture", source=source, message_id="m1")
+
+        await BasePlatformAdapter.handle_message(adapter, event)
+        assert event._gateway_accepted is True
+        assert calls == []
+
+    asyncio.run(run_case())
+
+
+def test_long_work_handler_creates_one_native_task_and_acks_without_relay():
+    from gateway.run_inbound import GatewayInboundMixin
+    from unittest.mock import patch
+
+    class Adapter:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chat_id, content, metadata=None):
+            self.sent.append((chat_id, content, metadata))
+
+    class SessionEntry:
+        session_id = "control-session"
+
+    class SessionStore:
+        async def get_or_create_session(self, source):
+            return SessionEntry()
+
+    class Runner:
+        def __init__(self):
+            self.adapter = Adapter()
+            self.async_session_store = SessionStore()
+            self.created = []
+
+        async def _hm_admit_event(self, event):
+            return event, event.source, False
+
+        def _hm_estop_gate(self, event, source, is_internal):
+            return None
+
+        def _delivery_adapter_for(self, source):
+            return self.adapter
+
+        def _reply_metadata(self, event):
+            return {"telegram_reply_to_message_id": event.message_id, "_interim_send": True}
+
+    async def run_case():
+        runner = Runner()
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+        event = MessageEvent(
+            text="继续推进 ai-colleague fixture，真正需要我决定再找我",
+            source=source,
+            message_id="m1",
+        )
+
+        def create_task(**kwargs):
+            runner.created.append(kwargs)
+            return "t_remote_1"
+
+        with patch("gateway.remote_work.create_native_remote_task", side_effect=create_task):
+            assert await GatewayInboundMixin._handle_long_work_request(runner, event, "control") is True
+            assert await GatewayInboundMixin._handle_long_work_request(runner, event, "control") is True
+
+        assert len(runner.created) == 2
+        assert runner.created[0]["session_id"] == "control-session"
+        assert "Do not copy or depend on the Telegram transcript" in runner.created[0]["packet"]
+        assert runner.adapter.sent[0][1] == LONG_WORK_ACK
+        assert runner.adapter.sent[0][2]["_interim_send"] is True
+        assert runner.created[0]["idempotency_key"] == runner.created[1]["idempotency_key"]
+
+    asyncio.run(run_case())

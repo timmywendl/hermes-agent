@@ -1,0 +1,12 @@
+{
+  "source_commit": "7ce2a84ab2a72c65cfab78e3cc3e97ecf6723f19",
+  "base_commit": "60344574963861ee5d50b980338878be4f5b73af",
+  "same_as_base_source_files": 17177,
+  "different_source_files": [],
+  "base_paths_absent_in_original_tree": [
+    "tests/gateway/test_guest_worker_boundary.py",
+    "tests/gateway/test_guest_worker_stop.py",
+    "tests/gateway/test_guest_worker_transport.py"
+  ],
+  "scope": "Additional unchecked-out historical branch state; sanitized source snapshot only, no private history or runtime data."
+}

@@ -1,0 +1,191 @@
+"""Detached Task Human questions are durable, exactly routed, and fail closed."""
+
+from __future__ import annotations
+
+import threading
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
+from hermes_cli.kanban_human_input import (
+    ANSWERED,
+    RESUMED,
+    accept_answer,
+    pending_question,
+    publish_codex_question,
+    route_answer_from_source,
+    task_projection,
+    wait_for_answer,
+)
+
+
+@pytest.fixture
+def board(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    return home
+
+
+def _running(conn, title: str = "AI Colleague"):
+    task_id = kb.create_task(conn, title=title, assignee="worker")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (task_id,))
+    task = kb.claim_task(conn, task_id, claimer="worker")
+    assert task is not None and task.current_run_id is not None
+    return task
+
+
+def _params(question: str = "这次 Holiday Remote 验收结果选择哪项？") -> dict:
+    return {
+        "isBlocking": True,
+        "threadId": "codex-thread",
+        "turnId": "codex-turn",
+        "itemId": "ask-item",
+        "questions": [{
+            "id": "holiday-result",
+            "header": "Holiday Remote",
+            "question": question,
+            "isOther": True,
+            "options": [
+                {"label": "PASS", "description": "推荐"},
+                {"label": "FAIL", "description": "验收失败"},
+                {"label": "Other", "description": "其他"},
+            ],
+        }],
+    }
+
+
+def _subscribe(conn, task_id: str, chat: str = "chat-1") -> None:
+    kbn.add_notify_sub(
+        conn, task_id=task_id, platform="telegram", chat_id=chat,
+        user_id="human", notifier_profile="main",
+    )
+
+
+def test_real_question_projects_waiting_human_but_ordinary_events_do_not(board: Path) -> None:
+    with kbc.connect() as conn:
+        task = _running(conn)
+        _subscribe(conn, task.id)
+        assert task_projection(conn, task.id) is None
+        with kb.write_txn(conn):
+            kb._append_event(conn, task.id, "crashed", {"error": "ordinary"}, run_id=task.current_run_id)
+        assert task_projection(conn, task.id) is None
+
+        published = publish_codex_question(conn, task.id, task.current_run_id, _params(), board="default")
+        projection = task_projection(conn, task.id)
+        assert projection == {
+            "state": "WAITING_HUMAN",
+            "delivery_state": "PENDING_DELIVERY",
+            "project": "AI Colleague",
+            "question_identity": published.question_identity,
+            "question": "这次 Holiday Remote 验收结果选择哪项？",
+            "choices": published.envelope["choices"],
+            "created_at": published.envelope["created_at"],
+        }
+
+
+def test_exact_answer_resumes_same_task_once(board: Path) -> None:
+    with kbc.connect() as conn:
+        task = _running(conn)
+        _subscribe(conn, task.id)
+        pending = publish_codex_question(conn, task.id, task.current_run_id, _params(), board="default")
+        # A pinned HERMES_KANBAN_DB can appear under more than one board
+        # metadata entry; routing must scan that physical DB only once.
+        kb.create_board("same-pinned-db")
+        result: dict = {}
+
+        def waiter() -> None:
+            with kbc.connect() as wait_conn:
+                result.update(wait_for_answer(wait_conn, pending, poll_seconds=0.01))
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        routed = route_answer_from_source(
+            platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="human", profile="main", text="1",
+        )
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert routed["outcome"] == "accepted"
+        assert result == {"answers": {"holiday-result": {"answers": ["PASS"]}}}
+        assert kb.get_task(conn, task.id).current_run_id == task.current_run_id
+        kinds = [event.kind for event in kb.list_events(conn, task.id)]
+        assert kinds.count(ANSWERED) == 1
+        assert kinds.count(RESUMED) == 1
+
+        duplicate = route_answer_from_source(
+            platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="human", profile="main", text="1",
+        )
+        assert duplicate["outcome"] == "stale"
+        kinds = [event.kind for event in kb.list_events(conn, task.id)]
+        assert kinds.count(ANSWERED) == 1
+        assert kinds.count(RESUMED) == 1
+
+
+def test_two_pending_tasks_require_explicit_task_identity(board: Path) -> None:
+    with kbc.connect() as conn:
+        first = _running(conn, "Project A")
+        second = _running(conn, "Project B")
+        for task in (first, second):
+            _subscribe(conn, task.id)
+            publish_codex_question(
+                conn, task.id, task.current_run_id,
+                _params(f"{task.title} 选择？"), board="default",
+            )
+
+        ambiguous = route_answer_from_source(
+            platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="human", profile="main", text="1",
+        )
+        assert ambiguous["outcome"] == "ambiguous"
+        assert {item["task_id"] for item in ambiguous["tasks"]} == {first.id, second.id}
+        assert pending_question(conn, first.id) is not None
+        assert pending_question(conn, second.id) is not None
+
+        exact = route_answer_from_source(
+            platform="telegram", chat_id="chat-1", thread_id=None,
+            user_id="human", profile="main", text=f"{second.id}: 1",
+        )
+        assert exact["outcome"] == "accepted"
+        assert pending_question(conn, first.id) is not None
+        assert pending_question(conn, second.id) is None
+
+
+def test_question_without_delivery_route_stays_visible_undelivered(board: Path) -> None:
+    with kbc.connect() as conn:
+        task = _running(conn)
+        publish_codex_question(conn, task.id, task.current_run_id, _params(), board="default")
+        projection = task_projection(conn, task.id)
+        assert projection is not None
+        assert projection["state"] == "WAITING_HUMAN"
+        assert projection["delivery_state"] == "HUMAN_QUESTION_UNDELIVERED"
+
+
+def test_recommendation_is_only_projected_when_executor_marks_it(board: Path) -> None:
+    params = _params()
+    for option in params["questions"][0]["options"]:
+        option["description"] = "ordinary choice"
+    with kbc.connect() as conn:
+        task = _running(conn)
+        _subscribe(conn, task.id)
+        pending = publish_codex_question(
+            conn, task.id, task.current_run_id, params, board="default",
+        )
+        assert pending.envelope["recommended_choice"] is None
+
+
+def test_stale_or_wrong_question_identity_never_answers_task(board: Path) -> None:
+    with kbc.connect() as conn:
+        task = _running(conn)
+        _subscribe(conn, task.id)
+        pending = publish_codex_question(conn, task.id, task.current_run_id, _params(), board="default")
+        assert accept_answer(conn, task.id, task.current_run_id, "wrong", "1") == ("missing", None)
+        assert pending_question(conn, task.id).question_identity == pending.question_identity

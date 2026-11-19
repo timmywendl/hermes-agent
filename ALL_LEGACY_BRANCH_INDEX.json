@@ -1,0 +1,201 @@
+{
+  "branch_states": [
+    {
+      "local_branch": "refs/heads/backup/pre-dashboard-session-self-heal-20260930",
+      "source_commit": "0428605038d3bd63be3dae709675a236b93c7e9b"
+    },
+    {
+      "local_branch": "refs/heads/backup/pre-holiday-human-blocker-delivery-20260930",
+      "source_commit": "0428605038d3bd63be3dae709675a236b93c7e9b"
+    },
+    {
+      "local_branch": "refs/heads/backup/pre-holiday-human-blocker-delivery-broken-20261001",
+      "source_commit": "bedc87034e2156a5df8b354a323201272d971632"
+    },
+    {
+      "local_branch": "refs/heads/backup/pre-issue77-local-backport-20260929",
+      "source_commit": "33a30fdd815a965b59dd38aae74a67ecec7b0cca"
+    },
+    {
+      "local_branch": "refs/heads/backup/pre-semantic-control-router-20260930",
+      "source_commit": "27f4156ca0d43398a37ca6a2f650013d1cbab22a"
+    },
+    {
+      "local_branch": "refs/heads/backup/pre-t4-telegram-router-20260930",
+      "source_commit": "91f85eabbb46cb00f57887ffb9faede776a40596"
+    },
+    {
+      "local_branch": "refs/heads/docs/created-origin-retention-source-ready",
+      "source_commit": "42111de70d3b52ed3fcd602fb64e1ab56c1c705b"
+    },
+    {
+      "local_branch": "refs/heads/feat/native-turn-response-gate",
+      "source_commit": "501a7af3be041b01790131ee1f436c523463d919"
+    },
+    {
+      "local_branch": "refs/heads/feat/native-turn-response-gate-v0223",
+      "source_commit": "39610b4e9db83bee8d05f5738915ca1e5bf55e7a"
+    },
+    {
+      "local_branch": "refs/heads/fix/dashboard-chrome-mcp-tcc-repair-v1",
+      "source_commit": "f56160f5e4c2728cd3712bd95731bab04809ef9d"
+    },
+    {
+      "local_branch": "refs/heads/fix/dashboard-chrome-mcp-tcc-repair-v1-pr",
+      "source_commit": "36a1488be1351163a441f3868f602d04ef1d666b"
+    },
+    {
+      "local_branch": "refs/heads/fix/issue92-completion-contract-integration-v1",
+      "source_commit": "c3dee076e94b18df289cdc7910dbfec6a37c0494"
+    },
+    {
+      "local_branch": "refs/heads/fix/k2-managed-worker-runtime-routing",
+      "source_commit": "df363d4e02ead558088da05ed1a9d9bf93720a9b"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-bound-decision-resume-v1",
+      "source_commit": "4f258f65ab71b4907a57480b8123fc957b3b6ec1"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-completion-projection-forkbase",
+      "source_commit": "e32a90e9f11c5130897839c0292fa321ddc47b5e"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-completion-projection-forkmain",
+      "source_commit": "acc3cada0da86c81efc8aa6c5a291989549ca900"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-completion-projection-upstream",
+      "source_commit": "b1dd8968068e3768ff46e8a7cbe8432017af72a8"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-completion-receipt-v3",
+      "source_commit": "8d32080d0612c0c7e40f80b2367e22575eb5cf33"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-completion-safe-projection-v1",
+      "source_commit": "5d6854ef162b4a89715541ce7ee0ea9f10e9c5a7"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-create-origin-from-turn-bridge",
+      "source_commit": "adebb5ebb3ba3627be003de2211927c486c08ba3"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-create-originating-subscription-v1",
+      "source_commit": "70a1af647855a278f808efd97d8c2cc05e0af96f"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-created-origin-retention-v1",
+      "source_commit": "d91108050e3226eb306e445609247daf184929aa"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-locales-packaging-v1",
+      "source_commit": "e249d393d93e21a3bb7635b6756a32381249e9a4"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-locales-packaging-v2",
+      "source_commit": "ad2841fe37c7e37480e28119893d21e4adaeca37"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-review-lane-no-verdict-v1",
+      "source_commit": "ef75bc708867e3884cb40a91363be6dc6fddc034"
+    },
+    {
+      "local_branch": "refs/heads/fix/kanban-typed-receipt-v2",
+      "source_commit": "35ff423bf5721cebca0726b4ba1fe23d728124ef"
+    },
+    {
+      "local_branch": "refs/heads/fix/macos27-bundled-tcc-host-v1",
+      "source_commit": "613f7ac5d59d928c80650244185bd98218783801"
+    },
+    {
+      "local_branch": "refs/heads/fix/macos27-foreground-tcc-capability-proof-v1",
+      "source_commit": "725a51461f5d0089699fb9dc2aa3f2cfbf32f424"
+    },
+    {
+      "local_branch": "refs/heads/fix/native-k2-terminal-handoff",
+      "source_commit": "31f9324df6225203e7676df938dcfa648b36fa39"
+    },
+    {
+      "local_branch": "refs/heads/fix/p0-plugin-load-ingress-self-recovery",
+      "source_commit": "11ac50d56d0280f5ca50a40c25524a0563a12cbb"
+    },
+    {
+      "local_branch": "refs/heads/fix/telegram-delivery-recovery-1030",
+      "source_commit": "208ea188529a972b049cc2202e02ad44e13c9110"
+    },
+    {
+      "local_branch": "refs/heads/fix/telegram-status-intent-substantive-result-delivery-v1",
+      "source_commit": "e6575193d44c6ce67ade9914a445ed1da90f2162"
+    },
+    {
+      "local_branch": "refs/heads/impl/created-origin-retention-gc-tests",
+      "source_commit": "8592e14150a96afb9295262f08eda44177cc4785"
+    },
+    {
+      "local_branch": "refs/heads/impl/created-origin-retention-graph-tests",
+      "source_commit": "3f41e4095473bed671ca6e579e0f7bd6ef15848c"
+    },
+    {
+      "local_branch": "refs/heads/impl/created-origin-retention-origin-tests",
+      "source_commit": "b0aef86df71065ac7c4e879a4113bc455634d58f"
+    },
+    {
+      "local_branch": "refs/heads/impl/created-origin-retention-runtime",
+      "source_commit": "3045f6ff00eafcf82d797e92ce0d5fff6a49a053"
+    },
+    {
+      "local_branch": "refs/heads/local/dashboard-session-self-heal-20260930",
+      "source_commit": "11ac50d56d0280f5ca50a40c25524a0563a12cbb"
+    },
+    {
+      "local_branch": "refs/heads/local/holiday-human-blocker-delivery-20260930",
+      "source_commit": "0428605038d3bd63be3dae709675a236b93c7e9b"
+    },
+    {
+      "local_branch": "refs/heads/local/issue77-kanban-fresh-base",
+      "source_commit": "91f85eabbb46cb00f57887ffb9faede776a40596"
+    },
+    {
+      "local_branch": "refs/heads/local/semantic-control-router-20260930",
+      "source_commit": "0428605038d3bd63be3dae709675a236b93c7e9b"
+    },
+    {
+      "local_branch": "refs/heads/local/t4-telegram-router-20260930",
+      "source_commit": "27f4156ca0d43398a37ca6a2f650013d1cbab22a"
+    },
+    {
+      "local_branch": "refs/heads/main",
+      "source_commit": "33a30fdd815a965b59dd38aae74a67ecec7b0cca"
+    },
+    {
+      "local_branch": "refs/heads/feat/stage3-g2-workspace-source-candidate",
+      "source_commit": "f017baf2a4527935ba339165407a7a92dc21737b"
+    },
+    {
+      "local_branch": "refs/heads/feat/stage3-workspace-source-ready-v1",
+      "source_commit": "8009e277d82328dbc7e98538fa9ec6fbec2f330f"
+    },
+    {
+      "local_branch": "refs/heads/fix/native-k2-terminal-handoff",
+      "source_commit": "7ce2a84ab2a72c65cfab78e3cc3e97ecf6723f19"
+    },
+    {
+      "local_branch": "refs/heads/main",
+      "source_commit": "09cf64ed8c3903edbe0a9fba8c68243b6fe2766b"
+    },
+    {
+      "local_branch": "refs/heads/test/q1-vz-stop-candidate",
+      "source_commit": "6226dcaf4ca26a271384ba581158530f71546a25"
+    },
+    {
+      "local_branch": "refs/heads/test/q1-vz-transport-candidate",
+      "source_commit": "1fd159291fe799fd0118480b136bf9950bf941e8"
+    },
+    {
+      "local_branch": "refs/heads/test/stage3-q1-native-vz-harness-v1",
+      "source_commit": "445c3e0c42ddf0807b25502fc258e05c7a8745f4"
+    }
+  ],
+  "purpose": "All local branch tips have a corresponding sanitized snapshot manifest or an already-covered original source state. Original source commit identifiers are provenance, not a claim that the old Git history was pushed."
+}

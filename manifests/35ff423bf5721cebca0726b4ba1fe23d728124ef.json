@@ -1,0 +1,333 @@
+{
+  "source_commit": "35ff423bf5721cebca0726b4ba1fe23d728124ef",
+  "base_commit": "60344574963861ee5d50b980338878be4f5b73af",
+  "same_as_base_source_files": 17143,
+  "different_source_files": [
+    {
+      "path": "agent/managed_worker.py",
+      "source_sha256": "0fbcbc9889cb010f978a01b814c35bced6b7ab444f2b9c2aba4d079617d0e625",
+      "archived_sha256": "0fbcbc9889cb010f978a01b814c35bced6b7ab444f2b9c2aba4d079617d0e625",
+      "mode": "100644",
+      "origin": "git_blob:83f8c198137911529c79b8ac44efa630fc171176",
+      "redacted": false
+    },
+    {
+      "path": "gateway/kanban_pr_receipt.py",
+      "source_sha256": "8a9f2c6136a0f554d1160f65864667aa3fc31a4ccfaca43c77f40cae24ad4b3e",
+      "archived_sha256": "28fb5a70f7818f618b68fdb99f5dc8bb9a267e10a56542b0435bd4bc7992d070",
+      "mode": "100644",
+      "origin": "git_blob:18b1a4c2eefe9af41abcd82050305562ec0d34f0",
+      "redacted": true
+    },
+    {
+      "path": "gateway/kanban_watchers.py",
+      "source_sha256": "29ff0f9cbb72603a2b46e07e303bd1f002c31bcac45dac51322b0e10fc066f18",
+      "archived_sha256": "29ff0f9cbb72603a2b46e07e303bd1f002c31bcac45dac51322b0e10fc066f18",
+      "mode": "100644",
+      "origin": "git_blob:cf4bff7909e2bb6dbe241b96bc31501da0208d89",
+      "redacted": false
+    },
+    {
+      "path": "gateway/kanban_watchers_notifier.py",
+      "source_sha256": "4725ab9f16ea04982028fa75c5a871a8e00a430ad0be6ce9d6cfd1e2decbc737",
+      "archived_sha256": "4725ab9f16ea04982028fa75c5a871a8e00a430ad0be6ce9d6cfd1e2decbc737",
+      "mode": "100644",
+      "origin": "git_blob:d06ea7fcf0a9485e2b54afa8e4dc85e15549c373",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban.py",
+      "source_sha256": "14131a7111cf9d30b735cdbc9c44f979228a8b1311b67c8c00c0f92cc33bc72d",
+      "archived_sha256": "14131a7111cf9d30b735cdbc9c44f979228a8b1311b67c8c00c0f92cc33bc72d",
+      "mode": "100644",
+      "origin": "git_blob:e1c36a8111989198caa488fddb68bff30684e428",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db.py",
+      "source_sha256": "d01f95e025fe16eee9dfdc8b5422946651aea3946967f4361411bce1f9ca9fb1",
+      "archived_sha256": "d01f95e025fe16eee9dfdc8b5422946651aea3946967f4361411bce1f9ca9fb1",
+      "mode": "100644",
+      "origin": "git_blob:b038e547c52f0a3df058b3a1dba59e01f3c66cd2",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_dispatch.py",
+      "source_sha256": "eaad8bf5e59335c1413db1afab83f87e3a1d7df1ffca1bd834e20c755feac447",
+      "archived_sha256": "eaad8bf5e59335c1413db1afab83f87e3a1d7df1ffca1bd834e20c755feac447",
+      "mode": "100644",
+      "origin": "git_blob:1e01999a2f103f8451faabaf2ebef05d6f81703f",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_db_workspace.py",
+      "source_sha256": "64f745f0f69e3730917f81971f462c4f73cd2678ce3b001bdb47cf6864482e4f",
+      "archived_sha256": "64f745f0f69e3730917f81971f462c4f73cd2678ce3b001bdb47cf6864482e4f",
+      "mode": "100644",
+      "origin": "git_blob:0e9f71b3301598c189f8d887ac5e4952a1434d9d",
+      "redacted": false
+    },
+    {
+      "path": "hermes_cli/kanban_ops.py",
+      "source_sha256": "b8169b47b10d0ce5878fbc55dcac7b3b23735763955d1806f8026e9386dd7058",
+      "archived_sha256": "b8169b47b10d0ce5878fbc55dcac7b3b23735763955d1806f8026e9386dd7058",
+      "mode": "100644",
+      "origin": "git_blob:37acd1872ec47309bbb92f35f36826d673c88cf1",
+      "redacted": false
+    },
+    {
+      "path": "hermes_state_worker_context.py",
+      "source_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "archived_sha256": "c6e624108a97dc1a094374dee4947af8c6f9e7763a81a3d4ed212b660560277f",
+      "mode": "100644",
+      "origin": "git_blob:b132aa4137ecd96c9ba33c6bebc6d5ff257c1077",
+      "redacted": false
+    },
+    {
+      "path": "locales/af.yaml",
+      "source_sha256": "d040d2168144eb599a128df99075edaecbde8ef56268e66cac482b618f7f680b",
+      "archived_sha256": "d040d2168144eb599a128df99075edaecbde8ef56268e66cac482b618f7f680b",
+      "mode": "100644",
+      "origin": "git_blob:e7bdfb0e9a9daaa5567f1b8e915a25e609c73006",
+      "redacted": false
+    },
+    {
+      "path": "locales/ar.yaml",
+      "source_sha256": "cae1fcdb36b5b26442db4b14f363c3f1fb9126ee13ef7e7e99de84bb2a36dbd6",
+      "archived_sha256": "cae1fcdb36b5b26442db4b14f363c3f1fb9126ee13ef7e7e99de84bb2a36dbd6",
+      "mode": "100644",
+      "origin": "git_blob:c5cbf51d398f19fbdfc36b327f81db9039284bdd",
+      "redacted": false
+    },
+    {
+      "path": "locales/de.yaml",
+      "source_sha256": "9a553fc957c1917b65015c3f0c8eb23eacd640df9ee8101596d256078b31d13c",
+      "archived_sha256": "9a553fc957c1917b65015c3f0c8eb23eacd640df9ee8101596d256078b31d13c",
+      "mode": "100644",
+      "origin": "git_blob:43b92de53679ed019a1e35b988137fb30c8aaf5f",
+      "redacted": false
+    },
+    {
+      "path": "locales/en.yaml",
+      "source_sha256": "842ad851a76b8e6232b140a626fc26eff57f8b1fba6341ddf6baf51e689522ac",
+      "archived_sha256": "842ad851a76b8e6232b140a626fc26eff57f8b1fba6341ddf6baf51e689522ac",
+      "mode": "100644",
+      "origin": "git_blob:f3865e4bcdd27a885a89b4d2c5d156612efaaaab",
+      "redacted": false
+    },
+    {
+      "path": "locales/es.yaml",
+      "source_sha256": "2496572698d7c09ff24499f11c4cf158908863e2166d6ff8ff04b229906ace58",
+      "archived_sha256": "2496572698d7c09ff24499f11c4cf158908863e2166d6ff8ff04b229906ace58",
+      "mode": "100644",
+      "origin": "git_blob:93d66cc709a4b8bec46977aa6976979e81169b0a",
+      "redacted": false
+    },
+    {
+      "path": "locales/fr.yaml",
+      "source_sha256": "c17f8657f6ce88cb0bf7f7d2dfe62cfe36200d8dc11a84d2963edd3e6569ea8f",
+      "archived_sha256": "c17f8657f6ce88cb0bf7f7d2dfe62cfe36200d8dc11a84d2963edd3e6569ea8f",
+      "mode": "100644",
+      "origin": "git_blob:db9877ca42ef9c8b3fc602c20ce6aec2e0583b52",
+      "redacted": false
+    },
+    {
+      "path": "locales/ga.yaml",
+      "source_sha256": "b68fe59a01185135ea347eae71587c4cab0bfcd29dfade160230abef3041a71d",
+      "archived_sha256": "b68fe59a01185135ea347eae71587c4cab0bfcd29dfade160230abef3041a71d",
+      "mode": "100644",
+      "origin": "git_blob:a480e1f5fa6bf119b8f35cd193ab4dac59f93a81",
+      "redacted": false
+    },
+    {
+      "path": "locales/hu.yaml",
+      "source_sha256": "06a989040c0c5869b9f0524353b429a188e0f7beb84f2c683d142986051388ec",
+      "archived_sha256": "06a989040c0c5869b9f0524353b429a188e0f7beb84f2c683d142986051388ec",
+      "mode": "100644",
+      "origin": "git_blob:a7cf3f3dda9b440d7bd893c44367515ec535d7b0",
+      "redacted": false
+    },
+    {
+      "path": "locales/it.yaml",
+      "source_sha256": "059eb337b521c0af7498c7edaa3fe724309232597f0be8c5e9a08d35b96b408d",
+      "archived_sha256": "059eb337b521c0af7498c7edaa3fe724309232597f0be8c5e9a08d35b96b408d",
+      "mode": "100644",
+      "origin": "git_blob:9f5bcbef9470d546aafc452599134d5ed997bae3",
+      "redacted": false
+    },
+    {
+      "path": "locales/ja.yaml",
+      "source_sha256": "b28687356db5d9fc6716d30d62252835ad2e25e946216fa21176b1233d486f53",
+      "archived_sha256": "b28687356db5d9fc6716d30d62252835ad2e25e946216fa21176b1233d486f53",
+      "mode": "100644",
+      "origin": "git_blob:7b74acd17c80e7a5575805577cd7fe20498fcf0f",
+      "redacted": false
+    },
+    {
+      "path": "locales/ko.yaml",
+      "source_sha256": "22695e6ecb739ad269819e9942717b5058a12174e2a971f7d7233ce318491897",
+      "archived_sha256": "22695e6ecb739ad269819e9942717b5058a12174e2a971f7d7233ce318491897",
+      "mode": "100644",
+      "origin": "git_blob:3f07fa541a011db0723bfa4d658770f950edf96f",
+      "redacted": false
+    },
+    {
+      "path": "locales/pt.yaml",
+      "source_sha256": "6d7dde25c038a4e669fc0f065bb6f8c02e49b53484e2748375cfd96c2db7203c",
+      "archived_sha256": "6d7dde25c038a4e669fc0f065bb6f8c02e49b53484e2748375cfd96c2db7203c",
+      "mode": "100644",
+      "origin": "git_blob:16b4c3dfa48febf9ce2027691abc8f9300ccfc3a",
+      "redacted": false
+    },
+    {
+      "path": "locales/ru.yaml",
+      "source_sha256": "b279cba45b454d9b370e93791b475e9dc8905ee1ebfd9f16f81d933cb4efa497",
+      "archived_sha256": "b279cba45b454d9b370e93791b475e9dc8905ee1ebfd9f16f81d933cb4efa497",
+      "mode": "100644",
+      "origin": "git_blob:e8723e53287b434973bd6b036775e6f0db1e665d",
+      "redacted": false
+    },
+    {
+      "path": "locales/tr.yaml",
+      "source_sha256": "3fb0dae53a5175e0769c28b4c85688a66d742bb9ab1969c669f4dc6b35c38f20",
+      "archived_sha256": "3fb0dae53a5175e0769c28b4c85688a66d742bb9ab1969c669f4dc6b35c38f20",
+      "mode": "100644",
+      "origin": "git_blob:566e1d19266856e9a91be146acf07dce57aca20a",
+      "redacted": false
+    },
+    {
+      "path": "locales/uk.yaml",
+      "source_sha256": "bfe458c91918c31de7db9ebf7e1208f86fa1a9fd5e7b9bbe1a27bf970875f7a5",
+      "archived_sha256": "bfe458c91918c31de7db9ebf7e1208f86fa1a9fd5e7b9bbe1a27bf970875f7a5",
+      "mode": "100644",
+      "origin": "git_blob:8bd33c02378322ad80dd1b3cd7dc0f93946b62cf",
+      "redacted": false
+    },
+    {
+      "path": "locales/zh-hant.yaml",
+      "source_sha256": "44bad54c456e44edab0af3127c6de186f0efe07ea61a243d9f2923467f9b4ec1",
+      "archived_sha256": "44bad54c456e44edab0af3127c6de186f0efe07ea61a243d9f2923467f9b4ec1",
+      "mode": "100644",
+      "origin": "git_blob:41a154046811b7749887137d6b552a0870dbdb34",
+      "redacted": false
+    },
+    {
+      "path": "locales/zh.yaml",
+      "source_sha256": "e2353b2de752a80de02c9f2dc1841d8c181d2608e661315ab6d1ac161dcb5b5b",
+      "archived_sha256": "e2353b2de752a80de02c9f2dc1841d8c181d2608e661315ab6d1ac161dcb5b5b",
+      "mode": "100644",
+      "origin": "git_blob:ea6903d29186159ffceabda5b41ae5f4b9c0cae6",
+      "redacted": false
+    },
+    {
+      "path": "tests/agent/transports/test_hermes_tools_mcp_server.py",
+      "source_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "archived_sha256": "410b378d88eec3adf1fa232b2cdc0011b36d899a69826c2ec372f41d0a3c163f",
+      "mode": "100644",
+      "origin": "git_blob:30be55bc991b6e86eaa11afb837666aebdf0c83d",
+      "redacted": false
+    },
+    {
+      "path": "tests/gateway/test_kanban_artifact_declaration.py",
+      "source_sha256": "9484998fd3b45c84e44f44d46e9b424ca5643a49cd4168c9c3e7cbdb9de48b5b",
+      "archived_sha256": "65de8a066359be9fa05a1f39e254bd60509c084006390acdd7d8cf23d8bde9fd",
+      "mode": "100644",
+      "origin": "git_blob:7a719ce08aa5004b2500a8c54a7b8afcd3fb0630",
+      "redacted": true
+    },
+    {
+      "path": "tests/gateway/test_kanban_completion_collector_binding.py",
+      "source_sha256": "cfa2677b66d2aa6ceaa540a9ba1c8a2457c70056f373169a1b3268971e010fc4",
+      "archived_sha256": "cfa2677b66d2aa6ceaa540a9ba1c8a2457c70056f373169a1b3268971e010fc4",
+      "mode": "100644",
+      "origin": "git_blob:cf60403faafb03bc2fe549a121ab5403cc8dfb2f",
+      "redacted": false
+    },
+    {
+      "path": "tests/gateway/test_kanban_completion_safe_projection.py",
+      "source_sha256": "89f1595e5522eff048283f2e229529dc5bf260532a56afcaaeaf2f3348bd607d",
+      "archived_sha256": "0286b484cd529ccad88c585a5287fec570ed46d5276a106f1c55a11e888fc4c9",
+      "mode": "100644",
+      "origin": "git_blob:0793b6ee2bf8aa8ad39f48cf00971b4b02303704",
+      "redacted": true
+    },
+    {
+      "path": "tests/gateway/test_kanban_pr_receipt_verification.py",
+      "source_sha256": "d74497468623e383c4c38a7eed9817f59cc6b74e5ca6f9b8c94b6d19cf9e7262",
+      "archived_sha256": "d74497468623e383c4c38a7eed9817f59cc6b74e5ca6f9b8c94b6d19cf9e7262",
+      "mode": "100644",
+      "origin": "git_blob:aa656ce758f73dbd7cd1c9985badad7000200773",
+      "redacted": false
+    },
+    {
+      "path": "tests/gateway/test_managed_worker_routing_kwargs.py",
+      "source_sha256": "caf1b789cbf9f4ef959ed3c6e9d82cac5a38b93d8bc8175d8e15b41baa4fc3a4",
+      "archived_sha256": "caf1b789cbf9f4ef959ed3c6e9d82cac5a38b93d8bc8175d8e15b41baa4fc3a4",
+      "mode": "100644",
+      "origin": "git_blob:128793197b75d7886f73217db8ba4d1e845a7f12",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_creator_origin.py",
+      "source_sha256": "840ffdac42d995d05b1027bff19da1332dd4407347bb6e2ec1c1cc453e6c1106",
+      "archived_sha256": "840ffdac42d995d05b1027bff19da1332dd4407347bb6e2ec1c1cc453e6c1106",
+      "mode": "100644",
+      "origin": "git_blob:4402b201a804430b47e36d7f147870839100e760",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_gc_retention.py",
+      "source_sha256": "eba984b5328e4dc4c762f596aeb8940bb434de1c242b9632df50606f14af4ea3",
+      "archived_sha256": "eba984b5328e4dc4c762f596aeb8940bb434de1c242b9632df50606f14af4ea3",
+      "mode": "100644",
+      "origin": "git_blob:9e8c923c73c835903d080c051ce76f949332c309",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_graph_identity.py",
+      "source_sha256": "f3b4d861b3480938dfe1e886b214e3bc64c9412bab07e689dd9262f2a917072b",
+      "archived_sha256": "f3b4d861b3480938dfe1e886b214e3bc64c9412bab07e689dd9262f2a917072b",
+      "mode": "100644",
+      "origin": "git_blob:29c434caf5bad3c328f0a76d40460376e3ec9b98",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_scratch_artifact_ownership.py",
+      "source_sha256": "58040b57e1caa044081c982034f0878cee9d3ce54f0b02c760fabba76926c2e0",
+      "archived_sha256": "58040b57e1caa044081c982034f0878cee9d3ce54f0b02c760fabba76926c2e0",
+      "mode": "100644",
+      "origin": "git_blob:65c4d4f116a46469cdd1da5b4e459cf2018eabb9",
+      "redacted": false
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worktree_isolation.py",
+      "source_sha256": "a77a137fa8bb3716406e07dbefd269fedfbaabc6f368af9b4d3e33d98faaf61d",
+      "archived_sha256": "0a671a98e8ae3be8d6d2127808d9126496c19a75ecc49297efb57844b2836ac7",
+      "mode": "100644",
+      "origin": "git_blob:10a9ab1afff13a9d6fb1b1e6b27dd75917031ad9",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_cli/test_kanban_worktree_teardown.py",
+      "source_sha256": "dddf6b50d82e43e41f268b6d4694054fc6cb842d106c07a72d05b88d31bd1544",
+      "archived_sha256": "cf7a7736c7a9c6c8814624511edfa815b626c624a9b78aafb83b1b1d2ef7e08c",
+      "mode": "100644",
+      "origin": "git_blob:1d9458940d736c79d967a9a277b67f1a663f4faf",
+      "redacted": true
+    },
+    {
+      "path": "tests/hermes_state/test_runtime_worker_context.py",
+      "source_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "archived_sha256": "79951369449f9c9379ef658247263ee0a25397100ae3c88946299d4f9280640e",
+      "mode": "100644",
+      "origin": "git_blob:51b8cc96d5b131313534c08f4d72aea2baf39827",
+      "redacted": false
+    }
+  ],
+  "base_paths_absent_in_original_tree": [
+    "tests/gateway/test_guest_worker_boundary.py",
+    "tests/gateway/test_guest_worker_stop.py",
+    "tests/gateway/test_guest_worker_transport.py"
+  ],
+  "scope": "Additional unchecked-out historical branch state; sanitized source snapshot only, no private history or runtime data."
+}

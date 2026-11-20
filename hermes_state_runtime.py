@@ -631,7 +631,7 @@ def _worker_append(db, conn, session_id, payload):
     return {'count': count, 'annotations': row_annotations(messages)}
 
 
-def _worker_turn(db, conn, session_id, payload, operation):
+def _worker_turn(db, conn, session_id, payload, operation, *, holder_is_dead=None):
     import time
     from hermes_state_compression import _claim_lease_row
     from hermes_state import _compression_lock_holder_process_is_dead
@@ -647,7 +647,7 @@ def _worker_turn(db, conn, session_id, payload, operation):
     if operation == 'turn.acquire':
         value = _claim_lease_row(conn, 'session_turn_leases', 'conversation_id', key,
             holder, now, now + ttl,
-            lambda h, e: float(e) <= now or _compression_lock_holder_process_is_dead(h))[0]
+            lambda h, e: float(e) <= now or (holder_is_dead or _compression_lock_holder_process_is_dead)(h))[0]
     elif operation == 'turn.renew':
         value = conn.execute('UPDATE session_turn_leases SET expires_at=? WHERE conversation_id=? AND holder=?',
                              (now + ttl, key, holder)).rowcount > 0

@@ -91,12 +91,16 @@ def _result_ready(db, conn, session_id, payload):
 
 def _guest_handlers():
     from hermes_state_runtime import _worker_append, _worker_turn, _worker_usage
+    from gateway.session_worker_guest_context import guest_context_handlers, guest_compression_handlers
     return {
+        **guest_context_handlers(), **guest_compression_handlers(),
         'transcript.append': _worker_append,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
         'guest.result_ready': _result_ready,
-        **{name: (lambda db, conn, sid, p, op=name: _worker_turn(db, conn, sid, p, op))
+        # A Guest holder is an opaque lease identity, never a Host PID proof.
+        **{name: (lambda db, conn, sid, p, op=name: _worker_turn(db, conn, sid, p, op,
+                                                              holder_is_dead=lambda _holder: False))
            for name in ('turn.acquire', 'turn.renew', 'turn.release')},
     }
 
@@ -172,6 +176,55 @@ class GuestOwnerEndpoint:
                                (self.scope['execution_id'],)).fetchone()
             return _worker_public(row)
         return self.authority.db._execute_write(write)
+
+    def prepare_work(self, policy):
+        """Read an original claimed Task into non-secret Guest work data.
+
+        This snapshot is not launch authority; the native acquisition path must
+        revalidate its durable Board custody before any physical operation.
+        """
+        from pathlib import Path
+        import time
+        from agent.runtime_session_guest import validate_guest_work
+        from hermes_cli import kanban_db as kb
+        from hermes_cli.kanban_db_connect import connect_closing
+        from hermes_cli.kanban_db_workspace import _created_workspace_admission
+        with self.lock:
+            if self.revoked:
+                raise RuntimeStoreError('guest_channel_revoked')
+            with self.authority.db._read_ctx() as conn:
+                self._verify(conn)
+                if _session(conn, self.scope['session_id'])['source'] != 'kanban' or policy.source != 'kanban':
+                    raise RuntimeStoreError('guest_session_not_admitted')
+            context = json.loads(policy.kanban_json)
+            if (context['task_id'] != self.scope['task_id'] or context['run_id'] != self.scope['run_id']):
+                raise RuntimeStoreError('stale_kanban_claim')
+            path = Path(context['db']).resolve(strict=True)
+            with connect_closing(path) as conn, kb.write_txn(conn):
+                task = kb.get_task(conn, self.scope['task_id'])
+                run = conn.execute('SELECT * FROM task_runs WHERE id=?', (self.scope['run_id'],)).fetchone()
+                if (task is None or run is None or task.status != 'running' or run['status'] != 'running'
+                        or task.current_run_id != self.scope['run_id'] or run['task_id'] != task.id
+                        or task.claim_lock != context['claim_lock'] or run['claim_lock'] != task.claim_lock
+                        or type(task.claim_expires) is not int or task.claim_expires <= int(time.time())):
+                    raise RuntimeStoreError('stale_kanban_claim')
+                admission = _created_workspace_admission(conn, task.id)
+                if (admission is None or task.workspace_kind != 'worktree'
+                        or task.workspace_path != admission['workspace_path']
+                        or task.branch_name != admission['branch_name']):
+                    raise RuntimeStoreError('guest_workspace_not_admitted')
+                marker = conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' "
+                    "ORDER BY id DESC LIMIT 1", (task.id, run['id'])).fetchone()
+                if marker is None or json.loads(marker[0]).get('session_id') != self.scope['session_id']:
+                    raise RuntimeStoreError('guest_session_not_admitted')
+                return validate_guest_work({
+                    'version': 'HERMES_GUEST_WORK_V1', 'assignment': self.scope,
+                    'title': task.title, 'body': task.body or '', 'repo': admission['repo'],
+                    'base_commit': admission['base_commit'], 'branch': admission['branch_name'],
+                    'workspace': '/task', 'model': policy.model, 'completion_contract': task.completion_contract or '',
+                    'role': 'reviewer' if kb._retry_status_for_run(conn, task.id, run['id']) == 'review' else 'developer',
+                })
 
     def _guard(self, handler):
         def write(db, conn, session_id, payload):

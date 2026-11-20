@@ -53,16 +53,29 @@ def guest_history(db, conn, session_id, payload):
     return worker_history(db, conn, session_id, payload)
 
 
-def guest_create(db, conn, session_id, payload):
+def guest_create(db, conn, session_id, payload, *, scope):
     from hermes_state_worker_lifecycle import worker_create
-    if (not isinstance(payload, dict) or payload.get('cwd') not in (None, '/task')
-            or payload.get('git_repo_root') not in (None, '/task')):
+    identity = {'cwd': '/task', 'git_repo_root': '/task', 'user_id': '', 'chat_id': '',
+                'session_key': 'guest:' + scope['execution_id'], 'profile_name': 'default'}
+    if (not isinstance(payload, dict)
+            or any(payload.get(key) not in (None, value) for key, value in identity.items())):
         raise RuntimeStoreError('permission_denied')
-    row = conn.execute('SELECT cwd,git_repo_root FROM sessions WHERE id=?', (session_id,)).fetchone()
+    mapped = dict(payload)
+    if mapped.get('origin_json') is not None:
+        expected = {'platform': 'kanban', 'chat_id': '', 'chat_name': None, 'chat_type': 'dm',
+                    'user_id': '', 'user_name': None, 'thread_id': None}
+        try:
+            origin = json.loads(mapped['origin_json'])
+        except (TypeError, ValueError):
+            raise RuntimeStoreError('permission_denied') from None
+        if origin != expected:
+            raise RuntimeStoreError('permission_denied')
+    row = conn.execute('SELECT * FROM sessions WHERE id=?', (session_id,)).fetchone()
     if row is None:
         raise RuntimeStoreError('not_found')
-    mapped = dict(payload)
-    for key in ('cwd', 'git_repo_root'):
+    # Guest-local placeholders never rewrite the Owner's canonical routing or
+    # profile identity. The original constructor still validates every other key.
+    for key in (*identity, 'origin_json'):
         if mapped.get(key) is not None:
             mapped[key] = row[key]
     return worker_create(db, conn, session_id, mapped)
@@ -75,7 +88,8 @@ def guest_turn_cleanup(db, conn, session_id, payload):
     return worker_turn_cleanup(db, conn, session_id, payload)
 
 
-def guest_context_handlers():
+def guest_context_handlers(scope):
+    from functools import partial
     from hermes_state_worker_context import (
         worker_prompt, worker_row_role, worker_sidecars, worker_tail_role, worker_tool_names,
     )
@@ -87,7 +101,7 @@ def guest_context_handlers():
     )}
     return lifecycle | {
         'compression.context': guest_context, 'compression.lineage': guest_lineage,
-        'compression.history': guest_history, 'session.create': guest_create,
+        'compression.history': guest_history, 'session.create': partial(guest_create, scope=scope),
         'turn.cleanup': guest_turn_cleanup,
         'session.prompt': worker_prompt, 'session.tools': worker_tool_names, 'session.sidecars': worker_sidecars,
         'session.tail_role': worker_tail_role, 'session.row_role': worker_row_role,

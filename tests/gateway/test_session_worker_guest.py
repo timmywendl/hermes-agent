@@ -429,7 +429,9 @@ def test_guest_consumes_original_managed_runtime_with_real_owner_store(owner, tm
             assert runtime_session_store.is_worker_process()
             self.store, self.sid = kwargs['session_db'], kwargs['session_id']
             self.session_prompt_tokens = self.session_completion_tokens = 0
-            self.store.create_session(self.sid, kwargs['platform'], cwd='/task')
+            self.store.create_session(self.sid, kwargs['platform'], cwd='/task',
+                                      user_id=kwargs['user_id'], chat_id=kwargs['chat_id'],
+                                      session_key=kwargs['gateway_session_key'], profile_name='default')
         def run_conversation(self, text, *, conversation_history, **kwargs):
             assert 'Small code fix' in text and conversation_history == []
             self.store.append_messages_batch(self.sid, [{'role': 'assistant', 'content': 'offline wiring check'}])
@@ -527,5 +529,43 @@ def test_guest_in_place_compression_uses_original_transactions_and_opaque_holder
         store.release_compression_lock('owned', 'guest-holder:first')
         assert store.try_acquire_compression_lock('owned', 'guest-holder:second')
         store.release_compression_lock('owned', 'guest-holder:second')
+    finally:
+        store.close()
+
+
+def test_real_agent_session_constructor_maps_only_pinned_guest_identity(owner, tmp_path, monkeypatch):
+    import json
+    from run_agent import AIAgent
+    authority, _row, scope, endpoint = owner
+    canonical = {'source': 'kanban', 'cwd': '/host/task', 'user_id': 'host-user', 'chat_id': 'host-chat',
+                 'session_key': 'host-route', 'profile_name': 'host-profile',
+                 'origin_json': json.dumps({'platform': 'kanban', 'profile': 'host-profile'})}
+    def seed(conn):
+        for key, value in canonical.items():
+            conn.execute(f'UPDATE sessions SET {key}=? WHERE id=?', (value, 'owned'))
+    authority.db._execute_write(seed)
+    store = guest_session_store(endpoint, scope, tmp_path / 'real-constructor')
+    monkeypatch.setattr('hermes_cli.profiles.get_active_profile_name', lambda: 'default')
+    agent = SimpleNamespace(_persist_disabled=False, _session_db_created=False, _session_db=store,
+        session_id='owned', platform='kanban', model='approved-codex',
+        _session_row_model_config=lambda: {'max_iterations': 32}, _cached_system_prompt='Guest prompt',
+        _user_id='', _chat_id='', _gateway_session_key='guest:' + scope['execution_id'],
+        _parent_session_id=None)
+    try:
+        AIAgent._ensure_db_session(agent)
+        assert agent._session_db_created, 'real constructor must not silently defer a rejected Guest identity'
+        after = authority.db.get_session('owned')
+        assert {key: after[key] for key in canonical} == canonical
+        for attack in ({'user_id': 'foreign'}, {'profile_name': 'foreign'},
+                       {'session_key': 'guest:foreign'}, {'origin_json': '{broken'},
+                       {'origin_json': json.dumps({'platform': 'kanban', 'user_id': 'foreign'})}):
+            sequence = authority.db._read_one('SELECT last_sequence FROM worker_executions')[0] + 1
+            with pytest.raises(RuntimeStoreError, match='permission_denied'):
+                endpoint({'method': 'worker.persist', 'scope': scope, 'params': {
+                    'sequence': sequence, 'operation': 'session.create',
+                    'payload': {'source': 'kanban', **attack}}})
+            # Rejected receipts have not committed or changed the canonical row.
+            assert authority.db._read_one('SELECT last_sequence FROM worker_executions')[0] == sequence - 1
+            assert {key: authority.db.get_session('owned')[key] for key in canonical} == canonical
     finally:
         store.close()

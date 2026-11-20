@@ -89,11 +89,11 @@ def _result_ready(db, conn, session_id, payload):
     return {'status': 'pending_retirement'}
 
 
-def _guest_handlers():
+def _guest_handlers(scope):
     from hermes_state_runtime import _worker_append, _worker_turn, _worker_usage
     from gateway.session_worker_guest_context import guest_context_handlers, guest_compression_handlers
     return {
-        **guest_context_handlers(), **guest_compression_handlers(),
+        **guest_context_handlers(scope), **guest_compression_handlers(),
         'transcript.append': _worker_append,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
@@ -165,7 +165,7 @@ class GuestOwnerEndpoint:
             operation = 'guest.result_ready' if params['operation'] == 'execution.finish' else params['operation']
             return apply_worker_receipt(self.authority.db, **assignment, sequence=params['sequence'],
                 operation=operation, payload=params['payload'],
-                handlers={key: self._guard(handler) for key, handler in _guest_handlers().items()})
+                handlers={key: self._guard(handler) for key, handler in _guest_handlers(self.scope).items()})
 
     def _adopt(self):
         def write(conn):

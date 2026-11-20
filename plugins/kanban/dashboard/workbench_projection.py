@@ -67,16 +67,27 @@ def _history(record: dict, body: str, author: str | None = None) -> dict:
     return {"body": body, "created_at": record.get("created_at"), "author": author or record.get("author"), "id": record.get("id")}
 
 
-def _input_decisions(tasks: list[dict], events: list[dict]) -> dict:
+def _decision_response(comment: dict) -> dict:
+    response = (parse_object(comment.get("body")) or {}).get("workbench_decision_response")
+    return response if isinstance(response, dict) and isinstance(response.get("decision_id"), str) else {}
+
+
+def _input_decisions(tasks: list[dict], events: list[dict], comments: list[dict]) -> dict:
     decisions = {}
+    answered = {_decision_response(c).get("decision_id") for c in comments}
     for task in tasks:
-        if task.get("status") != "blocked" or task.get("block_kind") != "needs_input":
-            continue
+        active = task.get("status") == "blocked" and task.get("block_kind") == "needs_input"
         requests = [e for e in events if e["task_id"] == task["id"] and e["kind"] == "blocked" and isinstance((e.get("payload") or {}).get("reason"), str)]
-        request = requests[-1] if requests else None
-        reason = request["payload"]["reason"] if request else "Human input requested; reason UNKNOWN"
-        key = f"blocked:{request['id']}" if request else f"task:{task['id']}"
-        decisions[key] = {"id": key, "task_id": task["id"], "title": task["title"], "reason": reason, "recommendation": None, "status": "pending", "history": [_history(request, reason)] if request else []}
+        for request in requests:
+            key = f"blocked:{request['id']}"
+            current = active and request is requests[-1]
+            if request["payload"].get("kind") != "needs_input" and not current and key not in answered:
+                continue
+            reason = request["payload"]["reason"]
+            decisions[key] = {"id": key, "task_id": task["id"], "title": task["title"], "reason": reason, "recommendation": None, "status": "pending" if current else "superseded", "history": [_history(request, reason)]}
+        if active and not requests:
+            key = f"task:{task['id']}"
+            decisions[key] = {"id": key, "task_id": task["id"], "title": task["title"], "reason": "Human input requested; reason UNKNOWN", "recommendation": None, "status": "pending", "history": []}
     return decisions
 
 
@@ -92,16 +103,14 @@ def _explicit_decision(record: dict, source: str) -> dict | None:
 
 
 def _decisions(tasks: list[dict], events: list[dict], comments: list[dict]) -> list[dict]:
-    decisions = _input_decisions(tasks, events)
+    decisions = _input_decisions(tasks, events, comments)
     for source, records in (("event", events), ("comment", comments)):
         for record in records:
             decision = _explicit_decision(record, source)
             if decision:
                 decisions[decision["id"]] = decision
     for comment in comments:
-        response = (parse_object(comment.get("body")) or {}).get("workbench_decision_response")
-        if not isinstance(response, dict):
-            continue
+        response = _decision_response(comment)
         decision = decisions.get(response.get("decision_id"))
         if decision and decision["task_id"] == comment["task_id"]:
             decision["history"].append(_history(comment, str(response.get("response") or "")))

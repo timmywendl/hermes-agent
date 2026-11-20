@@ -170,6 +170,29 @@ def test_plan_uses_existing_auxiliary_provider_without_mutating_stores(setup, mo
     assert _disk(home) == before
 
 
+def test_decision_history_survives_unblock_and_new_request(setup):
+    client, _home, _project_id = setup
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="Choose scope", initial_status="blocked")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="First decision")
+    first = client.get(PREFIX).json()["decisions"][0]
+    assert client.post(PREFIX + f"/decisions/{task_id}/respond", json={
+        "decision_id": first["id"], "response": "Desktop first",
+    }).status_code == 200
+    with kbc.connect_closing() as conn:
+        assert kb.unblock_task(conn, task_id)
+    history = client.get(PREFIX).json()["decisions"]
+    assert history[0]["status"] == "responded"
+    assert history[0]["history"][-1]["body"] == "Desktop first"
+    with kbc.connect_closing() as conn:
+        assert kb.block_task(conn, task_id, kind="needs_input", reason="Second decision")
+    history = client.get(PREFIX).json()["decisions"]
+    assert len(history) == 2
+    assert history[0]["id"] == first["id"] and history[0]["status"] == "responded"
+    assert history[1]["status"] == "pending"
+    assert history[1]["reason"] == "Second decision"
+
+
 def _github(monkeypatch, *, checks=True, stale=False, moving=False, required="test"):
     sha, older = "a" * 40, "b" * 40
     called = []

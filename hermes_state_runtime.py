@@ -80,6 +80,13 @@ def _retire_admission_workers(conn, row, owner_epoch):
     lineage = json.loads(row['lineage_json'])
     targets = list({row['target_session_id'], lineage[-1] if lineage else row['target_session_id']})
     scope = f"session_id IN ({','.join('?' * len(targets))}) AND generation=? AND owner_epoch=?"
+    # Guest result/Discard is logical settlement, never proof that the VM and
+    # its Host resources retired. Only the original physical-custody path may
+    # terminalize its admission-owned kanban reservation before this point.
+    if conn.execute(f"SELECT 1 FROM worker_executions WHERE {scope} "
+                    "AND kind='kanban' AND status!='terminal' LIMIT 1",
+                    (*targets, row['generation'], owner_epoch)).fetchone():
+        raise RuntimeStoreError('guest_physical_retirement_required')
     # Settlement closes an execution that never wrote execution.finish: its read copies go too.
     from hermes_state_runtime_workers import compact_terminal_receipts
     for (execution_id,) in conn.execute(f"SELECT execution_id FROM worker_executions WHERE {scope} "

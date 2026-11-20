@@ -4,6 +4,40 @@ import { useRef, useState } from 'react'
 import { confirmMission, previewMission } from './api'
 import { useWorkbenchText } from './workbench-i18n'
 import type { MissionPlan } from './workbench-types'
+import { workbenchTime } from './workbench-view'
+
+export function ProjectFacts({ context }: { context: MissionPlan['project_context'] }) {
+  const t = useWorkbenchText()
+
+  return (
+    <section aria-label={t('projectFacts')}>
+      <h3>{t('projectFacts')}</h3>
+      <p>{context?.state || t('unknown')}</p>
+      <p className="workbench-muted">{t('projectFactsLimit')}</p>
+      {context && (
+        <>
+          <p>
+            {t('manifests')}: {context.manifests.join(', ') || t('unknown')}
+          </p>
+          <p>
+            {t('packageManagers')}: {context.package_managers.join(', ') || t('unknown')}
+          </p>
+          <p>
+            {t('contextNames')}: {context.context_files.join(', ') || t('unknown')}
+          </p>
+          <p>
+            {t('suggestedChecks')}: {context.verify_commands.join('; ') || t('unknown')}
+          </p>
+          {context.observed_at && (
+            <small>
+              {t('fetched')} {workbenchTime(context.observed_at)}
+            </small>
+          )}
+        </>
+      )}
+    </section>
+  )
+}
 
 export function GoalIntake({ projectId, onSaved }: { projectId: string; onSaved: () => void }) {
   const t = useWorkbenchText()
@@ -61,6 +95,7 @@ export function GoalIntake({ projectId, onSaved }: { projectId: string; onSaved:
       {plan?.status === 'preview' && (
         <div className="workbench-plan">
           <h3>{t('plan')}</h3>
+          <ProjectFacts context={plan.project_context} />
           <label>
             {t('planTitle')}
             <Input disabled={submitted} onChange={event => update({ title: event.target.value })} value={plan.title} />

@@ -98,6 +98,20 @@ def test_confirm_is_atomic_inert_and_recovers_exact_replays(setup, monkeypatch):
     assert {t["relationship_state"] for t in snapshot["tasks"]} == {"ROOT", "WORK_ITEM"}
 
 
+def test_project_context_addition_preserves_older_confirmation_replays(setup):
+    client, _home, project_id = setup
+    request = _confirm(project_id, request_id="before-project-context")
+    metadata = {"workbench": {"kind": "root", "request_id": request["request_id"], "project_id": project_id, "plan": request["plan"]}, "description": request["plan"]["body"]}
+    with kbc.connect_closing() as conn:
+        root = kb.create_task(conn, title=request["plan"]["title"], body=json.dumps(metadata, sort_keys=True, ensure_ascii=False),
+                              initial_status="blocked", project_id=project_id, idempotency_key="workbench:" + request["request_id"])
+    result = client.post(PREFIX + "/confirm", json=request)
+    assert result.status_code == 200, result.text
+    assert result.json()["root_id"] == root and result.json()["replayed"] is True
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == 1
+
+
 def test_read_preserves_unknown_metadata_and_never_treats_dependencies_as_lineage(setup):
     client, home, _project_id = setup
     with kbc.connect_closing() as conn:
@@ -179,7 +193,9 @@ def test_plan_uses_existing_auxiliary_provider_without_mutating_stores(setup, mo
     assert response.json()["status"] == "preview"
     assert response.json()["model"] == "fake-model"
     assert calls[0]["task"] == "kanban_decomposer"
-    assert json.loads(calls[0]["messages"][1]["content"])["project"] == {"name": "Widget", "description": "A useful widget"}
+    context = json.loads(calls[0]["messages"][1]["content"])["project"]
+    assert context["name"] == "Widget" and context["description"] == "A useful widget"
+    assert context["facts"]["state"] == "unknown"
     assert _disk(home) == before
 
     def unavailable(**kwargs):
@@ -190,6 +206,45 @@ def test_plan_uses_existing_auxiliary_provider_without_mutating_stores(setup, mo
     assert response.json()["status"] == "unavailable"
     assert response.json()["work_items"] == []
     assert _disk(home) == before
+
+
+def test_plan_uses_real_registered_project_facts_without_execution(setup, monkeypatch):
+    client, home, project_id = setup
+    from agent import auxiliary_client
+    with pdb.connect_closing() as conn:
+        repo = Path(pdb.get_project(conn, project_id).primary_path)
+    marker = repo / "package.json"
+    content = json.dumps({"scripts": {"test": "never-execute-this-command", "lint": "also-never-execute"}})
+    marker.write_text(content)
+    (repo / "package-lock.json").write_text("{}")
+    (repo / "AGENTS.md").write_text("Untrusted project instructions; do not execute.")
+    calls = []
+
+    def provider(**kwargs):
+        calls.append(json.loads(kwargs["messages"][1]["content"]))
+        proposed = _confirm(project_id)["plan"]
+        proposed["project_context"] = {"project_id": "other", "state": "detected", "manifests": ["fabricated.json"]}
+        return SimpleNamespace(model="test-provider", choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(proposed)))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", provider)
+    before = _disk(home)
+    result = client.post(PREFIX + "/plan", json={"goal": "Improve widget testing", "project_id": project_id}).json()
+    facts = result["project_context"]
+    assert facts["project_id"] == project_id and facts["state"] == "detected"
+    assert facts["manifests"] == ["package.json"]
+    assert facts["verify_commands"] == ["npm run test", "npm run lint"]
+    assert facts["package_managers"] == ["npm"] and facts["context_files"] == ["AGENTS.md"]
+    assert calls[0]["project"]["facts"] == facts
+    assert "never-execute" not in json.dumps(calls)
+    snapshot_facts = client.get(PREFIX, params={"project_id": project_id}).json()["project_context"]
+    assert snapshot_facts["manifests"] == facts["manifests"]
+    assert snapshot_facts["verify_commands"] == facts["verify_commands"]
+    assert marker.read_text() == content and _disk(home) == before
+    marker.unlink()
+    with pdb.connect_closing() as conn:
+        missing = pdb.create_project(conn, name="Missing", primary_path=str(repo / "missing"))
+    result = client.post(PREFIX + "/plan", json={"goal": "Plan despite missing project", "project_id": missing}).json()
+    assert result["project_context"]["state"] == "unavailable"
 
 
 @pytest.mark.parametrize("reason", ["First decision", None])

@@ -7,8 +7,8 @@ import { $boardSlug, fetchWorkbench, useKanbanScope } from './api'
 import { BoardSwitcher } from './board-switcher'
 import { AgentActivity, DecisionInbox, DeliveryCenter, SourceUnknowns } from './workbench-evidence'
 import { useWorkbenchText } from './workbench-i18n'
-import { GoalIntake } from './workbench-intake'
-import type { WorkbenchTask } from './workbench-types'
+import { GoalIntake, ProjectFacts } from './workbench-intake'
+import type { WorkbenchSnapshot, WorkbenchTask } from './workbench-types'
 import { missionDescription, workbenchTime } from './workbench-view'
 
 function TaskChoice({ task, selected, onClick }: { task: WorkbenchTask; selected: boolean; onClick: () => void }) {
@@ -21,6 +21,42 @@ function TaskChoice({ task, selected, onClick }: { task: WorkbenchTask; selected
         {task.status} · {task.assignee || t('unknown')}
       </span>
     </button>
+  )
+}
+
+function ProjectPicker({
+  snapshot,
+  projectId,
+  onChange
+}: {
+  snapshot: WorkbenchSnapshot | undefined
+  projectId: string
+  onChange: (value: string) => void
+}) {
+  const t = useWorkbenchText()
+
+  return (
+    <section className="workbench-section">
+      <label htmlFor="workbench-project">{t('project')}</label>
+      <select id="workbench-project" onChange={event => onChange(event.target.value)} value={projectId}>
+        <option value="">{t('allProjects')}</option>
+        {snapshot?.projects.map(project => (
+          <option key={project.id} value={project.id}>
+            {project.name}
+          </option>
+        ))}
+      </select>
+      {snapshot?.projects.length === 0 && <p>{t('noProjects')}</p>}
+      {snapshot?.projects
+        .filter(project => project.id === projectId)
+        .map(project => (
+          <div key={project.id}>
+            <p>{project.description}</p>
+            <small>{project.primary_path}</small>
+          </div>
+        ))}
+      {projectId && snapshot && <ProjectFacts context={snapshot.project_context} />}
+    </section>
   )
 }
 
@@ -77,33 +113,14 @@ function WorkbenchScope({ scope, slug }: { scope: string; slug: string }) {
       {query.isPending && <p role="status">{t('unknown')}</p>}
       <div className="workbench-layout">
         <aside>
-          <section className="workbench-section">
-            <label htmlFor="workbench-project">{t('project')}</label>
-            <select
-              id="workbench-project"
-              onChange={event => {
-                setProjectId(event.target.value)
-                setSelectedId('')
-              }}
-              value={projectId}
-            >
-              <option value="">{t('allProjects')}</option>
-              {snapshot?.projects.map(project => (
-                <option key={project.id} value={project.id}>
-                  {project.name}
-                </option>
-              ))}
-            </select>
-            {snapshot?.projects.length === 0 && <p>{t('noProjects')}</p>}
-            {snapshot?.projects
-              .filter(project => project.id === projectId)
-              .map(project => (
-                <div key={project.id}>
-                  <p>{project.description}</p>
-                  <small>{project.primary_path}</small>
-                </div>
-              ))}
-          </section>
+          <ProjectPicker
+            onChange={value => {
+              setProjectId(value)
+              setSelectedId('')
+            }}
+            projectId={projectId}
+            snapshot={snapshot}
+          />
           <section className="workbench-section">
             <h2>{t('missions')}</h2>
             {roots.map(task => (

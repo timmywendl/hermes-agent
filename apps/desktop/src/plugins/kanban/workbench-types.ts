@@ -20,6 +20,7 @@ export interface WorkbenchSnapshot {
   fetched_at: number | string
   board: { slug: string; title: string; project_id: null | string }
   projects: { id: string; name: string; description?: string; primary_path?: string }[]
+  project_context?: ProjectContext | null
   tasks: WorkbenchTask[]
   runs: (KanbanRun & { task_id: string; custody_state?: string })[]
   activity: (KanbanEvent & { task_id: string })[]
@@ -27,6 +28,16 @@ export interface WorkbenchSnapshot {
   decisions: WorkbenchDecision[]
   execution: { state: string; reason: string }
   unknowns: string[]
+}
+
+export interface ProjectContext {
+  project_id: null | string
+  state: string
+  observed_at: null | string
+  manifests: string[]
+  package_managers: string[]
+  verify_commands: string[]
+  context_files: string[]
 }
 
 export interface MissionPlan {
@@ -37,6 +48,7 @@ export interface MissionPlan {
   model: null | string
   status: 'preview' | 'unavailable'
   reason?: string
+  project_context?: ProjectContext | null
 }
 
 export interface MissionConfirmation {

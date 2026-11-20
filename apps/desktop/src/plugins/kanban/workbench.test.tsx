@@ -106,6 +106,32 @@ function mount() {
 }
 
 describe('Mission Workbench', () => {
+  it('shows detected project facts without claiming verification ran', async () => {
+    vi.mocked(previewMission).mockResolvedValue({
+      ...plan,
+      project_context: {
+        project_id: 'a',
+        state: 'detected',
+        observed_at: '2026-11-20T12:00:00Z',
+        manifests: ['package.json'],
+        package_managers: ['npm'],
+        verify_commands: ['npm run test'],
+        context_files: ['AGENTS.md']
+      }
+    })
+    mount()
+    await screen.findByText('Accepted goal')
+    fireEvent.change(screen.getByRole('textbox', { name: 'What would you like to achieve?' }), {
+      target: { value: 'Improve testing' }
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Preview AI plan' }))
+    const context = await screen.findByRole('region', { name: 'Project snapshot' })
+    expect(within(context).getByText(/package.json/)).toBeTruthy()
+    expect(within(context).getByText(/npm run test/)).toBeTruthy()
+    expect(within(context).getByText(/no command was run/)).toBeTruthy()
+    expect(confirmMission).not.toHaveBeenCalled()
+  })
+
   it('shows original authored worklog only for the selected Mission', async () => {
     vi.mocked(fetchWorkbench).mockResolvedValue({
       ...snapshot(),

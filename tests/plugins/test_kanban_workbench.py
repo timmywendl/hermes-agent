@@ -247,6 +247,34 @@ def test_plan_uses_real_registered_project_facts_without_execution(setup, monkey
     assert result["project_context"]["state"] == "unavailable"
 
 
+def test_malformed_project_facts_preserve_missions_and_planning(setup, monkeypatch):
+    client, home, project_id = setup
+    from agent import auxiliary_client
+    receipt = client.post(PREFIX + "/confirm", json=_confirm(project_id)).json()
+    with pdb.connect_closing() as conn:
+        repo = Path(pdb.get_project(conn, project_id).primary_path)
+    (repo / "package.json").write_text('{"scripts":1}')
+    calls = []
+
+    def provider(**kwargs):
+        calls.append(json.loads(kwargs["messages"][1]["content"]))
+        return SimpleNamespace(model="test-provider", choices=[SimpleNamespace(
+            message=SimpleNamespace(content=json.dumps(_confirm(project_id)["plan"])))])
+
+    monkeypatch.setattr(auxiliary_client, "call_llm", provider)
+    before = _disk(home)
+    snapshot = client.get(PREFIX, params={"project_id": project_id})
+    assert snapshot.status_code == 200
+    assert receipt["root_id"] in {task["id"] for task in snapshot.json()["tasks"]}
+    assert snapshot.json()["project_context"]["state"] == "unavailable"
+    preview = client.post(PREFIX + "/plan", json={"goal": "Improve widgets", "project_id": project_id})
+    assert preview.status_code == 200 and preview.json()["status"] == "preview"
+    assert preview.json()["project_context"]["state"] == "unavailable"
+    assert calls[0]["project"]["facts"]["state"] == "unavailable"
+    assert _disk(home) == before
+    assert (repo / "package.json").read_text() == '{"scripts":1}'
+
+
 @pytest.mark.parametrize("reason", ["First decision", None])
 def test_decision_history_survives_unblock_and_new_request(setup, reason):
     client, _home, _project_id = setup

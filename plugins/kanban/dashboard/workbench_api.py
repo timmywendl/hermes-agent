@@ -128,8 +128,8 @@ def _project_context(project: dict | None) -> dict:
             if root.is_dir():
                 facts = asdict(detect_project_facts(root))
                 context.update(facts, state="detected" if any(facts.values()) else "unknown")
-        except OSError:
-            pass  # The preview remains useful, with an explicit unavailable project snapshot.
+        except (OSError, TypeError, ValueError):
+            pass  # Unreadable or malformed project facts must not hide canonical Missions.
     return context
 
 

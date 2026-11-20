@@ -76,17 +76,18 @@ def _input_decisions(tasks: list[dict], events: list[dict], comments: list[dict]
     decisions = {}
     answered = {_decision_response(c).get("decision_id") for c in comments}
     for task in tasks:
-        active = task.get("status") == "blocked" and task.get("block_kind") == "needs_input"
-        requests = [e for e in events if e["task_id"] == task["id"] and e["kind"] == "blocked" and isinstance((e.get("payload") or {}).get("reason"), str)]
+        active = task.get("status") in {"blocked", "triage"} and task.get("block_kind") == "needs_input"
+        requests = [e for e in events if e["task_id"] == task["id"] and e["kind"] in {"blocked", "block_loop_detected"}]
         for request in requests:
             key = f"blocked:{request['id']}"
             current = active and request is requests[-1]
-            if request["payload"].get("kind") != "needs_input" and not current and key not in answered:
+            if (request.get("payload") or {}).get("kind") != "needs_input" and not current and key not in answered:
                 continue
-            reason = request["payload"]["reason"]
+            reason = (request.get("payload") or {}).get("reason")
+            reason = reason if isinstance(reason, str) and reason else "Human input requested; reason UNKNOWN"
             decisions[key] = {"id": key, "task_id": task["id"], "title": task["title"], "reason": reason, "recommendation": None, "status": "pending" if current else "superseded", "history": [_history(request, reason)]}
-        if active and not requests:
-            key = f"task:{task['id']}"
+        key = f"task:{task['id']}"
+        if (active and not requests) or key in answered:
             decisions[key] = {"id": key, "task_id": task["id"], "title": task["title"], "reason": "Human input requested; reason UNKNOWN", "recommendation": None, "status": "pending", "history": []}
     return decisions
 

@@ -170,12 +170,14 @@ def test_plan_uses_existing_auxiliary_provider_without_mutating_stores(setup, mo
     assert _disk(home) == before
 
 
-def test_decision_history_survives_unblock_and_new_request(setup):
+@pytest.mark.parametrize("reason", ["First decision", None])
+def test_decision_history_survives_unblock_and_new_request(setup, reason):
     client, _home, _project_id = setup
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(conn, title="Choose scope", initial_status="blocked")
-        assert kb.block_task(conn, task_id, kind="needs_input", reason="First decision")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason=reason)
     first = client.get(PREFIX).json()["decisions"][0]
+    assert first["id"].startswith("blocked:")
     assert client.post(PREFIX + f"/decisions/{task_id}/respond", json={
         "decision_id": first["id"], "response": "Desktop first",
     }).status_code == 200

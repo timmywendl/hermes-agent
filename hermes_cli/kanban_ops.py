@@ -58,6 +58,12 @@ def _cmd_tail(args: argparse.Namespace) -> int:
 
 
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    if not kbd.BOARD_EXECUTION_ENABLED:
+        if getattr(args, "json", False):
+            _print_json({"disabled": kbd.BOARD_EXECUTION_PAUSE_REASON, "spawned": [], "reclaimed": 0}, ascii=True)
+        else:
+            print(kbd.BOARD_EXECUTION_PAUSE_REASON)
+        return 0
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path.
@@ -175,6 +181,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     from --help) keeps the standalone loop for hosts that truly cannot run the
     gateway. The default path exits 2 so nobody accidentally runs two
     dispatchers against the same kanban.db."""
+    if not kbd.BOARD_EXECUTION_ENABLED:
+        print(kbd.BOARD_EXECUTION_PAUSE_REASON)
+        return 0
     if not getattr(args, "force", False):
         return _err(_DAEMON_DEPRECATED, 2)
 

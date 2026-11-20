@@ -136,3 +136,56 @@ def test_diagnostics_reports_resolved_allowlist(kanban_home, capsys, config, exp
     payload = json.loads(capsys.readouterr().out)
     assert payload == [{"task_id": None, "dispatch_profiles": payload[-1]["dispatch_profiles"], "diagnostics": []}]
     assert payload[-1]["dispatch_profiles"].startswith(expected)
+
+
+@pytest.mark.parametrize('json_output', [False, True])
+def test_board_pause_cli_reports_reason_without_opening_storage(monkeypatch, capsys, json_output):
+    import argparse
+    import json
+    from hermes_cli import kanban_ops
+    def forbidden(*args, **kwargs):
+        raise AssertionError('paused CLI initialized storage')
+    monkeypatch.setattr(kbc, 'connect_closing', forbidden)
+    monkeypatch.setattr(kb, 'init_db', forbidden)
+    monkeypatch.setenv('BOARD_EXECUTION_ENABLED', 'true')
+    args = argparse.Namespace(json=json_output, dry_run=False, force=True)
+    assert kanban_ops._cmd_dispatch(args) == 0
+    text = capsys.readouterr().out
+    if json_output:
+        assert json.loads(text)['disabled'] == kbd.BOARD_EXECUTION_PAUSE_REASON
+    else:
+        assert kbd.BOARD_EXECUTION_PAUSE_REASON in text
+    for force in (False, True):
+        args.force = force
+        assert kanban_ops._cmd_daemon(args) == 0
+        assert kbd.BOARD_EXECUTION_PAUSE_REASON in capsys.readouterr().out
+
+
+def test_board_pause_embedded_gateway_and_dashboard_keep_board_unchanged(kanban_home, caplog, monkeypatch):
+    from gateway.kanban_watchers_dispatcher import _KanbanDispatcher, _resolve_dispatcher_settings
+    with kbc.connect() as conn:
+        kb.create_task(conn, title='queued', assignee='default')
+        kb.recompute_ready(conn)
+        before = list(conn.iterdump())
+    def forbidden_reclaim(*args, **kwargs):
+        raise AssertionError('paused Gateway entered reclaim phase')
+    monkeypatch.setattr(kbd, '_run_reclaim_phase', forbidden_reclaim)
+    settings = _resolve_dispatcher_settings({'board_execution_enabled': True}, kb)
+    dispatcher = _KanbanDispatcher(kb, settings)
+    with caplog.at_level('INFO', logger='hermes_cli.kanban_db'):
+        result = dispatcher.tick_once_for_board('default')
+    assert kbd.BOARD_EXECUTION_PAUSE_REASON in caplog.text
+    assert result.disabled == kbd.BOARD_EXECUTION_PAUSE_REASON
+    assert not dispatcher.ready_nonempty()
+    assert kbd.BOARD_EXECUTION_PAUSE_REASON in kbd.describe_suppression([result])
+    import importlib.util
+    import sys
+    path = Path(__file__).resolve().parents[2] / 'plugins/kanban/dashboard/plugin_api.py'
+    spec = importlib.util.spec_from_file_location('paused_dashboard', path)
+    dashboard = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, dashboard)
+    spec.loader.exec_module(dashboard)
+    payload = dashboard.dispatch(dry_run=False, max_n=8, board='default')
+    assert payload['disabled'] == kbd.BOARD_EXECUTION_PAUSE_REASON and payload['spawned'] == []
+    with kbc.connect() as conn:
+        assert list(conn.iterdump()) == before

@@ -151,6 +151,13 @@ class SessionAuthority:
                 authorize(conn)
         return guard
 
+    def _board_admission_gate(self, ref, authorize=None):
+        def guard(conn):
+            self._admission_gate(authorize)(conn)
+            from gateway.session_kanban import check_board_execution
+            check_board_execution(self, ref, conn=conn)
+        return guard
+
     def logical_owner(self, session_id):
         """The FIFO/admission identity of a route: the root of its compression lineage.
         Compression advances the physical transcript, never the admission identity. A session this
@@ -353,7 +360,7 @@ class SessionAuthority:
         request_id = str(payload['native_text_v1']['event']['message_id'] or uuid.uuid4().hex)
         return await tracked_write(self, partial(
             self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
-            request_id=request_id, payload=payload, authorize=self._admission_gate()),
+            request_id=request_id, payload=payload, authorize=self._board_admission_gate(ref)),
             then=partial(self._admitted, ref, event), ordered=True,
             after=partial(self._schedule_admitted, ref))
 
@@ -435,6 +442,8 @@ class SessionAuthority:
 
     async def _submit(self, actor, request, *, _authorize_write=None):
         self._require_admission_open()
+        from gateway.session_kanban import check_board_execution
+        check_board_execution(self, request.ref)
         if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
                 'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
@@ -469,7 +478,7 @@ class SessionAuthority:
                 return admit_session_input(self.db, epoch=self.epoch, principal_id=actor.subject,
                                            session_id=request.ref.session_id, request_id=request.request_id,
                                            payload=payload, intent=request.intent,
-                                           _authorize_write=self._admission_gate(_authorize_write))
+                                           _authorize_write=self._board_admission_gate(request.ref, _authorize_write))
             except Exception:
                 self._release_refused_capture(request, payload)
                 raise
@@ -770,6 +779,8 @@ class SessionAuthority:
     async def _claim_next(self, ref, live):
         # False asks the pump to re-read after a queued head changed during preflight.
         async with live.claim_gate, live.mutation_lock:
+            from gateway.session_kanban import check_board_execution
+            check_board_execution(self, ref)
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
@@ -829,7 +840,7 @@ class SessionAuthority:
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
+                                                    session_id=ref.session_id, _guard=self._board_admission_gate(ref),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read

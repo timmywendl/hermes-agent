@@ -36,6 +36,11 @@ if TYPE_CHECKING:
 # dispatcher parks the task in ``blocked`` with a reason — prevents retry storms.
 DEFAULT_FAILURE_LIMIT = 2
 
+# Source-only pause: no configuration or transport may enable Board execution.
+BOARD_EXECUTION_ENABLED = False
+BOARD_EXECUTION_PAUSE_REASON = "Board Local/Managed execution paused pending qualified physical containment"
+
+
 # Worker log files larger than this at spawn time are rotated.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
 DEFAULT_LOG_BACKUP_COUNT = 1
@@ -91,19 +96,9 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 
 @dataclass
 class DispatchResult:
-    """Outcome of a single ``dispatch`` pass.
+    """Outcome of one tick, including explicit holds and per-task bookkeeping."""
 
-    ``kanban.default_assignee`` applied this tick before spawning (#27145). Surfaces the auto-assignment to
-    telemetry / CLI / dashboard so the operator can see when the dispatcher is acting on the fallback rule
-    ``kanban.max_in_progress_per_profile`` (#21582). Each entry is ``(task_id, assignee,
-    current_running_count)``. NOT an operator-actionable failure — the task will be picked up on a
-    subsequent tick when the assignee has capacity. Separate bucket so telemetry / dashboards can show "this
-    profile is busy" vs
-    the board's dispatch lock (issue #35240). A losing dispatcher does no DB writes this tick — the lock
-    holder is making progress on the same board. This is the steady-state signal that a single-writer guard
-    is
-    """
-
+    disabled: Optional[str] = None
     reclaimed: int = 0
     promoted: int = 0
     reconciled_orphans: list[str] = field(default_factory=list)
@@ -156,20 +151,14 @@ class DispatchResult:
 
 
 def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
-    """One line naming why the tick(s) held ready work back, or ``""``.
-
-    ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
-    memory_pressure=critical`` — the respawn-guard reasons counted per task
-    plus the tick-level holds. Feeds the "dispatcher stuck" warnings of the
-    CLI daemon and the embedded gateway dispatcher, which otherwise report a
-    bare zero-spawn count while ``hermes kanban tail`` is the only place the
-    guard reason is written (#111910).
-    """
+    """Describe holds for CLI and embedded Gateway suppression telemetry."""
     counts: dict[str, int] = {}
     pressure: Optional[str] = None
     for res in results:
         if res is None:
             continue
+        if res.disabled:
+            counts[res.disabled] = counts.get(res.disabled, 0) + 1
         for _task_id, reason in res.respawn_guarded:
             counts[reason] = counts.get(reason, 0) + 1
         if res.rate_limited:
@@ -1807,12 +1796,12 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     "correctly idle" (only control-plane lanes waiting on ``claim_task``). Falls
     back to "any assigned" when ``profile_exists`` is unimportable.
     """
-    return _has_spawnable(conn, "ready")
+    return BOARD_EXECUTION_ENABLED and _has_spawnable(conn, "ready")
 
 
 def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     """:func:`has_spawnable_ready` for the review column."""
-    return _has_spawnable(conn, "review")
+    return BOARD_EXECUTION_ENABLED and _has_spawnable(conn, "review")
 
 
 def review_dispatch_enabled() -> bool:
@@ -1997,6 +1986,10 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
+    if not BOARD_EXECUTION_ENABLED:
+        _kb._log.info("kanban dispatcher: %s", BOARD_EXECUTION_PAUSE_REASON)
+        return DispatchResult(disabled=BOARD_EXECUTION_PAUSE_REASON)
+
     def _locked_tick() -> DispatchResult:
         return _dispatch_once_locked(
             conn,
@@ -2366,6 +2359,8 @@ def _dispatch_once_locked(
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
+    if not BOARD_EXECUTION_ENABLED:
+        return DispatchResult(disabled=BOARD_EXECUTION_PAUSE_REASON)
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
@@ -2798,14 +2793,9 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
 
 def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
-
-    Returns the child's PID so the dispatcher can detect crashes before the
-    claim TTL expires; completion is still observed via the worker's own
-    ``complete`` / ``block`` transitions. ``board`` pins the child's
-    ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root to the
-    board the task was claimed from, so workers cannot see other boards.
-    """
+    """Launch the detached Board submitter and return its booked PID."""
+    if not BOARD_EXECUTION_ENABLED:
+        raise RuntimeError(BOARD_EXECUTION_PAUSE_REASON)
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
@@ -2964,6 +2954,11 @@ def run_daemon(
     the gateway dispatcher and ``hermes kanban dispatch`` — the standalone
     daemon must not be the one uncapped entry point.
     """
+    if not BOARD_EXECUTION_ENABLED:
+        if on_tick is not None:
+            on_tick(DispatchResult(disabled=BOARD_EXECUTION_PAUSE_REASON))
+        return
+
     import threading
 
     if stop_event is None:

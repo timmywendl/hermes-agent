@@ -10,6 +10,64 @@ import sqlite3
 from hermes_state_runtime import RuntimeStoreError
 
 
+def require_board_execution_enabled():
+    from hermes_cli.kanban_db_dispatch import BOARD_EXECUTION_ENABLED, BOARD_EXECUTION_PAUSE_REASON
+    if not BOARD_EXECUTION_ENABLED:
+        raise RuntimeStoreError('board_execution_paused', detail=BOARD_EXECUTION_PAUSE_REASON)
+
+
+def _board_policy(policy):
+    """Independent persisted markers survive a changed source or absent Kanban context."""
+    try:
+        request = json.loads(policy['request_json'])
+        if not isinstance(request, dict):
+            raise ValueError('invalid request provenance')
+        return (policy['source'] == 'kanban' or policy['kanban_json'] is not None
+                or request.get('source') == 'kanban'
+                or any(key in request for key in ('board', 'task_id', 'run_id')))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeStoreError('storage_unavailable') from exc
+
+
+
+def check_board_execution(authority, ref, *, conn=None, policy=None):
+    """Read the original receipt, never infer execution rights from a mutable live source."""
+    from hermes_cli.kanban_db_dispatch import BOARD_EXECUTION_ENABLED
+    if BOARD_EXECUTION_ENABLED:
+        return
+    if policy is not None and _board_policy(vars(policy)):
+        require_board_execution_enabled()
+    if conn is None:
+        with authority.db._read_ctx() as read:
+            return check_board_execution(authority, ref, conn=read)
+    from hermes_state_local import POLICY_PREFIX
+    from gateway.config import Platform
+    row = conn.execute('SELECT source,chat_id FROM sessions WHERE id=?', (ref.session_id,)).fetchone()
+    saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (POLICY_PREFIX + ref.session_id,)).fetchone()
+    live = authority.sessions.get(ref.session_id)
+    local = live is not None and live.source is not None and live.source.platform == Platform.LOCAL
+    if row is not None and row[0] == 'kanban':
+        require_board_execution_enabled()
+    if saved is None:
+        if local or (row is not None and str(row[1] or '').startswith('local-')):
+            raise RuntimeStoreError('storage_unavailable')
+        return
+    try:
+        receipt = json.loads(saved[0])
+        if (receipt['session_id'] != ref.session_id or receipt['profile_id'] != authority.profile_id
+                or not isinstance(receipt['request_id'], str)):
+            raise ValueError('invalid receipt identity')
+        if receipt['request_id'].startswith('kanban:') or _board_policy(receipt['policy']):
+            require_board_execution_enabled()
+        # Reject partial/malformed local provenance rather than falling back to a default session.
+        from gateway.session_policy import restore_policy
+        restore_policy(receipt['policy'])
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        if isinstance(exc, RuntimeStoreError):
+            raise
+        raise RuntimeStoreError('storage_unavailable') from exc
+
+
 def build_kanban_policy(connection, params, config):
     from hermes_cli import kanban_db as kb
     from hermes_cli.profiles import resolve_profile_env
@@ -70,6 +128,7 @@ def build_kanban_policy(connection, params, config):
 
 
 async def run_task(connection, params):
+    require_board_execution_enabled()
     if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
     from gateway.run import _load_gateway_config

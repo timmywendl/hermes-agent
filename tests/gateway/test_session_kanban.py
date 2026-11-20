@@ -101,6 +101,7 @@ def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):
 def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatch):
     """A claim that stops being current between policy/session creation and the marker
     transaction is refused: no owner_admitted row, no resume, no submit."""
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch.BOARD_EXECUTION_ENABLED", True)
     import asyncio
     from contextlib import closing
     from hermes_cli import kanban_db as kb
@@ -146,3 +147,12 @@ def test_claim_reclaimed_before_admission_marker_is_refused(tmp_path, monkeypatc
     assert calls == []
     with closing(connect(board='owned')) as conn:
         assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='owner_admitted'", (task_id,)).fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_board_pause_run_task_has_no_creation_resume_or_submission():
+    from gateway.session_kanban import run_task
+    from hermes_state_runtime import RuntimeStoreError
+    # An unusable connection proves refusal precedes every session/claim access.
+    with pytest.raises(RuntimeStoreError, match='board_execution_paused'):
+        await run_task(object(), {})

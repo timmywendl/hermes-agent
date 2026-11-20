@@ -39,10 +39,13 @@ def managed_policy(authority, ref):
 
     The frozen creation snapshot, not current profile config, chooses execution.
     """
+    from gateway.session_kanban import check_board_execution
+    check_board_execution(authority, ref)
     from gateway.session_policy import policy_for_source
     policy = policy_for_source(authority.runner, authority.sessions[ref.session_id].source)
     if policy is None:
         return None
+    check_board_execution(authority, ref, policy=policy)
     if policy.ignore_user_config or policy.kanban_json is not None:
         return policy
     if policy.config().get('gateway', {}).get('managed_workers') is not True:
@@ -450,6 +453,8 @@ def _interrupted_before_bootstrap(authority, row):
 
 
 async def execute_managed(authority, ref, row, policy):
+    from gateway.session_kanban import check_board_execution
+    check_board_execution(authority, ref, policy=policy)
     from gateway.run_turn_progress import publish_worker_tool_event
     # This route never passes the inbound prepare step, so the worker would read ``@`` tokens as typed.
     from gateway.session_context_refs import managed_turn_text, refused_turn_result
@@ -463,7 +468,11 @@ async def execute_managed(authority, ref, row, policy):
         from gateway.session_worker_spawn import acquire_process
         from gateway.session_managed_worker_log import worker_log_path
         log_path = worker_log_path(authority.profile_id)
-        process = await acquire_process(subprocess.Popen, [sys.executable, '-m', 'agent.managed_worker'],
+        def spawn(*args, **kwargs):
+            # This callback runs in the acquisition thread, after all asynchronous preparation.
+            check_board_execution(authority, ref, policy=policy)
+            return subprocess.Popen(*args, **kwargs)
+        process = await acquire_process(spawn, [sys.executable, '-m', 'agent.managed_worker'],
             cwd=cwd, stdin=subprocess.PIPE, env=env, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL if log_path is None else subprocess.PIPE, **WORKER_POPEN)
     except asyncio.CancelledError:

@@ -719,3 +719,45 @@ def hosted_owner(tmp_path, monkeypatch):
     thread.join()
     loop.close()
     store._db.close()
+
+
+@pytest.fixture
+def paused_session(owner, tmp_path, monkeypatch):
+    """Create real persisted local provenance, with scheduling explicitly held by the test."""
+    from dataclasses import replace
+    from gateway.session_contract import Principal
+    from gateway.session_local import create_local_session
+    from gateway.session_policy import build_policy
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    owner.runner.adapters = {}
+    owner.runner._adapter_for_source = lambda source: owner.runner.adapters[source.platform]
+    monkeypatch.setattr(owner, '_schedule', lambda ref: None)
+    actor = Principal('human', owner.profile_id,
+                      frozenset({'session:create', 'session:read', 'session:submit', 'session:control'}), 'transport')
+
+    def create(board=True):
+        policy = build_policy({'source': 'cli', 'cwd': str(tmp_path), 'model': 'fixture'},
+                              {'platform_toolsets': {'cli': []}})
+        if board:
+            policy = replace(policy, source='kanban', kanban_json='{"task_id":"held"}',
+                             request_json='{"source":"kanban","board":"held","task_id":"held","run_id":1}')
+        ref = create_local_session(owner, actor, {'request_id': 'kanban:held' if board else 'ordinary'},
+                                   trusted_policy=policy)
+        return actor, ref, policy
+    return create
+
+
+@pytest.fixture(autouse=True)
+def _retained_engine_unit_contracts(request, monkeypatch):
+    """Legacy synthetic-policy tests exercise the retained engine, not the shipped pause.
+
+    These unit fixtures either deliberately omit durable local receipts or test Board
+    execution internals. Production-default pause and non-Board controls use real receipts.
+    """
+    legacy = {
+        'test_session_kanban_run_off_loop.py', 'test_kanban_finite_admission.py',
+        'test_managed_spawn_cancellation.py', 'test_session_authority_cancel_settlement.py',
+    }
+    if (request.path.name in legacy
+            or request.node.name == 'test_bypass_policy_routes_to_managed_worker_and_bootstrap_carries_flags'):
+        monkeypatch.setattr('hermes_cli.kanban_db_dispatch.BOARD_EXECUTION_ENABLED', True)

@@ -178,6 +178,7 @@ def test_decision_history_survives_unblock_and_new_request(setup, reason):
         assert kb.block_task(conn, task_id, kind="needs_input", reason=reason)
     first = client.get(PREFIX).json()["decisions"][0]
     assert first["id"].startswith("blocked:")
+    assert first["reason"] == (reason or "Human input requested; reason UNKNOWN")
     assert client.post(PREFIX + f"/decisions/{task_id}/respond", json={
         "decision_id": first["id"], "response": "Desktop first",
     }).status_code == 200
@@ -186,13 +187,14 @@ def test_decision_history_survives_unblock_and_new_request(setup, reason):
     history = client.get(PREFIX).json()["decisions"]
     assert history[0]["status"] == "responded"
     assert history[0]["history"][-1]["body"] == "Desktop first"
+    second_reason = "Second decision" if reason else None
     with kbc.connect_closing() as conn:
-        assert kb.block_task(conn, task_id, kind="needs_input", reason="Second decision")
+        assert kb.block_task(conn, task_id, kind="needs_input", reason=second_reason)
     history = client.get(PREFIX).json()["decisions"]
     assert len(history) == 2
     assert history[0]["id"] == first["id"] and history[0]["status"] == "responded"
     assert history[1]["status"] == "pending"
-    assert history[1]["reason"] == "Second decision"
+    assert history[1]["reason"] == (second_reason or "Human input requested; reason UNKNOWN")
 
 
 def _github(monkeypatch, *, checks=True, stale=False, moving=False, required="test"):

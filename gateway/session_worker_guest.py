@@ -294,7 +294,8 @@ def serve_guest_request(stream, endpoint):
     still owns physical Stop; EOF or a sent reply is never a retirement proof.
     """
     try:
-        from agent.managed_worker import encode_frame, read_frame
+        from agent.managed_worker import read_frame
+        from agent.runtime_session_guest import write_guest_frame
         request = read_frame(stream)
         if (set(request) != {'version', 'id', 'request'} or type(request['version']) is not int
                 or request['version'] != 1 or type(request['id']) is not int or request['id'] < 1):
@@ -304,8 +305,7 @@ def serve_guest_request(stream, endpoint):
             response['result'] = endpoint(request['request'])
         except RuntimeStoreError as exc:
             response['error'] = exc.reason
-        stream.write(encode_frame(response))
-        stream.flush()
+        write_guest_frame(stream, response)
     except (EOFError, OSError, ValueError):
         # An applied receipt may already be committed when reply delivery fails.
         # Never remove the assignment or infer retirement from a broken channel.

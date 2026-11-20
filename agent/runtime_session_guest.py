@@ -38,6 +38,29 @@ def validate_guest_work(frame):
     return json.loads(json.dumps(frame))
 
 
+
+def write_guest_frame(stream, frame):
+    """Write one bounded frame completely, including raw streams' short writes.
+
+    The transport supplies a finite per-call I/O timeout; the whole-frame budget
+    also prevents a peer renewing authority indefinitely by accepting tiny writes.
+    """
+    import time
+    from agent.managed_worker import encode_frame
+    pending = memoryview(encode_frame(frame))
+    deadline = time.monotonic() + 5.0
+    while pending:
+        if time.monotonic() >= deadline:
+            raise TimeoutError('guest_frame_write_deadline')
+        count = stream.write(pending)
+        if type(count) is not int or not 0 < count <= len(pending):
+            raise OSError('guest_frame_write_incomplete')
+        pending = pending[count:]
+    stream.flush()
+    if time.monotonic() >= deadline:
+        raise TimeoutError('guest_frame_write_deadline')
+
+
 class GuestByteChannel:
     """Bounded request/reply over an already connected, VM-scoped binary stream.
 
@@ -52,14 +75,13 @@ class GuestByteChannel:
         self.failure = None
 
     def __call__(self, request):
-        from agent.managed_worker import encode_frame, read_frame
+        from agent.managed_worker import read_frame
         with self.lock:
             if self.failure is not None:
                 raise WorkerPersistenceError(self.failure)
             self.sequence += 1
             try:
-                self.stream.write(encode_frame({'version': 1, 'id': self.sequence, 'request': request}))
-                self.stream.flush()
+                write_guest_frame(self.stream, {'version': 1, 'id': self.sequence, 'request': request})
                 response = read_frame(self.stream)
                 if (set(response) not in ({'version', 'id', 'result'}, {'version', 'id', 'error'})
                         or type(response['version']) is not int or response['version'] != 1

@@ -705,3 +705,90 @@ def test_real_guest_channel_loss_records_unknown_without_losing_assignment(owner
     assert len(authority.db.get_messages('owned')) == (1 if phase == 'after_receipt_commit' else 0)
     with pytest.raises(RuntimeStoreError, match='guest_channel_revoked'):
         endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+
+
+def test_constrained_raw_sockets_deliver_complete_large_request_and_response(owner, tmp_path):
+    import socket
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import ExitStack
+    from agent.runtime_session_guest import GuestByteChannel
+    from gateway.session_worker_guest import serve_guest_request
+    authority, _row, scope, endpoint = owner
+    host, guest = socket.socketpair()
+    writes = {'host': [], 'guest': []}
+    with ExitStack() as stack:
+        stack.enter_context(host)
+        stack.enter_context(guest)
+        def duplex(sock, label):
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+            sock.settimeout(3)
+            reader = stack.enter_context(sock.makefile('rb'))
+            writer = stack.enter_context(sock.makefile('wb', buffering=0))
+            def write(data):
+                count = writer.write(data)
+                writes[label].append((len(data), count))
+                return count
+            return SimpleNamespace(readline=reader.readline, write=write, flush=writer.flush)
+        owner_stream, guest_stream = duplex(host, 'host'), duplex(guest, 'guest')
+        def serve():
+            for _ in range(3):
+                serve_guest_request(owner_stream, endpoint)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            served = pool.submit(serve)
+            store = guest_session_store(GuestByteChannel(guest_stream), scope, tmp_path / 'large-wire')
+            try:
+                text = ('large engineering worklog ' * 20000).strip()
+                assert store.append_messages_batch('owned', [{'role': 'assistant', 'content': text}]) == 1
+                assert store.get_messages_as_conversation('owned')[0]['content'] == text
+                served.result(timeout=10)
+            finally:
+                store.close()
+    assert all(any(count < size for size, count in writes[side]) for side in writes)
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'running'
+
+
+def test_partial_owner_reply_timeout_preserves_committed_receipt_and_marks_unknown(owner):
+    import socket
+    from agent.managed_worker import encode_frame
+    from gateway.session_worker_guest import serve_guest_request
+    authority, _row, scope, endpoint = owner
+    endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+    seed = 'large engineering worklog ' * 20000
+    endpoint({'method': 'worker.persist', 'scope': scope, 'params': {'sequence': 1,
+        'operation': 'transcript.append', 'payload': {'messages': [{'role': 'assistant', 'content': seed}]}}})
+    request = {'version': 1, 'id': 1, 'request': {'method': 'worker.persist', 'scope': scope, 'params': {
+        'sequence': 2, 'operation': 'compression.history', 'payload': {'target': 'owned',
+            'include_ancestors': False, 'include_inactive': False, 'repair_alternation': True,
+            'include_row_ids': True, 'include_compacted': False}}}}
+    host, guest = socket.socketpair()
+    with host, guest:
+        host.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        host.settimeout(.2)
+        guest.sendall(encode_frame(request))
+        with host.makefile('rwb', buffering=0) as stream:
+            with pytest.raises(OSError):
+                serve_guest_request(stream, endpoint)  # peer deliberately does not read
+    assert authority.db._read_one('SELECT last_sequence FROM worker_executions')[0] == 2
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    assert authority.db.get_messages('owned')[0]['content'] == seed
+    assert endpoint.revoked
+
+
+def test_partial_guest_request_timeout_is_sticky_before_reading_response():
+    import socket
+    from agent.runtime_session_guest import GuestByteChannel
+    host, guest = socket.socketpair()
+    reads = []
+    with host, guest:
+        guest.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
+        guest.settimeout(.2)
+        with guest.makefile('rwb', buffering=0) as raw:
+            def read(size):
+                reads.append(size)
+                return raw.readline(size)
+            channel = GuestByteChannel(SimpleNamespace(write=raw.write, flush=raw.flush, readline=read))
+            with pytest.raises(OSError):
+                channel({'worklog': 'x' * 500000})  # Owner deliberately does not read
+            assert reads == [], 'a truncated request must never enter the reply wait'
+            with pytest.raises(WorkerPersistenceError, match='guest_transport_lost'):
+                channel({'retry': 'must not reconnect'})

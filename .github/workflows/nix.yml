@@ -57,12 +57,12 @@ jobs:
   # flake turns main red after the merge.
   detect:
     name: Detect affected areas
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       nix: ${{ steps.classify.outputs.nix }}
     steps:
-      - uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # A stable run passes the claim commit. Every other event tests its own head SHA.
           ref: ${{ inputs.commit || github.sha }}
@@ -81,13 +81,13 @@ jobs:
     if: needs.detect.outputs.nix == 'true' || inputs.release == true
     # The build compiles the package and its whole dependency closure, so this
     # takes minutes and not seconds when the cache misses. `nix flake check`
-    # builds 21 checks, and --max-jobs defaults to the core count. It uses the
-    # wider runner with no more configuration.
-    runs-on: blacksmith-32vcpu-ubuntu-2404
+    # builds every check on the standard GitHub-hosted runner. Bound concurrent
+    # derivations and per-build cores to fit 16 GiB; retain the complete check set.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           # A stable run passes the claim commit. Every other event tests its own head SHA.
           ref: ${{ inputs.commit || github.sha }}
@@ -161,7 +161,37 @@ jobs:
         # A path: flake has no git metadata, so the release source names its
         # commit with ?rev=: without it self.rev is null, the install stamp
         # carries no commit, and the packaged CLI reports "unknown".
-        run: nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs
+        run: |
+          nproc
+          free -h
+          df -h / /nix
+          vmstat -w 5 > "$RUNNER_TEMP/nix-resources.log" &
+          monitor_pid=$!
+          trap 'kill "$monitor_pid"; wait "$monitor_pid" || true' EXIT
+          /usr/bin/time -v -o "$RUNNER_TEMP/nix-time.txt" \
+            nix flake check "${{ inputs.release == true && format('path:{0}/release-source?rev={1}', runner.temp, env.CANDIDATE_COMMIT) || '.' }}" --print-build-logs --max-jobs 2 --cores 2
+
+      - name: Record Nix runner measurements
+        if: always()
+        run: |
+          {
+            echo '## Nix GitHub-hosted runner resources'
+            echo '```text'
+            nproc
+            free -h
+            df -h / /nix
+            cat "$RUNNER_TEMP/nix-time.txt" "$RUNNER_TEMP/nix-resources.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Nix runner measurements
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nix-runner-resources
+          path: |
+            ${{ runner.temp }}/nix-time.txt
+            ${{ runner.temp }}/nix-resources.log
 
       - name: Verify release package runtime identity
         if: inputs.release == true

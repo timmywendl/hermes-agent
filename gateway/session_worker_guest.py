@@ -43,6 +43,25 @@ def _guest_claim(scope, principal_id):
                                  payload=scope | {'principal_id': principal_id})
 
 
+_ASSIGNMENT_PREFIX = 'guest.assignment.v1:'
+
+
+def _guest_assignment_record(conn, scope, principal_id):
+    instance = conn.execute('SELECT instance_id FROM runtime_epoch WHERE singleton=1').fetchone()[0]
+    return json.dumps({'version': 'HERMES_GUEST_ASSIGNMENT_V1', 'scope': scope,
+                       'principal_id': principal_id, 'owner_instance': instance},
+                      sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def _verify_guest_assignment(conn, scope, principal_id):
+    row = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                       (_ASSIGNMENT_PREFIX + scope['execution_id'],)).fetchone()
+    # Immutable canonical bytes: malformed, missing, duplicate-key or mismatched
+    # identity cannot be normalized into a new assignment after Owner loss.
+    if row is None or row[0] != _guest_assignment_record(conn, scope, principal_id):
+        raise RuntimeStoreError('guest_assignment_unavailable')
+
+
 def reserve_guest_admission(authority, *, admission_id, principal_id, binding):
     """Reserve the existing started admission without inventing a Host PID.
 
@@ -71,12 +90,19 @@ def reserve_guest_admission(authority, *, admission_id, principal_id, binding):
             raise RuntimeStoreError('admission_conflict')
         scope = {'session_id': session_id, 'generation': generation, 'epoch': authority.epoch,
                  'execution_id': 'admission-worker:' + admission_id, **asdict(binding)}
+        key = _ASSIGNMENT_PREFIX + scope['execution_id']
+        if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (key,)).fetchone():
+            raise RuntimeStoreError('guest_assignment_conflict')
         # The established admission-worker prefix prevents cross-epoch adoption.
         claim = _guest_claim(scope, principal_id)
         conn.execute("INSERT INTO worker_executions"
                      "(execution_id,session_id,kind,owner_epoch,generation,status,adoption_digest) "
                      "VALUES(?,?,'kanban',?,?,'registered',?)",
                      (scope['execution_id'], session_id, authority.epoch, generation, _secret_digest(claim)))
+        # Persist the exact non-secret VM/Task/Run/Owner identity before exposing
+        # the reservation. A failure here rolls back the worker row as well.
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
+                     (key, _guest_assignment_record(conn, scope, principal_id)))
         return scope
     return authority.db._execute_write(write)
 
@@ -139,6 +165,10 @@ class GuestOwnerEndpoint:
                 or not compare_digest(row['adoption_digest'],
                                       _secret_digest(_guest_claim(self.scope, self.principal_id)))):
             raise RuntimeStoreError('permission_denied')
+        # Revocation can only remove authority: damaged assignment bytes must
+        # not prevent the original, digest-bound endpoint from recording UNKNOWN.
+        if not allow_unknown:
+            _verify_guest_assignment(conn, self.scope, self.principal_id)
         admissions = ('started', 'unknown') if allow_unknown else ('started',)
         workers = ('registered', 'running', 'unknown') if allow_unknown else ('registered', 'running')
         if admission['status'] not in admissions or row['status'] not in workers:
@@ -260,18 +290,24 @@ class GuestOwnerEndpoint:
 def serve_guest_request(stream, endpoint):
     """Process one frame on the original Owner's authenticated VM stream.
 
-    Transport loss must call endpoint.revoke in the Owner's acquisition/cleanup
-    path; this function never treats EOF or a sent reply as physical retirement.
+    Wire loss durably revokes this assignment. The acquisition/cleanup path
+    still owns physical Stop; EOF or a sent reply is never a retirement proof.
     """
-    from agent.managed_worker import encode_frame, read_frame
-    request = read_frame(stream)
-    if (set(request) != {'version', 'id', 'request'} or type(request['version']) is not int
-            or request['version'] != 1 or type(request['id']) is not int or request['id'] < 1):
-        raise RuntimeStoreError('invalid_guest_frame')
-    response = {'version': 1, 'id': request['id']}
     try:
-        response['result'] = endpoint(request['request'])
-    except RuntimeStoreError as exc:
-        response['error'] = exc.reason
-    stream.write(encode_frame(response))
-    stream.flush()
+        from agent.managed_worker import encode_frame, read_frame
+        request = read_frame(stream)
+        if (set(request) != {'version', 'id', 'request'} or type(request['version']) is not int
+                or request['version'] != 1 or type(request['id']) is not int or request['id'] < 1):
+            raise RuntimeStoreError('invalid_guest_frame')
+        response = {'version': 1, 'id': request['id']}
+        try:
+            response['result'] = endpoint(request['request'])
+        except RuntimeStoreError as exc:
+            response['error'] = exc.reason
+        stream.write(encode_frame(response))
+        stream.flush()
+    except (EOFError, OSError, ValueError):
+        # An applied receipt may already be committed when reply delivery fails.
+        # Never remove the assignment or infer retirement from a broken channel.
+        endpoint.revoke()
+        raise

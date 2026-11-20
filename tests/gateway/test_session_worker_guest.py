@@ -19,12 +19,17 @@ from hermes_state_runtime import (
 
 
 @pytest.fixture
-def owner(tmp_path):
+def owner(tmp_path, request, monkeypatch):
+    if hasattr(request, 'param'):
+        monkeypatch.setattr('hermes_state_wal.resolve_journal_mode', lambda: request.param.lower())
     with closing(SessionDB(tmp_path / 'owner.db')) as db:
         db.create_session('owned', 'cli')
         db.create_session('other', 'cli')
         epoch = begin_runtime_epoch(db, instance_id='original-owner')
-        authority = SimpleNamespace(db=db, epoch=epoch, _require_admission_open=lambda: None)
+        mode = db._conn.execute('PRAGMA journal_mode').fetchone()[0]
+        if hasattr(request, 'param'):
+            assert mode == request.param.lower()
+        authority = SimpleNamespace(db=db, epoch=epoch, _require_admission_open=lambda: None, journal_mode=mode)
         admit_session_input(db, epoch=epoch, principal_id='human', session_id='owned',
                             request_id='task', payload={'text': 'work original task'})
         row = claim_session_input(db, epoch=epoch, session_id='owned')
@@ -569,3 +574,134 @@ def test_real_agent_session_constructor_maps_only_pinned_guest_identity(owner, t
             assert {key: authority.db.get_session('owned')[key] for key in canonical} == canonical
     finally:
         store.close()
+
+
+@pytest.mark.parametrize('owner', ['WAL', 'DELETE'], indirect=True)
+def test_guest_reservation_commits_recoverable_identity_atomically(owner):
+    import json
+    import sqlite3
+    authority, row, scope, _endpoint = owner
+    key = 'guest.assignment.v1:' + scope['execution_id']
+    # A separate connection observes committed identity, not an in-memory Endpoint.
+    with closing(sqlite3.connect(authority.db.db_path)) as observer:
+        assert observer.execute('PRAGMA journal_mode').fetchone()[0] == authority.journal_mode
+        stored = observer.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
+        assert stored is not None, 'Owner restart must retain exact Task/Run/VM assignment before launch'
+        record = json.loads(stored[0])
+        assert record == {'version': 'HERMES_GUEST_ASSIGNMENT_V1', 'scope': scope,
+                          'principal_id': 'human', 'owner_instance': 'original-owner'}
+        assert observer.execute('SELECT status FROM worker_executions WHERE execution_id=?',
+                                (scope['execution_id'],)).fetchone()[0] == 'registered'
+    assert scope['execution_id'] == 'admission-worker:' + row['admission_id']
+    assert not ({'secret', 'api_key', 'pid', 'birth', 'profile_id'} & set(record))
+
+
+def test_guest_reservation_rolls_back_if_identity_cannot_be_saved(owner):
+    import sqlite3
+    authority, _row, _scope, _endpoint = owner
+    admit_session_input(authority.db, epoch=authority.epoch, principal_id='human', session_id='other',
+                        request_id='other-reservation', payload={'text': 'same Owner, other task'})
+    row = claim_session_input(authority.db, epoch=authority.epoch, session_id='other')
+    authority.db._execute_write(lambda conn: conn.execute(
+        "CREATE TRIGGER reject_guest_identity BEFORE INSERT ON state_meta "
+        "WHEN NEW.key LIKE 'guest.assignment.v1:%' BEGIN SELECT RAISE(ABORT,'identity disk failure'); END"))
+    with pytest.raises(sqlite3.IntegrityError, match='identity disk failure'):
+        reserve_guest_admission(authority, admission_id=row['admission_id'], principal_id='human',
+            binding=GuestBinding('other-task', 8, 'other-vm', 1, 'a' * 64, 'b' * 64))
+    execution = 'admission-worker:' + row['admission_id']
+    assert authority.db._read_one('SELECT * FROM worker_executions WHERE execution_id=?', (execution,)) is None
+    assert authority.db.get_meta('guest.assignment.v1:' + execution) is None
+    assert authority.db._read_one('SELECT status FROM session_admissions WHERE admission_id=?',
+                                  (row['admission_id'],))[0] == 'started'
+
+
+@pytest.mark.parametrize('damage', ['missing', 'malformed', 'foreign-instance', 'foreign-vm'])
+def test_damaged_guest_identity_refuses_adoption_without_erasing_unknown(owner, damage):
+    import json
+    authority, _row, scope, endpoint = owner
+    key = 'guest.assignment.v1:' + scope['execution_id']
+    original = authority.db.get_meta(key)
+    assert original is not None, 'durable identity must be present before testing corruption'
+    if damage == 'missing':
+        authority.db._execute_write(lambda conn: conn.execute('DELETE FROM state_meta WHERE key=?', (key,)))
+    elif damage == 'malformed':
+        authority.db.set_meta(key, '{broken')
+    else:
+        record = json.loads(original)
+        if damage == 'foreign-instance':
+            record['owner_instance'] = 'foreign-owner'
+        else:
+            record['scope']['vm_id'] = 'foreign-vm'
+        authority.db.set_meta(key, json.dumps(record))
+    damaged = authority.db.get_meta(key)
+    with pytest.raises(RuntimeStoreError, match='guest_assignment_unavailable'):
+        endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+    assert authority.db.get_meta(key) == damaged
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'registered'
+    assert authority.db._read_one('SELECT count(*) FROM worker_receipts')[0] == 0
+    endpoint.revoke()
+    endpoint.revoke()
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    assert authority.db.get_meta(key) == damaged
+    epoch = begin_runtime_epoch(authority.db, instance_id='restart-owner')
+    recover_session_inputs(authority.db, epoch=epoch)
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    assert authority.db.get_meta(key) == damaged
+    with pytest.raises(RuntimeStoreError, match='guest_physical_retirement_required'):
+        resolve_unknown_session_input(authority.db, epoch=epoch, admission_id=_row['admission_id'],
+                                      generation=scope['generation'])
+
+
+def test_new_owner_connection_retains_old_vm_identity_without_resume_or_retirement(owner):
+    import json
+    authority, row, scope, endpoint = owner
+    key = 'guest.assignment.v1:' + scope['execution_id']
+    before = authority.db.get_meta(key)
+    endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+    with closing(SessionDB(authority.db.db_path)) as restarted:
+        epoch = begin_runtime_epoch(restarted, instance_id='replacement-owner')
+        assert recover_session_inputs(restarted, epoch=epoch) == 1
+        after = restarted.get_meta(key)
+        assert after == before
+        record = json.loads(after)
+        assert record['scope'] == scope and record['owner_instance'] == 'original-owner'
+        assert restarted._read_one('SELECT instance_id FROM runtime_epoch')[0] == 'replacement-owner'
+        new_authority = SimpleNamespace(db=restarted, epoch=epoch, _require_admission_open=lambda: None)
+        for owner_authority in (authority, new_authority):
+            old_endpoint = GuestOwnerEndpoint(owner_authority, record['scope'], principal_id=record['principal_id'])
+            with pytest.raises(RuntimeStoreError, match='stale_epoch'):
+                old_endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+        with pytest.raises(RuntimeStoreError, match='guest_physical_retirement_required'):
+            resolve_unknown_session_input(restarted, epoch=epoch, admission_id=row['admission_id'],
+                                          generation=scope['generation'])
+        assert restarted._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert restarted.get_meta(key) == before
+
+
+@pytest.mark.parametrize('phase', ['before_request', 'after_receipt_commit'])
+def test_real_guest_channel_loss_records_unknown_without_losing_assignment(owner, phase):
+    import socket
+    from agent.managed_worker import encode_frame
+    from gateway.session_worker_guest import serve_guest_request
+    authority, _row, scope, endpoint = owner
+    key = 'guest.assignment.v1:' + scope['execution_id']
+    before = authority.db.get_meta(key)
+    host, guest = socket.socketpair()
+    with host:
+        host.settimeout(5)
+        if phase == 'after_receipt_commit':
+            endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})
+            guest.sendall(encode_frame({'version': 1, 'id': 1, 'request': {
+                'method': 'worker.persist', 'scope': scope, 'params': {'sequence': 1,
+                    'operation': 'transcript.append',
+                    'payload': {'messages': [{'role': 'assistant', 'content': 'committed before channel loss'}]}}}}))
+        guest.close()  # only this owned socket; no listener, Gateway or Worker
+        with host.makefile('rwb', buffering=0) as stream:
+            with pytest.raises((EOFError, OSError)):
+                serve_guest_request(stream, endpoint)
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    assert authority.db._read_one('SELECT status FROM session_admissions')[0] == 'unknown'
+    assert authority.db.get_meta(key) == before
+    assert len(authority.db.get_messages('owned')) == (1 if phase == 'after_receipt_commit' else 0)
+    with pytest.raises(RuntimeStoreError, match='guest_channel_revoked'):
+        endpoint({'method': 'worker.adopt', 'scope': scope, 'params': {}})

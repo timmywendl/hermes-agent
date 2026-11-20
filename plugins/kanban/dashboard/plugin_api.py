@@ -37,10 +37,13 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import kanban_diagnostics as kd
 from hermes_cli.kanban_db import KANBAN_ATTACHMENT_MAX_BYTES, _collision_free_path, _safe_attachment_name
+from plugins.kanban.dashboard.workbench_api import router as workbench_router
 
 log = logging.getLogger(__name__)
 
 router = APIRouter()
+
+router.include_router(workbench_router)
 
 _BOARD_Q = Query(None, description="Kanban board slug (omit for current)")
 

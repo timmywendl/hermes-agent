@@ -133,7 +133,8 @@ jobs:
 
   # Build and test the image for each architecture. This job runs PR code, so
   # in standalone mode it must remain secret-free. Publishing happens in the
-  # separate, protected publish paths after these tests pass.
+  # separate, protected publish paths after these tests pass. The personal fork
+  # participates only in this secret-free validation, never upstream publishing.
   #
   # Runs ONLY in standalone mode and in the release 'test' phase: it builds
   # the SAME Dockerfile and runs the SAME real docker-integration tests, then
@@ -145,7 +146,7 @@ jobs:
     needs: [mode, detect]
     if: >-
       !cancelled() && needs.mode.result == 'success' &&
-      ((needs.mode.outputs.release != 'true' && github.repository == 'NousResearch/hermes-agent' && needs.detect.outputs.build == 'true') || needs.mode.outputs.phase == 'test')
+      ((needs.mode.outputs.release != 'true' && contains(fromJSON('["NousResearch/hermes-agent","timmywendl/hermes-agent"]'), github.repository) && needs.detect.outputs.build == 'true') || needs.mode.outputs.phase == 'test')
     strategy:
       fail-fast: false
       matrix:

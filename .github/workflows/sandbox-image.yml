@@ -39,7 +39,7 @@ env:
 jobs:
   # PR code: secret-free build + smoke per arch.
   build:
-    if: github.repository == 'NousResearch/hermes-agent'
+    if: contains(fromJSON('["NousResearch/hermes-agent","timmywendl/hermes-agent"]'), github.repository)
     strategy:
       fail-fast: false
       matrix:

@@ -17,7 +17,7 @@ from plugins.kanban.dashboard.workbench_projection import snapshot as _snapshot,
 
 log = logging.getLogger(__name__)
 router = APIRouter()
-EXECUTION = {"state": "paused", "reason": "Board execution is paused; saved plans remain blocked and unassigned. Human responses do not dispatch work."}
+EXECUTION = {"state": "planning_only", "reason": "Workbench does not dispatch execution; saved plans remain blocked and unassigned. Existing runtime controls determine execution eligibility."}
 
 
 def fetched_at() -> str:

@@ -72,7 +72,7 @@ def test_confirm_is_atomic_inert_and_recovers_exact_replays(setup, monkeypatch):
     confirmed = client.post(PREFIX + "/confirm", json=request)
     assert confirmed.status_code == 200, confirmed.text
     receipt = confirmed.json()
-    assert receipt["execution"]["state"] == "paused"
+    assert receipt["execution"]["state"] == "planning_only"
     replay = client.post(PREFIX + "/confirm", json=request).json()
     assert replay["replayed"] is True
     assert replay["root_id"] == receipt["root_id"]

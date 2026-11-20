@@ -112,7 +112,7 @@ describe('Mission Workbench', () => {
     vi.mocked(fetchWorkbench).mockResolvedValue(data)
     mount()
     expect(await screen.findByRole('heading', { name: 'Improve project' })).toBeTruthy()
-    expect(screen.getByText('Board execution is paused')).toBeTruthy()
+    expect(screen.getByText('Workbench does not dispatch execution')).toBeTruthy()
     expect(screen.getByText('No recorded execution. Agent activity is unknown.')).toBeTruthy()
     expect(screen.getByRole('button', { name: /Write the regression/ })).toBeTruthy()
     expect(screen.queryByText('Waiting for Human Merge')).toBeNull()

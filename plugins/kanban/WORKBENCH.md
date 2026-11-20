@@ -23,6 +23,8 @@ and changed files at the current PR HEAD. Missing access, missing required polic
 moving HEADs and absent evidence stay UNKNOWN. A recorded run outcome is reported
 evidence, not proof of physical execution ownership or independent acceptance.
 
-Board execution remains paused. This slice provides planning and inspection; it
+Workbench does not dispatch execution. This slice provides planning and inspection; it
 does not demonstrate Worker-owned engineering delivery or qualify a new execution
-environment. D controls and existing STOP_UNCERTAIN records remain authoritative.
+environment. Existing runtime controls determine execution eligibility; this view
+does not attest that D is installed. D controls and existing STOP_UNCERTAIN records
+remain authoritative.

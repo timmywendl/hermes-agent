@@ -85,7 +85,7 @@ def workbench(board: str | None = Query(None), project_id: str | None = Query(No
     if project_id:
         result["tasks"] = [t for t in result["tasks"] if t.get("project_id") == project_id]
         ids = {t["id"] for t in result["tasks"]}
-        for key in ("runs", "activity", "decisions"):
+        for key in ("runs", "activity", "comments", "decisions"):
             result[key] = [r for r in result[key] if r["task_id"] in ids]
     return {"fetched_at": fetched_at(), "board": {"slug": slug, "title": meta.get("name") or slug, "project_id": meta.get("project_id")}, "projects": projects, **result, "execution": EXECUTION}
 

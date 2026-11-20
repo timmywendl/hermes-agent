@@ -122,6 +122,28 @@ def test_read_preserves_unknown_metadata_and_never_treats_dependencies_as_lineag
     assert _disk(home) == before
 
 
+def test_worklog_preserves_authors_bodies_and_project_board_scope(setup):
+    client, home, project_id = setup
+    receipt = client.post(PREFIX + "/confirm", json=_confirm(project_id)).json()
+    child = receipt["work_item_ids"][0]
+    kb.create_board("other", name="Other")
+    with kbc.connect_closing() as conn:
+        note_id = kb.add_comment(conn, child, "codex", "Reported test failure: widget creation returns 500.")
+        kb.add_comment(conn, child, "claude", "Review note: reproduce the failure before changing the handler.")
+        unrelated = kb.create_task(conn, title="Another scope", triage=True)
+        kb.add_comment(conn, unrelated, "other-agent", "Unrelated project worklog")
+    before = _disk(home)
+    data = client.get(PREFIX, params={"project_id": project_id}).json()
+    assert [(c["author"], c["body"]) for c in data["comments"]] == [
+        ("codex", "Reported test failure: widget creation returns 500."),
+        ("claude", "Review note: reproduce the failure before changing the handler."),
+    ]
+    assert data["comments"][0]["id"] == note_id
+    assert all(c["task_id"] == child and c["created_at"] > 0 for c in data["comments"])
+    assert client.get(PREFIX, params={"board": "other"}).json()["comments"] == []
+    assert _disk(home) == before
+
+
 def test_decision_response_keeps_task_blocked_and_audits_history(setup):
     client, _home, _project_id = setup
     with kbc.connect_closing() as conn:

@@ -27,6 +27,7 @@ export function AgentActivity({ snapshot, taskIds }: { snapshot: WorkbenchSnapsh
   const t = useWorkbenchText()
   const runs = snapshot.runs.filter(run => taskIds.has(run.task_id))
   const events = snapshot.activity.filter(event => taskIds.has(event.task_id))
+  const comments = snapshot.comments?.filter(comment => taskIds.has(comment.task_id))
 
   return (
     <section aria-label={t('activity')} className="workbench-section">
@@ -55,6 +56,21 @@ export function AgentActivity({ snapshot, taskIds }: { snapshot: WorkbenchSnapsh
           )}
         </article>
       ))}
+      <h3>{t('worklog')}</h3>
+      {!comments && <p className="workbench-muted">{t('worklogUnavailable')}</p>}
+      {comments?.length === 0 && <p className="workbench-muted">{t('noWorklog')}</p>}
+      <ol className="workbench-timeline">
+        {comments?.map(comment => (
+          <li key={comment.id}>
+            <time>{workbenchTime(comment.created_at)}</time>
+            <span>
+              {comment.author} · {t('task')} {comment.task_id}
+            </span>
+            <small>{t('evidence')}</small>
+            <p className="workbench-prose">{comment.body}</p>
+          </li>
+        ))}
+      </ol>
       <h3>{t('history')}</h3>
       {events.length === 0 && <p className="workbench-muted">{t('noHistory')}</p>}
       <ol className="workbench-timeline">

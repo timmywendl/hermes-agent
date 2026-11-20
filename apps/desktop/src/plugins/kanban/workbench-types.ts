@@ -23,6 +23,7 @@ export interface WorkbenchSnapshot {
   tasks: WorkbenchTask[]
   runs: (KanbanRun & { task_id: string; custody_state?: string })[]
   activity: (KanbanEvent & { task_id: string })[]
+  comments?: { id: number; task_id: string; author: string; body: string; created_at: number }[]
   decisions: WorkbenchDecision[]
   execution: { state: string; reason: string }
   unknowns: string[]

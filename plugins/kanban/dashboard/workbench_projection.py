@@ -139,4 +139,4 @@ def snapshot(conn) -> dict:
     if runs:
         unknowns.append("Run custody is UNKNOWN: historical run records are displayed without asserting live process ownership")
     _lineage(tasks, events, unknowns)
-    return {"tasks": tasks, "runs": runs, "activity": events, "decisions": _decisions(tasks, events, comments), "unknowns": unknowns}
+    return {"tasks": tasks, "runs": runs, "activity": events, "comments": comments, "decisions": _decisions(tasks, events, comments), "unknowns": unknowns}

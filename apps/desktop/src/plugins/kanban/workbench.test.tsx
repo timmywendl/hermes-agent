@@ -106,6 +106,37 @@ function mount() {
 }
 
 describe('Mission Workbench', () => {
+  it('shows original authored worklog only for the selected Mission', async () => {
+    vi.mocked(fetchWorkbench).mockResolvedValue({
+      ...snapshot(),
+      comments: [
+        {
+          id: 1,
+          task_id: 'item',
+          author: 'codex',
+          body: 'Reported test failure: widget creation returns 500.',
+          created_at: 1000
+        },
+        {
+          id: 2,
+          task_id: 'item',
+          author: 'claude',
+          body: 'Review note: reproduce before changing the handler.',
+          created_at: 1001
+        },
+        { id: 3, task_id: 'legacy', author: 'other-agent', body: 'Another Mission worklog', created_at: 1002 }
+      ]
+    })
+    mount()
+    await screen.findByText('Reported test failure: widget creation returns 500.')
+    expect(screen.getByText('Review note: reproduce before changing the handler.')).toBeTruthy()
+    expect(screen.queryByText('Another Mission worklog')).toBeNull()
+    expect(screen.getByText('No recorded execution. Agent activity is unknown.')).toBeTruthy()
+    fireEvent.click(screen.getByRole('button', { name: /Legacy task/ }))
+    expect(screen.getByText('Another Mission worklog')).toBeTruthy()
+    expect(screen.queryByText('Reported test failure: widget creation returns 500.')).toBeNull()
+  })
+
   it('presents canonical Mission membership and missing execution honestly', async () => {
     const data = snapshot()
     data.tasks.reverse()

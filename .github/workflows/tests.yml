@@ -110,7 +110,7 @@ jobs:
           scripts/run_tests.sh
         env:
           HERMES_TEST_SLICE: ${{ matrix.slice }}/2
-          HERMES_TEST_WORKERS: 32
+          HERMES_TEST_WORKERS: 4
           HERMES_TEST_FILE_TIMEOUT: 600
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
@@ -414,7 +414,7 @@ jobs:
           # Each file drives real installs/updaters (process trees plus uv and
           # git I/O); cpu_count of them at once starves their deadlines. A
           # shard holds at most ~7 files, so this runs each shard in one wave.
-          HERMES_TEST_WORKERS: "6"
+          HERMES_TEST_WORKERS: "4"
           HERMES_TEST_FILE_TIMEOUT: "3000"
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

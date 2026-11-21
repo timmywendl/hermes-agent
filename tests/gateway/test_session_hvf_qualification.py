@@ -695,3 +695,37 @@ def test_finalizer_persists_late_exact_reap_without_retiring_failed_attempt(owne
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.asyncio
+async def test_failed_pending_campaign_join_does_not_skip_late_reap(owner):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    handle.process = child
+    handle.identity = physical.child_identity(child, '/bin/cat')
+    path = Path(authority.db.db_path)
+    try:
+        observed = physical.exit_observation(handle)
+        adapter._persist_exit(candidate, handle, observed, failure=RuntimeStoreError('inert_original_timeout'))
+        async def pending_failure():
+            raise RuntimeStoreError('inert_pending_campaign_failure')
+        authority._hvf_campaign_task = asyncio.create_task(pending_failure())
+        with pytest.raises(RuntimeStoreError, match='inert_pending_campaign_failure'):
+            await adapter._finish_qualification_owner(candidate, authority, candidate.profile)
+        with closing(sqlite3.connect(path)) as db:
+            persisted = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?', (handle.key,)).fetchone()[0])
+        assert persisted['state'] == 'STOP_UNCERTAIN'
+        assert persisted['failure'] == 'inert_original_timeout'
+        assert persisted['exit_observation']['returncode'] == 0
+        assert persisted['exit_observation']['wait_result'] == 'REAPED_BY_ORIGINAL_OWNER'
+        with closing(sqlite3.connect(candidate.board)) as db:
+            board_record = json.loads(db.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
+        assert board_record == persisted
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)

@@ -6,6 +6,7 @@ from contextlib import closing
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -741,7 +742,6 @@ def _final_wait_and_record(candidate, handle):
 
 async def _qualification_main(args):
     from contextlib import ExitStack
-    from gateway.runtime_ownership import process_ownership
     candidate = None if args.prepare_home else await asyncio.to_thread(load_candidate, args.manifest)
     selected = Path(args.prepare_home) if args.prepare_home else candidate.profile
     home = await asyncio.to_thread(selected.resolve)
@@ -760,18 +760,35 @@ async def _qualification_main(args):
         result['actor'] = actor
         return result
     finally:
-        pending = getattr(authority, '_hvf_campaign_task', None)
-        if pending is not None and not pending.done():
-            signal_hvf_stop(authority)
+        await _finish_qualification_owner(candidate, authority, home)
+
+
+async def _finish_qualification_owner(candidate, authority, home):
+    from gateway.runtime_ownership import process_ownership
+    from gateway.session_runtime_workers import tracked_write
+    pending_error = None
+    pending = getattr(authority, '_hvf_campaign_task', None)
+    if pending is not None and not pending.done():
+        signal_hvf_stop(authority)
+        try:
             await asyncio.shield(pending)
-        live = [h for h in getattr(authority, '_hvf_workers', {}).values()
-                if h.process is not None and h.process.returncode is None]
-        # A late successful reap must update the same sticky failed attempt.
-        from gateway.session_runtime_workers import tracked_write
+        except BaseException as error:
+            # Joining a failed campaign must not bypass late-child observations.
+            logging.getLogger(__name__).exception('Campaign join failed; retaining late-child cleanup')
+            pending_error = error
+    live = [h for h in getattr(authority, '_hvf_workers', {}).values()
+            if h.process is not None and h.process.returncode is None]
+    try:
         for handle in live:
             await tracked_write(authority, lambda handle=handle: _final_wait_and_record(candidate, handle))
-        authority.db.close()
-        process_ownership.release(home)
+    except BaseException as error:
+        if pending_error is not None:
+            error.add_note(f'campaign join also failed: {pending_error!r}')
+        raise
+    authority.db.close()
+    process_ownership.release(home)
+    if pending_error is not None:
+        raise pending_error
 
 
 def main():

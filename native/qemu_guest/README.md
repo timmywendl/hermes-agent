@@ -129,3 +129,9 @@ latency/usage and Native inference require the separate D2 qualification. Human'
 only policy decision here is acceptance/rejection of this finite D2 operation;
 Native APPLY also needs concrete reviewed artifact/grant evidence, not a policy
 change to the accepted Owner architecture.
+
+## Offline artifact construction
+
+See [BUILD.md](BUILD.md) for the separate pinned ARM64 Q2 artifact builder,
+read-only raw-image verification and remaining Native qualification requirements.
+Artifact construction does not qualify boot, Worker execution or D2 inference.

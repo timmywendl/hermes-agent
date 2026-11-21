@@ -5,6 +5,7 @@ supply the inherited socketpair endpoint bound to this exact reservation. Q1's
 inert campaign, grant and helper are not extended or reused as launch authority.
 """
 import json
+import sqlite3
 import threading
 
 from agent.guest_inference import validate_request
@@ -28,21 +29,32 @@ class OwnerSerialSession:
         self.stop = threading.Event()
         self.io_lock = threading.Lock()
         self.inference_count = 0
-        workers = getattr(endpoint.authority, '_q2_guest_channels', None)
-        if workers is None:
-            workers = endpoint.authority._q2_guest_channels = {}
-        key = endpoint.scope['session_id']
-        if key in workers:
-            raise RuntimeStoreError('guest_unretired_channel')
+        self.wire = None
         encoded = json.dumps(self.work, sort_keys=True, separators=(',', ':'), allow_nan=False)
-        with endpoint.authority.db._read_ctx() as conn:
+        def attach(conn):
             endpoint._verify(conn)
+            workers = endpoint.authority.__dict__.setdefault('_q2_guest_channels', {})
+            key = endpoint.scope['session_id']
+            if key in workers:
+                raise RuntimeStoreError('guest_unretired_channel')
             saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                                  ('guest.work.v1:' + endpoint.scope['execution_id'],)).fetchone()
             if saved is None or saved[0] != encoded or getattr(endpoint, '_prepared_work', None) != encoded:
                 raise RuntimeStoreError('guest_work_not_prepared')
-        self.wire = SerialWire(fd, endpoint.scope)
-        workers[key] = self  # retained on EOF, cancel, result or Owner loss
+            self.wire = SerialWire(fd, endpoint.scope)
+            workers[key] = self  # retained on EOF, cancel, result or Owner loss
+        try:
+            endpoint.authority.db._execute_write(attach)
+        except Exception as failure:
+            self.stop.set()
+            if self.wire is not None:
+                self.wire.close()
+                self.wire.release_fd()
+                try:
+                    endpoint.revoke()
+                except (sqlite3.Error, OSError, RuntimeStoreError) as storage_failure:
+                    failure.add_note('Guest attachment revocation persistence failed: ' + str(storage_failure))
+            raise
 
     def serve_one(self):
         with self.io_lock:
@@ -66,7 +78,7 @@ class OwnerSerialSession:
             except RuntimeStoreError as exc:
                 payload = {'error': exc.reason}
             self.wire.send(frame['channel'], 'reply', payload, reply_to=frame['seq'])
-        except (ValueError, TypeError, KeyError, OSError, EOFError):
+        except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError):
             self.cancel(send=False)
             import os
             import socket

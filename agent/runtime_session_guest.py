@@ -115,10 +115,12 @@ def execute_guest(work, channel, *, persistence_exchange, control_stream, outbox
     from agent import runtime_session_store
     runtime_session_store._worker_process = True
     store = guest_session_store(persistence_exchange, frame['scope'], outbox_dir)
+    from agent.guest_inference import bind_serial_inference
     try:
-        run_adopted(frame, channel, store, control_stream=control_stream,
-                    ready_identity={'assignment': frame['scope']},
-                    agent_factory=guest_agent_factory(channel))
+        with bind_serial_inference(channel, work['model']):
+            run_adopted(frame, channel, store, control_stream=control_stream,
+                        ready_identity={'assignment': frame['scope']},
+                        agent_factory=guest_agent_factory(channel))
     finally:
         store.close()
 
@@ -126,9 +128,7 @@ def execute_guest(work, channel, *, persistence_exchange, control_stream, outbox
 def guest_agent_factory(channel):
     """Reuse AIAgent with its SDK using a serial-only HTTP transport."""
     from run_agent import AIAgent
-    from agent.guest_inference import SerialHTTPTransport
-    import httpx
-    from openai import OpenAI
+    from agent.guest_inference import serial_openai_client
 
     class GuestAgent(AIAgent):
         def __init__(self, **kwargs):
@@ -136,6 +136,5 @@ def guest_agent_factory(channel):
             super().__init__(**kwargs)
 
         def _create_openai_client(self, kwargs, **_options):
-            return OpenAI(api_key='guest-transport', base_url='http://guest.invalid/v1',
-                          max_retries=0, http_client=httpx.Client(transport=SerialHTTPTransport(channel), trust_env=False))
+            return serial_openai_client(channel)
     return GuestAgent

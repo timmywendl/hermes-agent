@@ -4,6 +4,11 @@ The placeholder HTTP request is intercepted inside the Guest process. No socket,
 HTTP headers, credentials or destination cross the VM boundary.
 """
 import json
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
+from inspect import signature
+from typing import Any, Callable, ParamSpec, TypeVar
 
 import httpx
 
@@ -69,3 +74,62 @@ class SerialHTTPTransport(httpx.BaseTransport):
         if len(raw) > MAX_FRAME:
             raise SerialError('inference_response_too_large')
         return httpx.Response(200, headers={'content-type': 'text/event-stream'}, content=raw)
+
+
+_SERIAL_INFERENCE: ContextVar[tuple[Any, str, list[Any]] | None] = ContextVar('guest_serial_inference', default=None)
+
+
+@contextmanager
+def bind_serial_inference(channel, model):
+    """Bind all existing main/aux SDK clients to this Guest's one channel."""
+    state = (channel, model, [])
+    token = _SERIAL_INFERENCE.set(state)
+    try:
+        yield
+    finally:
+        _SERIAL_INFERENCE.reset(token)
+        for client in state[2]:
+            client.close()
+
+
+def serial_openai_client(channel):
+    from openai import OpenAI
+    client = OpenAI(api_key='guest-transport', base_url='http://guest.invalid/v1', max_retries=0,
+                    http_client=httpx.Client(transport=SerialHTTPTransport(channel), trust_env=False))
+    state = _SERIAL_INFERENCE.get()
+    if state is not None:
+        state[2].append(client)
+    return client
+
+
+def serial_auxiliary_client(*, async_mode=False, raw_codex=False):
+    """Use mature Responses/compression adapters, bypassing Host client caches."""
+    state = _SERIAL_INFERENCE.get()
+    if state is None:
+        return None
+    from agent.auxiliary_client import CodexAuxiliaryClient, AsyncCodexAuxiliaryClient
+    if async_mode and raw_codex:
+        raise SerialError('guest_async_raw_inference_unsupported')
+    client = serial_openai_client(state[0])
+    if not raw_codex:
+        client = CodexAuxiliaryClient(client, state[1])
+        if async_mode:
+            client = AsyncCodexAuxiliaryClient(client)
+    return client, state[1]
+
+
+_P = ParamSpec('_P')
+_R = TypeVar('_R')
+
+
+def serial_auxiliary_route(callback: Callable[_P, _R]) -> Callable[_P, _R]:
+    """Keep the existing auxiliary API, with a Guest-only fixed transport binding."""
+    parameters = signature(callback)
+    @wraps(callback)
+    def routed(*args: _P.args, **kwargs: _P.kwargs) -> _R:
+        if _SERIAL_INFERENCE.get() is None:
+            return callback(*args, **kwargs)
+        values = parameters.bind(*args, **kwargs).arguments
+        return serial_auxiliary_client(async_mode=values.get('async_mode', False),
+                                       raw_codex=values.get('raw_codex', False))
+    return routed

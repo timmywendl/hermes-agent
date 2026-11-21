@@ -118,7 +118,10 @@ class SerialWire:
             self._validate(frame)
             self.received += 1
             return frame
-        except (ValueError, TypeError, KeyError, OSError, EOFError):
+        except (TypeError, KeyError, RecursionError) as exc:
+            self.failed = True
+            raise SerialError('invalid_serial_frame') from exc
+        except (ValueError, OSError, EOFError):
             self.failed = True
             raise
 
@@ -189,8 +192,9 @@ class GuestSerialClient:
                     self.replies.put_nowait(frame)
                 else:
                     raise SerialError('unexpected_owner_frame')
-        except (ValueError, OSError, EOFError, queue.Full) as exc:
-            self.failure = exc
+        except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError, queue.Full) as exc:
+            if self.failure is None:
+                self.failure = exc
             for destination in (self.replies, self.controls.queue):
                 try:
                     destination.put_nowait(exc)
@@ -210,15 +214,25 @@ class GuestSerialClient:
             if isinstance(result, Exception):
                 raise SerialError('guest_channel_lost') from result
             if result['reply_to'] != seq or result['channel'] != channel:
-                self.wire.failed = True
-                raise SerialError('guest_reply_mismatch')
+                self._invalid_reply('guest_reply_mismatch')
             body = result['payload']
             if not isinstance(body, dict) or set(body) not in ({'result'}, {'error'}):
-                raise SerialError('invalid_guest_reply')
+                self._invalid_reply('invalid_guest_reply')
             if 'error' in body:
+                reason = body['error']
+                if not isinstance(reason, str) or not 0 < len(reason) <= 80 or not reason.isprintable():
+                    self._invalid_reply('invalid_guest_error')
                 from agent.runtime_session_store import WorkerPersistenceError
-                raise WorkerPersistenceError(body['error'])
+                raise WorkerPersistenceError(reason)
             return body['result']
+
+    def _invalid_reply(self, reason):
+        error = SerialError(reason)
+        self.failure = error
+        self.wire.failed = True
+        self.wire.close()
+        self.controls.close_reader()
+        raise error
 
     def __call__(self, request):
         return self.call('persistence', request)

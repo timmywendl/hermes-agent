@@ -75,7 +75,10 @@ refuses caller-assembled or damaged work. Reviewer HEAD is supplied explicitly b
 the original Owner and frozen in the projection; a moving branch name is refused.
 VM identities cannot be reused for another assignment.
 OwnerSerialSession is bound to that assignment and retains its channel in the
-original Owner's accounting. Existing Stop routes to it; shutdown cannot report
+original Owner's accounting. Slot validation, descriptor duplication and slot
+publication share the existing SQLite writer transaction; competing acquisition
+threads cannot replace the slot or reset its budget. An uncertain attachment
+commit retains exclusion and closes its owned descriptor. Existing Stop routes to it; shutdown cannot report
 zero pending work while a channel remains. Revocation/EOF/result are never physical
 retirement. Restart recovery leaves the original worker/admission UNKNOWN and
 retains the assignment bytes; old epochs cannot adopt. No source-only API clears
@@ -90,7 +93,10 @@ Owner and Cockpit interface. Owner pins route, account, model, credentials,
 method/path, retry/fallback and usage policy; Guest submits only input/instructions,
 local function tool schemas, reasoning/text/output limits. No native remote tools,
 URL/header/model selector or generic proxy. The SDK HTTP transport is entirely
-in-process and serial-backed. Responses events are buffered up to 2 MiB per reply;
+in-process and serial-backed. A Guest-scoped binding also routes the existing
+auxiliary/compression Responses adapters through that channel (including their
+async wrapper), bypasses the Host/global client cache and closes scoped SDK
+clients on exit; the ordinary auxiliary router is restored outside that scope. Responses events are buffered up to 2 MiB per reply;
 no unbounded stream tunnel. Each channel permits at most 32 inference attempts;
 logical result-ready closes Host operations while lost-ACK persistence replay
 remains idempotent. Transport cleanup joins its service section and closes the

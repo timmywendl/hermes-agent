@@ -143,3 +143,34 @@ actual successful hv_vm_destroy and Owner accounting. Each succeeding slot start
 only after the prior one retires. Any failed slot ends the entire new campaign.
 The new Native result will be recorded separately from the unchanged first failure.
 Worker dispatch remains unauthorized regardless of this diagnostic result.
+
+## New campaign result: five inert lifecycles passed
+
+Executed source: `3f69f7dd95f6ac6eb4a288418dcf2e349bc828e6`.
+New immutable helper SHA256:
+`36f23b811da6658c4ba27008b4588feeea86e94ea62346e84aa8c6533be0eebe`.
+All five fresh processes ran serially through the original registered Owner.
+
+| Slot | PID | Observed wait | Retirement evidence |
+| --- | --- | --- | --- |
+| 1 | 84230 | 0 | Duplex serial STOP/Guest ORDERLY_SHUTDOWN, QMP Guest shutdown, actual hv_vm_destroy=0/joined=2 |
+| 2 | 84253 | 0 | Same independent normal lifecycle |
+| 3 | 84273 | 0 | Same independent normal lifecycle |
+| 4 | 84284 | -9 (SIGKILL) | Guest READY first, exact child reap; no explicit destroy claim |
+| 5 | 84301 | -6 (SIGABRT) | Guest READY first, core limit zero, exact child reap; no explicit destroy claim |
+
+Every slot recorded empty process group, serial/stdio EOF and closure, exact
+birth/fingerprint/executable and original Owner accounting. Owner FD counts were
+17 before and 17 after every slot. Both ledgers and diagnostic exit receipts
+match; the new grant is COMPLETE, all five new attempts RETIRED. The old grant,
+STOP_UNCERTAIN, original logs/helper and old databases retain their saved hashes.
+Total actual QEMU/VM attempts across both campaigns: six, with no retry.
+
+`rerun-result-20261121-A.json` contains per-slot facts and original log digests.
+Raw logs, complete fixed Manifest, build/signature provenance and independent
+reviews remain in the external evidence directory and PR15 evidence comments.
+Abnormal retirement uses the explicitly selected Apple process/VM trust boundary
+plus exact Owner wait/group/pipe observations, not independent kernel VM census.
+This is only this immutable build's bounded inert Q1 feasibility result, pending
+Main Control adjudication. It does not authorize Board Worker dispatch, Guest
+Agent/inference, credentials, publication, Stage3 or FIRST_WORKER_OWNED_DELIVERY.

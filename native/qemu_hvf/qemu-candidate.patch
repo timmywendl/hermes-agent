@@ -1,0 +1,77 @@
+--- a/system/main.c
++++ b/system/main.c
+@@ -66,8 +66,21 @@
+ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
+ #endif
+ 
++extern int hermes_hvf_admission_gate(void);
++extern int hermes_hvf_preflight(const char *plan_path);
++
+ int main(int argc, char **argv)
+ {
++    if (argc < 3 || strcmp(argv[1], "--hermes-hvf-q1") != 0) {
++        return 2;
++    }
++    if (hermes_hvf_admission_gate() != 0 || hermes_hvf_preflight(argv[2]) != 0) {
++        return 2;
++    }
++    char *executable = argv[0];
++    argc -= 2;
++    argv += 2;
++    argv[0] = executable;
+     qemu_init(argc, argv);
+ 
+     /*
+--- a/accel/hvf/hvf-all.c
++++ b/accel/hvf/hvf-all.c
+@@ -17,6 +17,8 @@
+ #include "system/address-spaces.h"
+ #include "system/memory.h"
+ #include "system/hvf.h"
++#include "system/cpus.h"
++#include "system/system.h"
+ #include "system/hvf_int.h"
+ #include "hw/core/cpu.h"
+ #include "hw/core/boards.h"
+@@ -189,6 +191,31 @@
+     .log_clear = hvf_log_clear,
+ };
+ 
++/* Q1 finite feasibility: complete explicit process-owned VM teardown. */
++static void hermes_hvf_process_exit(Notifier *notifier, void *opaque)
++{
++    CPUState *cpu;
++    unsigned int joined = 0;
++    (void)notifier;
++    (void)opaque;
++    CPU_FOREACH(cpu) {
++        if (cpu->created) {
++            cpu_remove_sync(cpu);
++            joined++;
++        }
++    }
++    memory_listener_unregister(&hvf_memory_listener);
++    hv_return_t result = hv_vm_destroy();
++    fprintf(stderr, "HERMES_HVF_VM_DESTROY_V1 pid=%d result=%d joined=%u\n",
++            getpid(), result, joined);
++    fflush(stderr);
++    if (result != HV_SUCCESS) {
++        _Exit(EXIT_FAILURE);
++    }
++}
++
++static Notifier hermes_hvf_exit_notifier = { .notify = hermes_hvf_process_exit };
++
+ static int hvf_accel_init(AccelState *as, MachineState *ms)
+ {
+     hv_return_t ret;
+@@ -219,6 +246,9 @@
+         exit(1);
+     }
+     assert_hvf_ok(ret);
++    fprintf(stderr, "HERMES_HVF_VM_CREATE_V1 pid=%d result=%d\n", getpid(), ret);
++    fflush(stderr);
++    qemu_add_exit_notifier(&hermes_hvf_exit_notifier);
+ 
+     as->gdbstub.sstep_flags = SSTEP_ENABLE | SSTEP_NOIRQ;
+ 

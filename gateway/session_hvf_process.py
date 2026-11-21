@@ -261,6 +261,9 @@ def observe_child(process, identity, mode, stop, output, started, deadline, seri
                 'process_group_empty': True, 'all_pipes_closed': True, 'guest_ready': True,
                 'guest_orderly_shutdown': shutdown, 'runtime_inventory': actual,
                 'elapsed_s': time.monotonic() - started, 'mode': mode,
+                'serial_stop_bytes': len(STOP.encode('ascii')) if mode == 'normal' else 0,
+                'guest_console_orderly': b'"event":"ORDERLY_SHUTDOWN"' in pipes.buffers['serial'],
+                'requested_signal': None if mode == 'normal' else int(signal.Signals['SIGKILL'] if mode == 'sigkill' else signal.SIGABRT),
                 'backend_ownership': 'APPLE_PROCESS_OWNED_HYPERVISOR_CONTRACT'}
     finally:
         try:

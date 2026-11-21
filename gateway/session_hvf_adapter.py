@@ -723,6 +723,22 @@ def _canary_servers(candidate, stack):
             server.listen(8)
 
 
+def _final_wait_and_record(candidate, handle):
+    from gateway.session_hvf_process import _wait_for_child, exit_observation
+    wait_error = None
+    try:
+        # A live unknown child is never abandoned by its original Owner. This
+        # is the retained-custody path, not a successful bounded qualification.
+        _wait_for_child(handle, None)
+    except (OSError, subprocess.SubprocessError) as error:
+        wait_error = error
+    errors = [] if wait_error is None else [{'operation': 'final_wait', 'error': repr(wait_error)}]
+    _persist_exit(candidate, handle, exit_observation(handle, errors=errors),
+                  failure=handle.record.get('failure', 'hvf_late_finalizer_wait'))
+    if wait_error is not None:
+        raise wait_error
+
+
 async def _qualification_main(args):
     from contextlib import ExitStack
     from gateway.runtime_ownership import process_ownership
@@ -748,11 +764,12 @@ async def _qualification_main(args):
         if pending is not None and not pending.done():
             signal_hvf_stop(authority)
             await asyncio.shield(pending)
-        live = [h.process for h in getattr(authority, '_hvf_workers', {}).values()
+        live = [h for h in getattr(authority, '_hvf_workers', {}).values()
                 if h.process is not None and h.process.returncode is None]
-        # An unaccounted live child cannot be abandoned by its original Owner.
-        for child in live:
-            await asyncio.to_thread(child.wait)
+        # A late successful reap must update the same sticky failed attempt.
+        from gateway.session_runtime_workers import tracked_write
+        for handle in live:
+            await tracked_write(authority, lambda handle=handle: _final_wait_and_record(candidate, handle))
         authority.db.close()
         process_ownership.release(home)
 

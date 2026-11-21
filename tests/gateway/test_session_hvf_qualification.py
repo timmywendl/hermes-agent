@@ -664,3 +664,34 @@ def test_owner_sink_failure_does_not_prevent_board_exit_evidence(owner, monkeypa
     assert recorded['state'] == 'STOP_UNCERTAIN'
     assert recorded['exit_observation'] == observed
     assert adapter.recover_hvf_reservations(authority)
+
+
+@pytest.mark.platforms('macos')
+def test_finalizer_persists_late_exact_reap_without_retiring_failed_attempt(owner):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    handle.process = child
+    handle.identity = physical.child_identity(child, '/bin/cat')
+    try:
+        unknown = physical.exit_observation(handle)
+        adapter._persist_exit(candidate, handle, unknown, failure=RuntimeStoreError('inert_initial_timeout'))
+        assert handle.record['exit_observation']['wait_result'] == 'UNKNOWN'
+        adapter._final_wait_and_record(candidate, handle)
+        observed = handle.record['exit_observation']
+        assert observed['wait_result'] == 'REAPED_BY_ORIGINAL_OWNER'
+        assert observed['returncode'] == 0
+        assert observed['process_group_status'] == 'EMPTY'
+        assert handle.record['state'] == 'STOP_UNCERTAIN'
+        assert handle.record['failure'] == 'inert_initial_timeout'
+        with closing(sqlite3.connect(candidate.board)) as db:
+            persisted = json.loads(db.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
+        indexed = adapter.metadata(authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (handle.key,))[0])
+        assert persisted == indexed == handle.record
+        assert not adapter._valid_retirement(persisted)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)

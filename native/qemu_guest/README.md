@@ -102,7 +102,11 @@ this fence or accepts a Guest retirement receipt. Native acquisition/retirement
 must use the original Owner's process-owned HVF proof path after Q2 APPLY; this
 candidate intentionally exposes no physical launch grant.
 
-## Minimal D2 decision requested
+## Historical PR16 D2 proposal
+
+The following section records the PR16 source-ready proposal and its policy
+status at that submission. The accepted-policy section below supersedes those
+policy-status statements; the default unconfigured endpoint still fails closed.
 
 Approve **one fixed, bounded Responses operation** through the existing original
 Owner and Cockpit interface. Owner pins route, account, model, credentials,

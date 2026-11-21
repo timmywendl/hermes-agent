@@ -117,3 +117,29 @@ be resumed or reused. No result in this PR qualifies normal or abnormal VM
 retirement, resource nonaccumulation, Stage 3 or Worker dispatch. Main Control
 must adjudicate any future bounded campaign; no authorization is inferred from
 unused later slots.
+
+## New grant PR15_HVF_RERUN_20261121_A
+
+[Main Control 7060302726](https://github.com/spareribes/ai-colleague/issues/139#issuecomment-7060302726)
+authorizes a fresh five-lifecycle campaign after offline gates and read-only
+reconciliation of the exact old child/group. It does not resume the old grant.
+`rerun-authorization.json` fixes the one new Profile/Board/output, immutable App
+inventory and prior-history digest in reviewed source. A manifest cannot rebind
+the grant to another profile or artifact inventory. Source HEAD is independently
+frozen in the external manifest, avoiding a self-referential source hash.
+
+Exit evidence now captures PID/birth/fingerprint/executable, actual Owner wait
+return and signal, group census and every stdin/stdout/stderr/serial endpoint.
+Both existing ledgers and a fsynced diagnostic receipt are attempted independently;
+an unavailable sink is explicit UNKNOWN, never a retirement grant. Normal exits
+persist physical facts while STOP_UNCERTAIN before final Owner accounting. Failed
+or timed-out attempts persist facts while remaining STOP_UNCERTAIN. No old exit
+status or retirement evidence is synthesized.
+
+Duplex serial uses the inherited unnamed socket. QMP stdin remains live through
+terminal SHUTDOWN delivery; closing it at serial STOP could lose the monitor event.
+Normal retirement requires matching wait/identity/group/pipe/drain observations,
+actual successful hv_vm_destroy and Owner accounting. Each succeeding slot starts
+only after the prior one retires. Any failed slot ends the entire new campaign.
+The new Native result will be recorded separately from the unchanged first failure.
+Worker dispatch remains unauthorized regardless of this diagnostic result.

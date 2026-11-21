@@ -22,16 +22,22 @@ RELEASE = b'HERMES_HVF_RELEASE_V1\n'
 STOP = 'HERMES_HVF_STOP_V1\n'
 
 
-def child_identity(process, executable):
+def child_identity(process, executable, observed=None):
     from hermes_cli.kanban_db_dispatch import _process_fingerprint
+    identity = observed if observed is not None else {}
+    identity.update(pid=process.pid, ppid=None, pgid=None, fingerprint=None,
+                    executable=None, created=None, boot_time=None)
     child = psutil.Process(process.pid)
-    identity = {'pid': child.pid, 'ppid': child.ppid(), 'pgid': os.getpgid(child.pid),
-                'fingerprint': _process_fingerprint(child.pid), 'executable': child.exe(),
-                'created': child.create_time(), 'boot_time': psutil.boot_time()}
+    identity['created'] = child.create_time()
+    identity['boot_time'] = psutil.boot_time()
+    identity['ppid'] = child.ppid()
+    identity['pgid'] = os.getpgid(child.pid)
+    identity['fingerprint'] = _process_fingerprint(child.pid)
+    identity['executable'] = child.exe()
     if (identity['ppid'] != os.getpid() or identity['pgid'] != child.pid
             or not identity['fingerprint'] or Path(identity['executable']).resolve() != Path(executable).resolve()):
         raise RuntimeStoreError('hvf_child_identity_unavailable')
-    return identity
+    return dict(identity)
 
 
 def verify_child(process, identity):
@@ -56,17 +62,19 @@ def group_members(pgid):
 class ChildPipes:
     """One synchronous Owner task drains both pipes; no unjoined reader threads."""
 
-    def __init__(self, process, serial=None):
+    def __init__(self, process, serial=None, observation=None):
         self.process = process
         self.selector = selectors.DefaultSelector()
         self.buffers = {'stdout': bytearray(), 'stderr': bytearray(), 'serial': bytearray()}
         self.serial = serial
+        self.observation = observation
         self.pending = bytearray()
         self.responses = {}
         self.events = []
         self.greeting = None
         self.sequence = 0
         self.closed = False
+        self.eof = {'stdout': False, 'stderr': False, 'serial': serial is None}
         for label, stream in (('stdout', process.stdout), ('stderr', process.stderr)):
             os.set_blocking(stream.fileno(), False)
             self.selector.register(stream, selectors.EVENT_READ, label)
@@ -87,6 +95,7 @@ class ChildPipes:
             except BlockingIOError:
                 continue
             if not data:
+                self.eof[key.data] = True
                 self.selector.unregister(key.fileobj)
                 key.fileobj.close()
                 continue
@@ -149,11 +158,14 @@ class ChildPipes:
             self.serial.close()
         self.closed = True
 
-    def drain_and_wait(self, deadline):
-        self.process.stdin.close()
+    def drain_and_wait(self, deadline, *, close_input=True):
+        if close_input:
+            self.process.stdin.close()
         while self.selector.get_map():
             self.pump(deadline)
         code = self.process.wait(timeout=max(0.01, deadline - time.monotonic()))
+        if self.observation is not None:
+            self.observation.update(wait_result='REAPED_BY_ORIGINAL_OWNER', wait_returncode=code)
         if self.pending.strip():
             raise RuntimeStoreError('hvf_partial_qmp_at_exit')
         self.close()
@@ -207,9 +219,9 @@ def guest_shutdown_seen(pipes):
                and event.get('data', {}).get('reason') == 'guest-shutdown' for event in pipes.events)
 
 
-def observe_child(process, identity, mode, stop, output, started, deadline, serial_socket):
+def observe_child(process, identity, mode, stop, output, started, deadline, serial_socket, observation=None):
     """Returns physical evidence only; original Owner performs retirement/accounting."""
-    pipes = ChildPipes(process, serial_socket)
+    pipes = ChildPipes(process, serial_socket, observation)
     startup = min(started + 60, deadline)
     serial = ''
     try:
@@ -235,7 +247,9 @@ def observe_child(process, identity, mode, stop, output, started, deadline, seri
                 raise RuntimeStoreError('hvf_serial_stop_partial_write')
         else:
             os.kill(process.pid, signal.Signals['SIGKILL'] if mode == 'sigkill' else signal.SIGABRT)
-        code = pipes.drain_and_wait(deadline)
+        # Keep the QMP connection live until terminal events arrive. Closing its
+        # input at serial STOP can disconnect the monitor before SHUTDOWN emits.
+        code = pipes.drain_and_wait(deadline, close_input=False)
         expected = 0 if mode == 'normal' else -(signal.Signals['SIGKILL'] if mode == 'sigkill' else signal.SIGABRT)
         if code != expected or group_members(identity['pgid']):
             raise RuntimeStoreError('hvf_exit_or_group_unverified')
@@ -249,7 +263,107 @@ def observe_child(process, identity, mode, stop, output, started, deadline, seri
                 'elapsed_s': time.monotonic() - started, 'mode': mode,
                 'backend_ownership': 'APPLE_PROCESS_OWNED_HYPERVISOR_CONTRACT'}
     finally:
-        output.mkdir(parents=True, exist_ok=True)
-        for label, data in pipes.buffers.items():
-            (output / f'{label}.log').write_bytes(data)
-        pipes.close()
+        try:
+            if observation is not None:
+                observation.update(eof=dict(pipes.eof), selector_drained=not bool(pipes.selector.get_map()) if not pipes.closed else all(pipes.eof.values()))
+            output.mkdir(parents=True, exist_ok=True)
+            for label, data in pipes.buffers.items():
+                (output / f'{label}.log').write_bytes(data)
+        finally:
+            pipes.close()
+
+
+def contain_child(handle, deadline):
+    """Bounded exact-child failure containment; never operate on a foreign PID."""
+    import subprocess
+    errors = []
+    child = handle.process
+    try:
+        try:
+            _wait_for_child(handle, 0.01)
+            return errors
+        except subprocess.TimeoutExpired:
+            pass
+        if handle.identity is None:
+            if child.stdin is not None and not child.stdin.closed:
+                child.stdin.close()
+        else:
+            verify_child(child, handle.identity)
+            os.kill(child.pid, signal.SIGTERM)
+            handle.pipe_observation.setdefault('signals_sent', []).append(int(signal.SIGTERM))
+        try:
+            _wait_for_child(handle, max(0.01, min(15, (deadline - time.monotonic()) / 2)))
+        except subprocess.TimeoutExpired:
+            if handle.identity is None:
+                raise RuntimeStoreError('hvf_no_verified_identity_for_escalation')
+            verify_child(child, handle.identity)
+            os.kill(child.pid, signal.Signals['SIGKILL'])
+            handle.pipe_observation.setdefault('signals_sent', []).append(int(signal.Signals['SIGKILL']))
+            _wait_for_child(handle, max(0.01, deadline - time.monotonic()))
+    except (OSError, psutil.Error, RuntimeStoreError, subprocess.TimeoutExpired) as error:
+        errors.append({'operation': 'contain_and_wait', 'error': repr(error)})
+    return errors
+
+
+def exit_observation(handle, *, errors=None):
+    """Available physical facts; unknown fields stay explicit, even after reap."""
+    errors = list(errors or [])
+    child = handle.process
+    identity = handle.identity
+    members = None
+    if identity is not None:
+        try:
+            members = list(group_members(identity['pgid']))
+        except (OSError, RuntimeStoreError) as error:
+            errors.append({'operation': 'process_group', 'error': repr(error)})
+    pipes = {}
+    for name in ('stdin', 'stdout', 'stderr', 'serial'):
+        stream = handle.serial if name == 'serial' else getattr(child, name)
+        if stream is None:
+            pipes[name] = {'closed': None, 'error': 'ENDPOINT_UNAVAILABLE'}
+            continue
+        try:
+            stream.close()
+            pipes[name] = {'closed': stream.fileno() == -1 if name == 'serial' else stream.closed}
+        except (OSError, ValueError) as error:
+            pipes[name] = {'closed': None, 'error': repr(error)}
+    pipes['child_serial_in_parent'] = {'closed': handle.guest_serial_closed}
+    code = child.returncode
+    return {'pid': child.pid, 'identity': identity if identity is not None else handle.observed_identity,
+            'identity_status': 'VERIFIED' if identity else 'UNKNOWN',
+            'returncode': code, 'exit_code': code if code is not None and code >= 0 else None,
+            'terminating_signal': -code if code is not None and code < 0 else None,
+            'wait_result': handle.pipe_observation.get('wait_result', 'UNKNOWN'),
+            'process_group_members': members,
+            'process_group_status': 'EMPTY' if members == [] else 'NONEMPTY' if members else 'UNKNOWN',
+            'pipes': pipes, 'all_pipes_closed': all(p.get('closed') is True for p in pipes.values()),
+            'drain_observation': dict(handle.pipe_observation), 'errors': errors}
+
+
+def verify_prior_absent(identity):
+    required = {'pid', 'created', 'fingerprint', 'executable', 'pgid', 'boot_time', 'ppid'}
+    if (not isinstance(identity, dict) or not required <= identity.keys()
+            or type(identity['pid']) is not int or identity['pid'] <= 1
+            or identity['pgid'] != identity['pid'] or not identity['fingerprint']
+            or not Path(identity['executable']).is_absolute()):
+        raise RuntimeStoreError('hvf_prior_identity_incomplete')
+    # A PID now occupied by another process is conservatively ambiguous here.
+    # No argv inference, kill, wait, or mutation of the old Owner is permitted.
+    try:
+        psutil.Process(identity['pid']).create_time()
+    except psutil.NoSuchProcess:
+        pass
+    except psutil.Error as error:
+        raise RuntimeStoreError('hvf_prior_process_unobservable') from error
+    else:
+        raise RuntimeStoreError('hvf_prior_pid_still_present_or_reused')
+    members = group_members(identity['pgid'])
+    if members:
+        raise RuntimeStoreError('hvf_prior_group_not_empty')
+    return list(members)
+
+
+def _wait_for_child(handle, timeout):
+    code = handle.process.wait(timeout=timeout)
+    handle.pipe_observation.update(wait_result='REAPED_BY_ORIGINAL_OWNER', wait_returncode=code)
+    return code

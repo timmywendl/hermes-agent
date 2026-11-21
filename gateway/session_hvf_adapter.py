@@ -25,7 +25,8 @@ from hermes_state_runtime import RuntimeStoreError, _epoch
 
 NAMESPACE = 'q1_hvf_v1'
 PREFIX = 'q1.hvf.attempt:'
-GRANT_KEY = 'q1.hvf.grant:7058818518'
+GRANT_ID = 'PR15_HVF_RERUN_20261121_A'
+GRANT_KEY = 'q1.hvf.grant:' + GRANT_ID
 MODES = ('normal', 'normal', 'normal', 'sigkill', 'sigabrt')
 
 
@@ -80,6 +81,8 @@ class HVFCandidate:
     output: Path
     files: dict[str, str]
     source_head: str
+    prior_profile: Path | None = None
+    prior_snapshot_sha256: str | None = None
 
     def __post_init__(self):
         paths = (self.profile, self.board, self.helper, self.plan, self.kernel,
@@ -100,6 +103,7 @@ class HVFCandidate:
             raise RuntimeStoreError('hvf_macos_required')
         _require_owner(authority)
         _verify_source_head(self.source_head)
+        _verify_authorization(self)
         home = Path(authority.profile_id).resolve(strict=True)
         if home.name != 'hvf-qualification' or home != self.profile.resolve(strict=True):
             raise RuntimeStoreError('hvf_disposable_profile_required')
@@ -120,6 +124,11 @@ class HVFCandidate:
             if path.is_symlink() or path.stat().st_nlink != 1 or hashlib.sha256(path.read_bytes()).hexdigest() != digest:
                 raise RuntimeStoreError('hvf_artifact_changed', detail=name)
         _verify_signature(self.helper)
+        if self.prior_profile is None or self.prior_snapshot_sha256 is None:
+            raise RuntimeStoreError('hvf_prior_child_reconciliation_required')
+        if self.profile.resolve() == self.prior_profile.resolve():
+            raise RuntimeStoreError('hvf_fresh_profile_required')
+        reconcile_prior(self.prior_profile, self.prior_snapshot_sha256)
 
     def argv(self, serial_fd):
         return [str(self.helper), '--hermes-hvf-q1', str(self.plan), '-L', str(self.plan.parent),
@@ -131,6 +140,16 @@ class HVFCandidate:
                 '-append', 'console=ttyAMA0 rdinit=/init panic=-1 loglevel=4',
                 '-drive', f'file={self.disk},format=raw,if=none,id=inert,readonly=on',
                 '-device', 'virtio-blk-pci,drive=inert']
+
+
+def _verify_authorization(candidate):
+    lock_path = Path(__file__).resolve().parents[1] / 'native/qemu_hvf/rerun-authorization.json'
+    lock = metadata(lock_path.read_text(encoding='utf-8-sig'))
+    names = ('profile', 'board', 'helper', 'plan', 'kernel', 'initramfs', 'disk', 'output', 'prior_profile')
+    binding = {name: str(getattr(candidate, name)) for name in names}
+    binding.update(files=dict(candidate.files), prior_snapshot_sha256=candidate.prior_snapshot_sha256)
+    if lock.get('grant') != GRANT_ID or lock.get('candidate') != binding or lock.get('modes') != list(MODES):
+        raise RuntimeStoreError('hvf_exact_grant_candidate_binding_changed')
 
 
 def _verify_signature(helper):
@@ -162,12 +181,48 @@ def _valid_retirement(record):
     if (record.get('state') != 'RETIRED' or any(proof.get(key) is not True for key in common)
             or type(proof.get('vm_create_successes')) is not int or proof['vm_create_successes'] != 1):
         return False
+    if not _valid_exit_observation(record, proof):
+        return False
     if record.get('mode') == 'normal':
         return (proof.get('destroy_success') is True and proof.get('explicit_vm_destroy') is True
                 and proof.get('guest_orderly_shutdown') is True and type(proof.get('exit_code')) is int
                 and proof['exit_code'] == 0)
     expected = {'sigkill': -signal.Signals['SIGKILL'], 'sigabrt': -signal.SIGABRT}.get(record.get('mode'))
     return expected is not None and proof.get('exit_code') == expected and proof.get('backend_ownership') == 'APPLE_PROCESS_OWNED_HYPERVISOR_CONTRACT'
+
+
+def _valid_identity(identity):
+    if not isinstance(identity, dict):
+        return False
+    required = ('pid', 'ppid', 'pgid', 'created', 'boot_time', 'fingerprint', 'executable')
+    return (all(key in identity for key in required) and type(identity['pid']) is int
+            and identity['pid'] > 1 and identity['pgid'] == identity['pid']
+            and isinstance(identity['fingerprint'], str) and bool(identity['fingerprint'])
+            and isinstance(identity['executable'], str) and Path(identity['executable']).is_absolute()
+            and type(identity['created']) in (int, float) and identity['created'] > 0
+            and type(identity['boot_time']) in (int, float) and identity['boot_time'] > 0)
+
+
+def _valid_exit_observation(record, proof):
+    observed = record.get('exit_observation')
+    identity = record.get('identity')
+    if not isinstance(observed, dict) or not _valid_identity(identity):
+        return False
+    endpoints = observed.get('pipes', {})
+    drain = observed.get('drain_observation', {})
+    if not isinstance(endpoints, dict) or not isinstance(drain, dict) or any(not isinstance(p, dict) for p in endpoints.values()):
+        return False
+    return (observed == proof.get('exit_observation') and observed.get('identity') == identity
+            and observed.get('pid') == identity.get('pid') and observed.get('identity_status') == 'VERIFIED'
+            and type(observed.get('returncode')) is int and observed.get('returncode') == proof.get('exit_code')
+            and observed.get('terminating_signal') == (-proof['exit_code'] if proof['exit_code'] < 0 else None)
+            and observed.get('wait_result') == 'REAPED_BY_ORIGINAL_OWNER'
+            and observed.get('process_group_status') == 'EMPTY' and observed.get('process_group_members') == []
+            and observed.get('all_pipes_closed') is True
+            and set(endpoints) == {'stdin', 'stdout', 'stderr', 'serial', 'child_serial_in_parent'}
+            and all(part.get('closed') is True for part in endpoints.values())
+            and drain.get('selector_drained') is True
+            and drain.get('eof') == {'stdout': True, 'stderr': True, 'serial': True})
 
 
 def recover_hvf_reservations(authority):
@@ -215,7 +270,10 @@ class HVFHandle:
         self.stop = threading.Event()
         self.process = None
         self.identity = None
+        self.observed_identity = {}
         self.serial = None
+        self.guest_serial_closed = None
+        self.pipe_observation = {}
 
     def control(self, frame):
         if frame != {'type': 'stop'}:
@@ -225,9 +283,13 @@ class HVFHandle:
 
 def _grant(authority, candidate):
     from hermes_cli.kanban_db_connect import connect_closing, write_txn
-    body = {'grant': '7058818518', 'epoch': authority.epoch, 'instance': authority.instance_id,
+    body = {'grant': GRANT_ID, 'epoch': authority.epoch, 'instance': authority.instance_id,
             'modes': list(MODES), 'reserved': 0, 'status': 'IN_PROGRESS',
-            'helper_sha256': candidate.files[str(candidate.helper)]}
+            'helper_sha256': candidate.files[str(candidate.helper)],
+            'source_head': candidate.source_head, 'profile': str(candidate.profile),
+            'board': str(candidate.board), 'output': str(candidate.output),
+            'artifacts': dict(candidate.files), 'prior_profile': str(candidate.prior_profile),
+            'prior_snapshot_sha256': candidate.prior_snapshot_sha256}
     def write(conn):
         _require_owner(authority, conn)
         if conn.execute('SELECT value FROM state_meta WHERE key=?', (GRANT_KEY,)).fetchone() is not None:
@@ -285,7 +347,7 @@ def _reserve(authority, candidate, slot):
             raise RuntimeStoreError('hvf_diagnostic_claim_failed')
         task = kb.get_task(board, task_id)
         record = {'version': 'HERMES_Q1_HVF_V1', 'state': 'STOP_UNCERTAIN', 'phase': 'STARTING',
-                  'slot': slot, 'mode': MODES[slot - 1], 'attempt': uuid.uuid4().hex,
+                  'grant': GRANT_ID, 'slot': slot, 'mode': MODES[slot - 1], 'attempt': uuid.uuid4().hex,
                   'task_id': task.id, 'run_id': task.current_run_id, 'session_id': session,
                   'claim_digest': hashlib.sha256(task.claim_lock.encode()).hexdigest(),
                   'epoch': authority.epoch, 'instance': authority.instance_id,
@@ -327,7 +389,8 @@ def _guard(board, handle):
         grant = metadata(grant_row[0]) if grant_row else {}
         if (grant.get('status') != 'IN_PROGRESS' or grant.get('reserved') != handle.record['slot']
                 or grant.get('epoch') != handle.authority.epoch or grant.get('instance') != handle.authority.instance_id
-                or grant.get('helper_sha256') != handle.record['helper_sha256']):
+                or grant.get('helper_sha256') != handle.record['helper_sha256']
+                or grant.get('source_head') != handle.record['source_head']):
             raise RuntimeStoreError('hvf_native_grant_changed')
         row = owner.execute('SELECT value FROM state_meta WHERE key=?', (handle.key,)).fetchone()
         if row is None or row[0] != canonical(handle.record):
@@ -348,31 +411,92 @@ def _persist(board, handle, record):
     handle.record = record
 
 
-def _contain_failed_child(handle):
-    """Contain only our still-unreaped exact child; never turn failure into PASS."""
-    from gateway.session_hvf_process import verify_child
-    child = handle.process
-    if child is None:
-        return
+def _contain_failed_child(handle, deadline):
+    """Observe/reap only our exact child; evidence never grants retirement."""
+    from gateway.session_hvf_process import contain_child, exit_observation
+    errors = contain_child(handle, deadline)
+    return exit_observation(handle, errors=errors)
+
+
+def _write_exit_receipt(path, body):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.' + uuid.uuid4().hex + '.tmp')
+    with temporary.open('x', encoding='utf-8') as stream:
+        stream.write(body + '\n')
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY)
     try:
-        child.wait(timeout=0.01)
-        return
-    except subprocess.TimeoutExpired:
-        pass
-    if handle.identity is None:
-        # Unreleased child admission gate cannot create a VM; EOF lets it exit.
-        if child.stdin and not child.stdin.closed:
-            child.stdin.close()
-        child.wait(timeout=60)
-        return
-    verify_child(child, handle.identity)
-    os.kill(child.pid, signal.SIGTERM)
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _persist_exit(candidate, handle, observation, *, failure=None):
+    record = {**handle.record, 'state': 'STOP_UNCERTAIN', 'native_spawned': True,
+              'phase': 'FAILED' if failure is not None else 'PHYSICAL_OBSERVED',
+              'exit_observation': observation}
+    if failure is not None:
+        record['failure'] = str(failure)[:500]
+    # A diagnostic receipt survives even if a damaged/unavailable ledger cannot
+    # accept facts. It has no admission, recovery or retirement authority.
+    directory = candidate.output / f'slot-{record["slot"]}'
+    path = directory / ('failure-observation.json' if failure is not None else 'exit-observation.json')
+    def receipt(status):
+        body = canonical({'attempt': record['attempt'], 'run_id': record['run_id'],
+                          'grant': GRANT_ID, 'state': 'STOP_UNCERTAIN',
+                          'ledger_persistence': status, 'observation': observation})
+        _write_exit_receipt(path, body)
+    receipt_error = None
     try:
-        child.wait(timeout=30)
-    except subprocess.TimeoutExpired:
-        verify_child(child, handle.identity)
-        os.kill(child.pid, signal.Signals['SIGKILL'])
-        child.wait(timeout=30)
+        receipt('PENDING')
+    except OSError as error:
+        receipt_error = error
+    ledger_errors = []
+    for writer in (_write_owner_exit, _write_board_exit):
+        try:
+            writer(candidate, handle, record)
+        except (RuntimeStoreError, sqlite3.Error, OSError) as error:
+            ledger_errors.append(error)
+    try:
+        status = 'UNKNOWN: ' + '; '.join(str(e) for e in ledger_errors) if ledger_errors else 'BOTH_LEDGERS_COMMITTED'
+        receipt(status)
+    except OSError as error:
+        receipt_error = error
+    if ledger_errors:
+        for additional_error in [*ledger_errors[1:], *([receipt_error] if receipt_error is not None else [])]:
+            ledger_errors[0].add_note(f'additional evidence sink failure: {additional_error}')
+        raise ledger_errors[0]
+    if receipt_error is not None:
+        raise receipt_error
+
+
+def _write_owner_exit(candidate, handle, record):
+    def write(conn):
+        _require_owner(handle.authority, conn)
+        previous = conn.execute('SELECT value FROM state_meta WHERE key=?', (handle.key,)).fetchone()
+        if previous is None or previous[0] != canonical(handle.record):
+            raise RuntimeStoreError('hvf_recovery_index_changed')
+        conn.execute('UPDATE state_meta SET value=? WHERE key=?', (canonical(record), handle.key))
+    handle.authority.db._execute_write(write)
+    handle.record = record
+
+
+def _write_board_exit(candidate, handle, record):
+    from hermes_cli.kanban_db_connect import connect_closing, write_txn
+    binding = ('attempt', 'task_id', 'run_id', 'session_id', 'claim_digest', 'epoch', 'instance',
+               'owner_pid', 'grant', 'helper_sha256', 'source_head')
+    with connect_closing(candidate.board) as board, write_txn(board):
+        row = board.execute('SELECT task_id,metadata FROM task_runs WHERE id=?', (record['run_id'],)).fetchone()
+        if row is None or row[0] != record['task_id']:
+            raise RuntimeStoreError('hvf_exit_run_changed')
+        body = metadata(row[1])
+        existing = body.get(NAMESPACE)
+        if not isinstance(existing, dict) or any(existing.get(key) != record.get(key) for key in binding):
+            raise RuntimeStoreError('hvf_exit_reservation_changed')
+        body[NAMESPACE] = record
+        board.execute('UPDATE task_runs SET metadata=? WHERE id=?', (canonical(body), record['run_id']))
 
 
 def _execute(authority, candidate, handle, campaign_deadline):
@@ -395,10 +519,11 @@ def _execute(authority, candidate, handle, campaign_deadline):
                                          stderr=subprocess.PIPE, bufsize=0, start_new_session=True, close_fds=True,
                                          pass_fds=(guest_serial.fileno(),), cwd=candidate.plan.parent,
                                          env={'PATH': '/usr/bin:/bin', 'HOME': str(candidate.profile / 'host-home')})
+                handle.process = child
             finally:
                 guest_serial.close()
-            handle.process = child
-            handle.identity = child_identity(child, candidate.helper)
+                handle.guest_serial_closed = guest_serial.fileno() == -1
+            handle.identity = child_identity(child, candidate.helper, handle.observed_identity)
             _persist(board, handle, {**handle.record, 'phase': 'CHILD_BOOKED', 'native_spawned': True,
                                      'identity': handle.identity})
         # Both stores commit/read back before the child can enter Hypervisor.framework.
@@ -408,15 +533,24 @@ def _execute(authority, candidate, handle, campaign_deadline):
             if os.write(child.stdin.fileno(), RELEASE) != len(RELEASE):
                 raise RuntimeStoreError('hvf_partial_release_frame')
         proof = observe_child(child, handle.identity, handle.record['mode'], handle.stop,
-                              candidate.output / f'slot-{handle.record["slot"]}', started, deadline, handle.serial)
+                              candidate.output / f'slot-{handle.record["slot"]}', started, deadline, handle.serial, handle.pipe_observation)
         candidate.verify(authority)
         proof['owner_fds_before'] = baseline_fds
         proof['owner_fds_after'] = psutil.Process().num_fds()
         if proof['owner_fds_after'] > baseline_fds:
             raise RuntimeStoreError('hvf_owner_fd_retirement_incomplete')
+        from gateway.session_hvf_process import exit_observation
+        observation = exit_observation(handle)
+        _persist_exit(candidate, handle, observation)
+        proof['exit_observation'] = observation
         return proof
-    except BaseException:
-        _contain_failed_child(handle)
+    except BaseException as failure:
+        if handle.process is not None:
+            observation = _contain_failed_child(handle, min(deadline, time.monotonic() + 30))
+            try:
+                _persist_exit(candidate, handle, observation, failure=failure)
+            except (RuntimeStoreError, sqlite3.Error, OSError) as persistence_error:
+                failure.add_note(f'exit evidence ledger update unavailable: {persistence_error}')
         raise
     finally:
         if handle.serial is not None:
@@ -499,6 +633,14 @@ async def qualify_hvf(authority, candidate):
                 'worker_dispatch': 'NOT_AUTHORIZED', 'source_head': candidate.source_head}
     except BaseException as failure:
         signal_hvf_stop(authority)
+        for handle in getattr(authority, '_hvf_workers', {}).values():
+            if handle.process is not None and handle.record.get('phase') != 'FAILED' and not handle.closed.is_set():
+                from gateway.session_hvf_process import exit_observation
+                try:
+                    await tracked_write(authority, lambda handle=handle, failure=failure: _persist_exit(
+                        candidate, handle, exit_observation(handle), failure=failure))
+                except (RuntimeStoreError, sqlite3.Error, OSError) as evidence_error:
+                    failure.add_note(f'campaign failure evidence unavailable: {evidence_error}')
         try:
             await tracked_write(authority, lambda failure=failure: _finish_grant(authority, failure=failure))
         except (RuntimeStoreError, sqlite3.Error, OSError) as diagnostic_error:
@@ -512,12 +654,13 @@ async def qualify_hvf(authority, candidate):
 
 def load_candidate(path):
     body = metadata(Path(path).read_text(encoding='utf-8-sig'))
-    if body.get('package') != 'HERMES_Q1_HVF_PROCESS_OWNED_GUEST_FEASIBILITY_V1' or body.get('grant') != '7058818518':
+    if body.get('package') != 'HERMES_Q1_HVF_PROCESS_OWNED_GUEST_FEASIBILITY_V1' or body.get('grant') != GRANT_ID:
         raise RuntimeStoreError('hvf_wrong_qualification_package')
     values = body['candidate']
     fields = ('profile', 'board', 'helper', 'plan', 'kernel', 'initramfs', 'disk', 'output')
     return HVFCandidate(**{key: Path(values[key]) for key in fields}, files=values['files'],
-                        source_head=values['source_head'])
+                        source_head=values['source_head'], prior_profile=Path(values['prior_profile']),
+                        prior_snapshot_sha256=values['prior_snapshot_sha256'])
 
 
 def _unused_profile(home):
@@ -527,7 +670,7 @@ def _unused_profile(home):
     if not path.exists():
         return
     with closing(sqlite3.connect(path.as_uri() + '?mode=ro', uri=True)) as db:
-        if db.execute('SELECT 1 FROM state_meta WHERE key=?', (GRANT_KEY,)).fetchone():
+        if db.execute("SELECT 1 FROM state_meta WHERE key LIKE 'q1.hvf.grant:%'").fetchone():
             raise RuntimeStoreError('hvf_grant_already_reserved_no_resume')
         if db.execute('SELECT 1 FROM worker_executions LIMIT 1').fetchone():
             raise RuntimeStoreError('hvf_non_diagnostic_history')
@@ -628,6 +771,36 @@ def main():
         print(canonical({'status': 'STOP_UNCERTAIN', 'error': repr(error),
                          'worker_dispatch': 'NOT_AUTHORIZED'}), flush=True)
         raise
+
+
+
+
+def prior_snapshot(profile):
+    """Stable logical snapshot of the spent original grant/attempt and Board."""
+    profile = Path(profile).resolve(strict=True)
+    with closing(sqlite3.connect((profile / 'state.db').as_uri() + '?mode=ro', uri=True)) as conn:
+        rows = list(conn.execute("SELECT key,value FROM state_meta WHERE key LIKE 'q1.hvf.%' ORDER BY key"))
+    board = profile / 'kanban/boards/hvf-qualification/kanban.db'
+    with closing(sqlite3.connect(board.as_uri() + '?mode=ro', uri=True)) as conn:
+        runs = list(conn.execute('SELECT id,task_id,status,metadata FROM task_runs ORDER BY id'))
+        tasks = list(conn.execute('SELECT id,status,current_run_id,worker_pid FROM tasks ORDER BY id'))
+    return {'owner_records': rows, 'runs': runs, 'tasks': tasks}
+
+
+def reconcile_prior(profile, expected_digest):
+    from gateway.session_hvf_process import verify_prior_absent
+    snapshot = prior_snapshot(profile)
+    if hashlib.sha256(canonical(snapshot).encode()).hexdigest() != expected_digest:
+        raise RuntimeStoreError('hvf_prior_history_changed')
+    grants = [metadata(value) for key, value in snapshot['owner_records'] if key == 'q1.hvf.grant:7058818518']
+    attempts = [metadata(value) for key, value in snapshot['owner_records'] if key.startswith(PREFIX)]
+    if (len(grants) != 1 or grants[0].get('status') != 'STOP_UNCERTAIN' or grants[0].get('reserved') != 1
+            or len(attempts) != 1 or attempts[0].get('state') != 'STOP_UNCERTAIN'):
+        raise RuntimeStoreError('hvf_prior_failed_campaign_not_exact')
+    result = verify_prior_absent(attempts[0]['identity'])
+    return {'prior_child_not_live': 'VERIFIED', 'identity': attempts[0]['identity'],
+            'snapshot_sha256': expected_digest, 'group_members': result,
+            'prior_retirement': 'STOP_UNCERTAIN_PRESERVED'}
 
 
 if __name__ == '__main__':

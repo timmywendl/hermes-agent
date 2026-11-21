@@ -83,7 +83,7 @@ def package(args):
     run(['codesign', '--force', '--sign', '-', '--entitlements', HERE / 'helper.entitlements', app])
     run(['codesign', '--verify', '--strict', app])
     inventory = {str(p): digest(p) for p in app.rglob('*') if p.is_file()}
-    receipt = {'package': 'HERMES_Q1_HVF_PROCESS_OWNED_GUEST_FEASIBILITY_V1', 'grant': '7058818518',
+    receipt = {'package': 'HERMES_Q1_HVF_PROCESS_OWNED_GUEST_FEASIBILITY_V1', 'grant': 'PR15_HVF_RERUN_20261121_A',
                'native_processes_started': 0, 'controls_root': str(controls), 'libraries': libraries,
                'unsigned_input_sha256': digest(args.binary), 'files': inventory,
                'helper': str(helper), 'plan': str(plan_path), 'app': str(app)}

@@ -45,7 +45,8 @@ def owner(tmp_path, monkeypatch):
     authority._hvf_campaign_stop = threading.Event()
     candidate = SimpleNamespace(profile=home, board=home / 'kanban/boards/hvf-qualification/kanban.db',
         output=tmp_path / 'output', helper=tmp_path / 'helper',
-        files={str(tmp_path / 'helper'): 'a' * 64}, source_head='b' * 40)
+        files={str(tmp_path / 'helper'): 'a' * 64}, source_head='b' * 40,
+        prior_profile=tmp_path / 'prior', prior_snapshot_sha256='c' * 64)
     try:
         yield authority, candidate
     finally:
@@ -215,8 +216,17 @@ def test_retirement_completes_diagnostic_only_and_matches_both_stores(owner):
     handle = adapter._reserve(authority, candidate, 1)
     from hermes_cli.kanban_db_connect import connect_closing, write_txn
     with connect_closing(candidate.board) as board, write_txn(board):
-        adapter._persist(board, handle, {**handle.record, 'native_spawned': True})
-    adapter._retire(candidate, handle, _normal_proof())
+        proof = _normal_proof()
+        observation = {'pid': 123, 'identity': _fixture_identity(), 'identity_status': 'VERIFIED', 'returncode': 0,
+            'wait_result': 'REAPED_BY_ORIGINAL_OWNER', 'process_group_status': 'EMPTY', 'process_group_members': [],
+            'all_pipes_closed': True, 'pipes': {key: {'closed': True} for key in
+                ('stdin', 'stdout', 'stderr', 'serial', 'child_serial_in_parent')},
+            'drain_observation': {'selector_drained': True, 'eof': {'stdin': True}}}
+        observation['drain_observation']['eof'] = {'stdout': True, 'stderr': True, 'serial': True}
+        proof['exit_observation'] = observation
+        adapter._persist(board, handle, {**handle.record, 'native_spawned': True,
+            'identity': _fixture_identity(), 'exit_observation': observation})
+    adapter._retire(candidate, handle, proof)
     handle.closed.set()
     assert not adapter.recover_hvf_reservations(authority)
     with connect_closing(candidate.board) as board, write_txn(board):
@@ -234,9 +244,12 @@ def test_retirement_completes_diagnostic_only_and_matches_both_stores(owner):
     'destroy_success', 'explicit_vm_destroy', 'guest_orderly_shutdown'])
 def test_each_required_normal_retirement_proof_is_mandatory(missing):
     proof = _normal_proof()
-    proof.pop(missing)
+    observed = _fixture_exit_observation()
+    proof['exit_observation'] = observed
     record = {'version': 'HERMES_Q1_HVF_V1', 'state': 'RETIRED', 'mode': 'normal',
-              'native_spawned': True, 'proof': proof}
+              'native_spawned': True, 'proof': proof, 'identity': _fixture_identity(), 'exit_observation': observed}
+    assert adapter._valid_retirement(record)
+    proof.pop(missing)
     assert not adapter._valid_retirement(record)
 
 
@@ -281,7 +294,10 @@ def test_actual_admission_child_released_only_after_durable_booking(owner, tmp_p
     child = handle.process
     assert child is not None and child.returncode == 0
     assert handle.record['native_spawned'] is True
-    assert handle.record['phase'] == 'VM_RELEASE_STARTING'
+    assert handle.record['phase'] == 'FAILED'
+    assert handle.record['exit_observation']['returncode'] == 0
+    assert handle.record['exit_observation']['wait_result'] == 'REAPED_BY_ORIGINAL_OWNER'
+    assert handle.record['exit_observation']['all_pipes_closed'] is True
     assert handle.record['state'] == 'STOP_UNCERTAIN'
     with closing(sqlite3.connect(candidate.board)) as independent:
         record = json.loads(independent.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
@@ -377,3 +393,274 @@ def test_open_serial_endpoint_blocks_retirement_after_child_exit():
         child.wait(timeout=5)
     assert parent.fileno() == -1
     assert all(stream.closed for stream in (child.stdin, child.stdout, child.stderr))
+
+
+def _fixture_identity():
+    return {'pid': 123, 'ppid': 100, 'pgid': 123, 'created': 1000.0, 'boot_time': 500.0,
+            'fingerprint': 'fixture', 'executable': '/fixture/inert'}
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('signal_number', [None, signal.SIGTERM])
+def test_failed_exit_facts_persist_to_both_ledgers_without_retiring(owner, signal_number):
+    import socket
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+    handle.process = child
+    handle.identity = physical.child_identity(child, '/bin/cat')
+    handle.serial, remote = socket.socketpair()
+    handle.guest_serial_closed = True
+    try:
+        if signal_number is None:
+            child.stdin.close()
+        else:
+            os.kill(child.pid, signal_number)
+        # Owner Popen wait is observed directly; pid absence alone is insufficient.
+        physical._wait_for_child(handle, 5)
+        observation = adapter._contain_failed_child(handle, time.monotonic() + 5)
+        adapter._persist_exit(candidate, handle, observation, failure=RuntimeStoreError('inert_fault'))
+        assert observation['pid'] == child.pid
+        assert observation['identity'] == handle.identity
+        assert observation['returncode'] == (0 if signal_number is None else -signal_number)
+        assert observation['terminating_signal'] == signal_number
+        assert observation['wait_result'] == 'REAPED_BY_ORIGINAL_OWNER'
+        assert observation['process_group_status'] == 'EMPTY'
+        assert observation['all_pipes_closed'] is True
+        with closing(sqlite3.connect(candidate.board)) as independent:
+            stored = json.loads(independent.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
+        indexed = adapter.metadata(authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (handle.key,))[0])
+        assert stored == indexed == handle.record
+        assert stored['exit_observation'] == observation
+        assert stored['state'] == 'STOP_UNCERTAIN'
+        assert not adapter._valid_retirement(stored)
+        assert adapter.recover_hvf_reservations(authority)
+        with pytest.raises(RuntimeStoreError, match='hvf_no_successor'):
+            adapter._reserve(authority, candidate, 2)
+    finally:
+        remote.close()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        for stream in (child.stdin, child.stdout, child.stderr):
+            stream.close()
+
+
+@pytest.mark.platforms('macos')
+def test_failed_group_observation_is_unknown_and_receipt_survives_db_failure(owner, monkeypatch):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    handle.process = child
+    handle.identity = physical.child_identity(child, '/bin/cat')
+    try:
+        observation = adapter._contain_failed_child(handle, time.monotonic() + 5)
+        def unavailable(pgid):
+            raise RuntimeStoreError('group_census_denied')
+        monkeypatch.setattr(physical, 'group_members', unavailable)
+        observation = physical.exit_observation(handle)
+        assert observation['process_group_status'] == 'UNKNOWN'
+        assert observation['process_group_members'] is None
+        assert observation['errors']
+        def broken(*args):
+            raise sqlite3.OperationalError('inert_ledger_failure')
+        monkeypatch.setattr(adapter, '_write_board_exit', broken)
+        with pytest.raises(sqlite3.OperationalError):
+            adapter._persist_exit(candidate, handle, observation, failure=RuntimeStoreError('inert_fault'))
+        receipt = json.loads((candidate.output / 'slot-1/failure-observation.json').read_text())
+        assert receipt['observation'] == observation
+        assert receipt['ledger_persistence'].startswith('UNKNOWN')
+        assert handle.record['state'] == 'STOP_UNCERTAIN'
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+@pytest.mark.platforms('macos')
+def test_reconciliation_never_accepts_live_pid_or_nonempty_group(tmp_path, monkeypatch):
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    identity = physical.child_identity(child, '/bin/cat')
+    try:
+        with pytest.raises(RuntimeStoreError, match='hvf_prior_pid_still_present'):
+            physical.verify_prior_absent(identity)
+        child.stdin.close()
+        child.wait(timeout=5)
+        assert physical.verify_prior_absent(identity) == []
+        monkeypatch.setattr(physical, 'group_members', lambda pgid: (999999,))
+        with pytest.raises(RuntimeStoreError, match='hvf_prior_group_not_empty'):
+            physical.verify_prior_absent(identity)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        child.stdout.close()
+        child.stderr.close()
+
+
+@pytest.mark.platforms('macos')
+def test_failed_abort_wait_status_is_persisted_with_core_zero(owner, tmp_path):
+    authority, candidate = owner
+    binary = tmp_path / 'core-zero-gate'
+    source = Path(adapter.__file__).resolve().parents[1] / 'native/qemu_hvf/admission_gate.c'
+    subprocess.run(['xcrun', 'clang', '-DHERMES_HVF_GATE_TEST_MAIN', str(source), '-o', str(binary)],
+                   check=True, capture_output=True, timeout=30)
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen([str(binary)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    handle.process = child
+    handle.identity = physical.child_identity(child, binary)
+    try:
+        import selectors
+        with selectors.DefaultSelector() as poller:
+            poller.register(child.stderr, selectors.EVENT_READ)
+            assert poller.select(5)
+        assert b'current=0 maximum=0' in child.stderr.readline()
+        os.kill(child.pid, signal.SIGABRT)
+        physical._wait_for_child(handle, 5)
+        observation = adapter._contain_failed_child(handle, time.monotonic() + 5)
+        adapter._persist_exit(candidate, handle, observation, failure=RuntimeStoreError('inert_abort'))
+        assert handle.record['state'] == 'STOP_UNCERTAIN'
+        assert observation['returncode'] == -signal.SIGABRT
+        assert observation['terminating_signal'] == signal.SIGABRT
+        assert observation['wait_result'] == 'REAPED_BY_ORIGINAL_OWNER'
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+        for stream in (child.stdin, child.stdout, child.stderr):
+            stream.close()
+
+
+@pytest.mark.platforms('macos')
+def test_wait_failure_keeps_unknown_even_if_signal_was_sent(owner, monkeypatch):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    handle.process = child
+    handle.identity = physical.child_identity(child, '/bin/cat')
+    try:
+        with monkeypatch.context() as patch:
+            def unavailable(*args, **kwargs):
+                raise subprocess.TimeoutExpired('/bin/cat', 1)
+            patch.setattr(child, 'wait', unavailable)
+            observation = adapter._contain_failed_child(handle, time.monotonic() + 2)
+        adapter._persist_exit(candidate, handle, observation, failure=RuntimeStoreError('inert_wait_failure'))
+        assert observation['wait_result'] == 'UNKNOWN'
+        assert observation['returncode'] is None
+        assert observation['errors']
+        assert handle.record['state'] == 'STOP_UNCERTAIN'
+        assert not adapter._valid_retirement(handle.record)
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+
+
+def test_receipt_failure_does_not_prevent_exit_facts_in_available_ledgers(owner, monkeypatch):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    observation = {'pid': 123, 'wait_result': 'UNKNOWN', 'errors': [{'operation': 'inert_fault'}]}
+    def denied(*args):
+        raise PermissionError('inert_receipt_directory_denied')
+    monkeypatch.setattr(adapter, '_write_exit_receipt', denied)
+    with pytest.raises(PermissionError):
+        adapter._persist_exit(candidate, handle, observation, failure=RuntimeStoreError('inert_failure'))
+    with closing(sqlite3.connect(candidate.board)) as independent:
+        recorded = json.loads(independent.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
+    indexed = adapter.metadata(authority.db._read_one('SELECT value FROM state_meta WHERE key=?', (handle.key,))[0])
+    assert recorded == indexed
+    assert recorded['state'] == 'STOP_UNCERTAIN'
+    assert recorded['exit_observation'] == observation
+
+
+@pytest.mark.parametrize('broken', [None, [], {'stdin': None}])
+def test_malformed_nested_exit_evidence_cannot_establish_retirement(broken):
+    identity = _fixture_identity()
+    record = {'identity': identity, 'exit_observation': {'identity': identity, 'pipes': broken, 'drain_observation': broken}}
+    assert not adapter._valid_exit_observation(record, {'exit_code': 0})
+
+
+@pytest.mark.platforms('macos')
+def test_terminal_monitor_input_remains_live_until_child_exit():
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, bufsize=0, start_new_session=True)
+    pipes = physical.ChildPipes(child)
+    try:
+        with pytest.raises(RuntimeStoreError, match='hvf_control_timeout'):
+            pipes.drain_and_wait(time.monotonic() + 2, close_input=False)
+        assert not child.stdin.closed
+    finally:
+        pipes.close()
+        child.wait(timeout=5)
+
+
+def _fixture_exit_observation():
+    return {'pid': 123, 'identity': _fixture_identity(), 'identity_status': 'VERIFIED', 'returncode': 0,
+            'terminating_signal': None, 'wait_result': 'REAPED_BY_ORIGINAL_OWNER',
+            'process_group_status': 'EMPTY', 'process_group_members': [], 'all_pipes_closed': True,
+            'pipes': {key: {'closed': True} for key in ('stdin', 'stdout', 'stderr', 'serial', 'child_serial_in_parent')},
+            'drain_observation': {'selector_drained': True, 'eof': {'stdout': True, 'stderr': True, 'serial': True}}}
+
+
+@pytest.mark.parametrize('missing', ['created', 'boot_time', 'fingerprint', 'executable'])
+def test_birth_identity_is_mandatory_in_retirement_evidence(missing):
+    proof = _normal_proof()
+    observed = _fixture_exit_observation()
+    proof['exit_observation'] = observed
+    identity = observed['identity']
+    record = {'version': 'HERMES_Q1_HVF_V1', 'state': 'RETIRED', 'mode': 'normal',
+              'native_spawned': True, 'proof': proof, 'identity': identity, 'exit_observation': observed}
+    assert adapter._valid_retirement(record)
+    del identity[missing]
+    assert not adapter._valid_retirement(record)
+
+
+def test_new_grant_never_resumes_a_profile_with_old_grant(owner):
+    authority, candidate = owner
+    authority.db._execute_write(lambda db: db.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
+        ('q1.hvf.grant:7058818518', '{"status":"STOP_UNCERTAIN"}')))
+    with pytest.raises(RuntimeStoreError, match='hvf_grant_already_reserved'):
+        adapter._unused_profile(candidate.profile)
+
+
+@pytest.mark.parametrize('field', ['profile', 'helper', 'files', 'prior_snapshot_sha256'])
+def test_grant_manifest_cannot_be_rebound_to_other_artifacts_or_profile(field):
+    from dataclasses import replace
+    lock_path = Path(adapter.__file__).resolve().parents[1] / 'native/qemu_hvf/rerun-authorization.json'
+    values = json.loads(lock_path.read_text())['candidate']
+    paths = ('profile', 'board', 'helper', 'plan', 'kernel', 'initramfs', 'disk', 'output', 'prior_profile')
+    candidate = adapter.HVFCandidate(**{name: Path(values[name]) for name in paths},
+        files=values['files'], prior_snapshot_sha256=values['prior_snapshot_sha256'], source_head='a' * 40)
+    adapter._verify_authorization(candidate)
+    replacement = ({**values['files'], str(candidate.helper): '0' * 64} if field == 'files'
+                   else '0' * 64 if field == 'prior_snapshot_sha256' else getattr(candidate, field).with_name('unapproved'))
+    changed = replace(candidate, **({'files': dict(candidate.files)} | {field: replacement}))
+    with pytest.raises(RuntimeStoreError, match='hvf_exact_grant_candidate_binding_changed'):
+        adapter._verify_authorization(changed)
+
+
+def test_owner_sink_failure_does_not_prevent_board_exit_evidence(owner, monkeypatch):
+    authority, candidate = owner
+    adapter._grant(authority, candidate)
+    handle = adapter._reserve(authority, candidate, 1)
+    observed = {'pid': 123, 'wait_result': 'UNKNOWN'}
+    def denied(*args):
+        raise sqlite3.OperationalError('inert_owner_sink_unavailable')
+    monkeypatch.setattr(adapter, '_write_owner_exit', denied)
+    with pytest.raises(sqlite3.OperationalError):
+        adapter._persist_exit(candidate, handle, observed, failure=RuntimeStoreError('inert_fault'))
+    with closing(sqlite3.connect(candidate.board)) as db:
+        recorded = json.loads(db.execute('SELECT metadata FROM task_runs').fetchone()[0])[adapter.NAMESPACE]
+    assert recorded['state'] == 'STOP_UNCERTAIN'
+    assert recorded['exit_observation'] == observed
+    assert adapter.recover_hvf_reservations(authority)

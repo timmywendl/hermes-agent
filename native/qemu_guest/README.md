@@ -8,6 +8,56 @@ with the original RuntimeSessionStore/outbox and canonical Owner receipts. It is
 an entry/transport adapter, not another Worker runtime or SessionDB. Delegation
 and session rotation remain refused on an exact physical assignment.
 
+## Combined original-Owner qualification package
+
+The integrated Host source uses the accepted plan
+`8ed92d2a68d70361021e774d6a3dad6b935cb277`. It preserves the Guest image's
+independent source identity, PR16 `9a270a78b421565a64901182062b18a0d3b2e673`,
+and imports accepted Builder PR17 `2232de50d163c5a1d630220922642983437ab9ac`
+and Host PR18 `13c096f01f4d65726d89e36f9985959f8c6fcb73`. Those original branches,
+the Q1 inert image and its Helper/grants remain unchanged.
+
+`gateway.session_guest_hvf` is a finite qualification sibling of the registered
+original `SessionAuthority`. It prepares a fresh disposable Board and original
+admission, books the exact process identity under the Board writer transaction,
+and releases the existing one-shot QEMU gate only after durable readback. It
+adds no product dispatch backend. `OwnerSerialSession` alone reads and writes
+the framed UART; the process observer handles separate QMP/stdout/stderr only.
+Normal finalization requires complete Host process, wait, group, descriptor,
+thread and Owner-accounting evidence. Cancellation keeps logical UNKNOWN even
+when complete physical cleanup facts can be appended. Neither a manifest nor
+a Guest reply can issue a grant or retire physical execution.
+
+The proposed serial three-slot batch is Developer, an independent read-only
+Reviewer of the **actual stopped Developer candidate**, and Cancellation. The
+reviewed ext4 parser preserves the actual Guest commit and verifies its content;
+it does not create an equivalent Host commit. Each slot has fresh identities,
+task and assignment devices. Dynamic manifests are bound by the original Owner
+before release. The fixed budget is three starts, one concurrent VM, 2 vCPU,
+2 GiB RAM, at most 8 GiB disks, 60 seconds startup, 30 seconds stop/cleanup,
+300 seconds per slot and 900 seconds total, with no retry, resume or reboot.
+
+A separate Q2 Helper has been built and signed; its offline receipt contains
+its complete App inventory, source bindings, entitlements, SBOM and provenance.
+Actual OS positive/negative controls have run in a separate primary Canary App
+with the same App identifier and entitlements and the exact linked preflight
+object. Their status is `PASS_POLICY_EQUIVALENT_CANARY_ONLY`: the Canary has a
+different Mach-O CDHash and resource prefix. This is **not** evidence that the
+actual QEMU Helper executable has run under its Sandbox. The initial secondary
+executable's pre-main `secinit` failure and all failed build/control records are
+retained. Exact-Helper preflight remains `NOT_RUN`; accepting the documented
+equivalence or authorizing that preflight is a remaining Main Control decision.
+
+The prepared Native payload is a request, never authority. It freezes the final
+combined source HEAD, original seven device identities, Helper identity,
+Sandbox evidence, exact disposable paths, deterministic derivation recipe and
+resource budget. A separate protected original-Owner operator action must record
+an explicit subsequent Human grant. **QEMU/HVF, Guest Worker, real models,
+credentials, Runtime Apply, real project writes and Board dispatch remain
+NOT_RUN / NOT_AUTHORIZED in this offline package.** The sections below preserve
+the accepted PR16/17/18 contracts; historical source-only phase statements do
+not negate the separately recorded offline construction and Canary evidence.
+
 ## Wire and dependencies
 
 QEMU inherits one AF_UNIX socketpair descriptor. Its socket chardev connects to

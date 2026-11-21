@@ -658,3 +658,41 @@ CI无check仍为NOT_RUN。Human保留最终Merge与后续真实模型/工程交�
 /Users/timmywen/Documents/AI_Colleague/evidence/q2-native-qualification-plan-20261122
 其中 source-artifact-audit.json 保存所有已知source blob/SHA和原七件真实身份。
 未来unknown hashes明确标记；本计划不能伪造尚未构建的源码/二进制/Slot1输出。
+
+## 14. Phase B 实施与离线交付补充
+
+以上第 1–13 节保留接受计划的原文；冻结身份仍为
+`8ed92d2a68d70361021e774d6a3dad6b935cb277`。
+Main Control 在 comment 7066910552 批准本 Worktree 的源码整合、构建、Sandbox Canary、
+离线回归、Mutation 和独立 Review。该决定明确没有授予 QEMU/HVF、Guest Worker、
+Runtime Apply、真实模型/凭据、真实项目写入或 Board 派工权限。
+
+整合采用 PR16 Guest 基线、PR17 Builder 和 PR18 Host 的保留历史；原接受分支不变。
+Q1 helper、原七件制品和历史失败/UNKNOWN 保留。新 Q2 Helper 独立构建，
+新 campaign root 是普通独立字节副本；原七件的 inode 与 SHA 再次核验。
+Developer 与 Reviewer 的任务设备由原 Owner 的冻结 assignment 派生；
+Reviewer 只接受真实 Slot1 磁盘提取的 commit/content 链，不预造 candidate。
+
+原 Owner 的持久化 grant 在 Popen 前消费 slot，STARTING 在 spawn 前提交；
+最终 Board writer transaction 内重新核对原 Owner、claim、全部历史和设备 FD，
+Popen、身份登记与 readback 后只放行一次原 Q1 release gate。
+Q2 SerialWire 独占 UART；QMP/stdio 观察器没有 UART 能力。
+Owner 保留精确 task FD 至退出后 fsync，核验只读设备字节与 inode，然后关闭能力。
+物理证明之后保留 ACCOUNTING exclusion，完成既有 Worker、admission 和 Board 记账后
+才写 RETIRED；任何中间失败保留 STOP_UNCERTAIN 并停止批次。
+取消的逻辑 UNKNOWN 不会因物理证明完整而改成成功；新 canonical Owner epoch 重新核验历史。
+
+实际 App Sandbox Canary 的结果为 **PASS_POLICY_EQUIVALENT_CANARY_ONLY**：
+独立主 Canary.app 与 QEMU Helper 使用相同 bundle identifier、entitlements 及同一 preflight
+对象，但 Mach-O CDHash 不同。它不是 exact Helper 执行证据。
+最初 secondary-executable secinit SIGTRAP 及全部构建失败记录保留。
+实际 QEMU Helper 的 Sandbox preflight 与 Native 三 Slot 均 **NOT_RUN**。
+完整授权包明确列出该剩余条件；必须由 Main Control 裁决等价性或明确授权 exact Helper
+前置验证，并另行授予一次完整三 Slot Native grant。源码交付不签发该 grant。
+
+证据根：
+`/Users/timmywen/Documents/AI_Colleague/evidence/q2-native-qualification-implementation-20261122`。
+最终 source/helper/code identity、原制品与副本、工具依赖、fixture、SBOM/provenance、
+静态检查、回归、Mutation、独立 exact-HEAD Review 及三 Slot 请求均由该目录的最终索引绑定。
+所有旧失败日志保留；离线 synthetic physical facts 不记作 Native PASS。
+FIRST_WORKER_OWNED_DELIVERY 仍为 NOT_ACHIEVED；未恢复真实 Worker 派工。

@@ -200,6 +200,19 @@ class SessionAuthority:
             signal_hvf_stop(self)
             raise
 
+    async def qualify_q2(self, candidate, *, slot, candidate_snapshot=None, batch_deadline=None):
+        """Finite protected qualification; never a product Board dispatch backend."""
+        from gateway.session_guest_hvf import qualify_slot
+        from gateway.session_runtime_workers import track_mutation
+        task = track_mutation(self, qualify_slot(self, candidate, slot,
+                              candidate=candidate_snapshot, batch_deadline=batch_deadline))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            from gateway.session_guest_serial import stop_guest_channels
+            stop_guest_channels(self)
+            raise
+
     def _pending_rows(self, ref):
         """Pending admissions as the event stream presents them: a settlement committed but not yet
         published (``LiveSession.settling``) still reads as its started claim. Callers that pair the
@@ -1104,6 +1117,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
     from gateway.session_hvf_adapter import recover_hvf_reservations
     recover_hvf_reservations(authority)
+    from gateway.session_guest_hvf import recover_q2_reservations
+    recover_q2_reservations(authority)
     if register:
         runner.session_authority = authority
     from gateway.session_cron import bind_owner

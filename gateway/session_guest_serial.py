@@ -7,6 +7,9 @@ inert campaign, grant and helper are not extended or reused as launch authority.
 import json
 import sqlite3
 import threading
+import time
+import queue
+from concurrent.futures import Future, CancelledError
 
 from agent.guest_inference import validate_request
 from agent.guest_serial import SerialError, SerialWire
@@ -15,7 +18,8 @@ from hermes_state_runtime import RuntimeStoreError
 
 
 class OwnerSerialSession:
-    def __init__(self, endpoint, fd, work, *, inference=None, activity=None, heartbeat_interval=5, heartbeat_lease=90):
+    def __init__(self, endpoint, fd, work, *, inference=None, activity=None, heartbeat_interval=5, heartbeat_lease=90,
+                 defer_heartbeat=False):
         if not isinstance(endpoint, GuestOwnerEndpoint) or work['assignment'] != endpoint.scope:
             raise RuntimeStoreError('guest_scope_mismatch')
         from gateway.session_hvf_adapter import _require_owner
@@ -27,12 +31,25 @@ class OwnerSerialSession:
         self.inference = inference
         self.activity = activity
         self.stop = threading.Event()
+        self.ready = threading.Event()
+        self.result_ready = threading.Event()
+        self.persisted_finish = threading.Event()
+        self.finished = threading.Event()
+        self.peer_eof = threading.Event()
+        self.transport_joined = threading.Event()
+        self.ready_at = self.result_at = self.finished_at = self.peer_eof_at = None
+        self.cleanup_errors = []
+        self.service_future = None
+        self.service_observed = False
+        self.service_failure = None
         self.stop_sent = threading.Event()
         self.unknown_persisted = threading.Event()
         self.stop_lock = threading.Lock()
         self.io_lock = threading.Lock()
         self.inference_count = 0
         self.wire = None
+        self.heartbeat_options = dict(interval=heartbeat_interval, lease=heartbeat_lease, on_failure=self._wire_failure)
+        self.heartbeat_deferred = defer_heartbeat
         from gateway.session_guest_inference import OwnerResponses
         encoded = json.dumps(self.work, sort_keys=True, separators=(',', ':'), allow_nan=False)
         def attach(conn):
@@ -48,10 +65,13 @@ class OwnerSerialSession:
             if isinstance(inference, OwnerResponses):
                 inference.bind(endpoint, self.stop, conn)
             self.wire = SerialWire(fd, endpoint.scope)
+            if defer_heartbeat:
+                self.wire.timeout = 60
             workers[key] = self  # retained on EOF, cancel, result or Owner loss
         try:
             endpoint.authority.db._execute_write(attach)
-            self.wire.start_heartbeat(interval=heartbeat_interval, lease=heartbeat_lease, on_failure=self.stop.set)
+            if not defer_heartbeat:
+                self.wire.start_heartbeat(**self.heartbeat_options)
         except Exception as failure:
             self.stop.set()
             if self.wire is not None:
@@ -67,16 +87,23 @@ class OwnerSerialSession:
         with self.io_lock:
             if self.wire.closed.is_set() and self.wire.failure is None:
                 raise SerialError('guest_transport_closed')
-            self._serve_one()
+            return self._serve_one()
 
     def _serve_one(self):
         try:
-            frame = self.wire.receive()
+            frame = self._receive()
+            if self.stop_sent.is_set() and self.unknown_persisted.is_set() and self.endpoint.revoked:
+                # Drain to actual peer EOF without admitting late operations.
+                # A denial wakes the unchanged Guest's outstanding RPC.
+                if frame['kind'] == 'request':
+                    self.wire.send(frame['channel'], 'reply', {'error': 'guest_channel_revoked'},
+                                   reply_to=frame['seq'])
+                return True
             with self.endpoint.authority.db._read_ctx() as conn:
                 self.endpoint._verify(conn)
             if frame['kind'] == 'event' and frame['channel'] == 'activity':
                 self._activity(frame['payload'])
-                return
+                return True
             if frame['kind'] != 'request':
                 raise SerialError('unexpected_guest_frame')
             try:
@@ -84,8 +111,29 @@ class OwnerSerialSession:
                 payload = {'result': result}
             except RuntimeStoreError as exc:
                 payload = {'error': exc.reason}
+            if self.stop.is_set() and 'result' in payload:
+                payload = {'error': 'guest_channel_revoked'}
             self.wire.send(frame['channel'], 'reply', payload, reply_to=frame['seq'])
+            return True
         except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError) as failure:
+            if (isinstance(failure, EOFError) and str(failure) == 'serial_eof'
+                    and self.stop_sent.is_set() and self.unknown_persisted.is_set() and self.endpoint.revoked):
+                with self.endpoint.authority.db._read_ctx() as conn:
+                    worker, admission = self.endpoint._verify(conn, allow_unknown=True)
+                    if worker['status'] != 'unknown' or admission['status'] != 'unknown':
+                        raise RuntimeStoreError('guest_cancel_unknown_unverified')
+                self.peer_eof.set()
+                self._close_io()
+                return False
+            if isinstance(failure, EOFError) and str(failure) == 'serial_eof' and self.finished.is_set():
+                try:
+                    self._verify_finished()
+                except (ValueError, OSError, sqlite3.Error) as verification_failure:
+                    failure.add_note('Healthy finish not verified: ' + str(verification_failure))
+                else:
+                    self.peer_eof.set()
+                    self._close_io()
+                    return False
             try:
                 self.cancel(send=False)
             except (sqlite3.Error, OSError, RuntimeStoreError) as storage_failure:
@@ -93,6 +141,50 @@ class OwnerSerialSession:
             finally:
                 self._close_io()
             raise
+
+    def _wire_failure(self):
+        # EOF can race the final queued frame. Only a committed logical finish
+        # permits the service reader to drain it; all other loss revokes now.
+        failure = self.wire.failure
+        if isinstance(failure, EOFError) and str(failure) == 'serial_eof':
+            self.peer_eof_at = time.monotonic()
+            self.peer_eof.set()
+            if self.result_ready.is_set() and self.persisted_finish.is_set():
+                return
+        self.stop.set()
+
+    def _receive(self):
+        try:
+            if self.heartbeat_deferred:
+                # Do not transmit into the Guest's still-cooked UART. The
+                # accepted Guest performs TCSAFLUSH before its first frame.
+                frame = self.wire.receive()
+                self.wire.timeout = 30
+                self.heartbeat_deferred = False
+                self.wire.start_heartbeat(**self.heartbeat_options)
+                if frame['kind'] != 'heartbeat':
+                    return frame
+                self.wire._heartbeat(frame['payload'])
+            return self.wire.receive()
+        except EOFError:
+            if (self.result_ready.is_set() and self.persisted_finish.is_set()
+                    and isinstance(self.wire.failure, EOFError)
+                    and str(self.wire.failure) == 'serial_eof'):
+                try:
+                    return self.wire.inbox.get_nowait()
+                except queue.Empty:
+                    pass
+            raise
+
+    def _verify_finished(self):
+        if not (self.result_ready.is_set() and self.persisted_finish.is_set() and self.finished.is_set()):
+            raise RuntimeStoreError('guest_logical_finish_unverified')
+        with self.endpoint.authority.db._read_ctx() as conn:
+            self.endpoint._verify(conn)
+            row = conn.execute('SELECT result_json FROM worker_receipts WHERE execution_id=? '
+                               'ORDER BY sequence DESC LIMIT 1', (self.endpoint.scope['execution_id'],)).fetchone()
+            if row is None or json.loads(row[0]) != {'status': 'pending_retirement'}:
+                raise RuntimeStoreError('guest_logical_finish_unverified')
 
     def _close_io(self):
         """Always close the descriptor even if shutdown or pump joining fails."""
@@ -115,7 +207,12 @@ class OwnerSerialSession:
         if self.stop.is_set():
             raise RuntimeStoreError('guest_channel_revoked')
         if channel == 'persistence':
-            return self.endpoint(payload)
+            result = self.endpoint(payload)
+            if (isinstance(payload, dict) and payload.get('method') == 'worker.persist'
+                    and payload.get('params', {}).get('operation') == 'execution.finish'
+                    and result == {'status': 'pending_retirement'}):
+                self.persisted_finish.set()
+            return result
         if channel == 'context' and payload == {'operation': 'assignment'}:
             self.endpoint.require_host_operation()
             return self.work
@@ -145,30 +242,133 @@ class OwnerSerialSession:
             raise SerialError('unsupported_guest_activity')
         if self.activity is not None:
             self.activity(payload)  # untrusted display data; never a retirement receipt
-        if payload['type'] == 'result':
+        if payload['type'] == 'ready':
+            self.ready_at = time.monotonic()
+            self.ready.set()
+        elif payload['type'] == 'result':
             self.wire.send('lifecycle', 'control', {'type': 'finish'})
+            self.result_at = time.monotonic()
+            self.result_ready.set()
+        elif payload['type'] == 'finished':
+            if not (self.result_ready.is_set() and self.persisted_finish.is_set()):
+                raise SerialError('guest_finished_before_canonical_receipt')
+            self.finished_at = time.monotonic()
+            self.finished.set()
+            self._verify_finished()
 
-    def close_transport(self):
-        """Join the synchronous service section and close our duplicated descriptor.
+    def bind_service(self, future):
+        """Bind the original Owner's one physical service operation for joining."""
+        if self.service_future is not None or not isinstance(future, Future):
+            raise RuntimeStoreError('guest_service_binding_conflict')
+        self.service_future = future
 
-        This is transport cleanup only. Original Owner accounting and durable
-        UNKNOWN remain until an independently qualified physical finalizer runs.
-        """
+    def _join_service(self, deadline, *, revoke):
+        if self.service_future is None:
+            return None
+        from concurrent.futures import TimeoutError as ServiceTimeout
+        try:
+            failure = self.service_future.exception(timeout=max(0, min(2, deadline - time.monotonic())))
+        except ServiceTimeout:
+            return RuntimeStoreError('guest_service_unretired')
+        except CancelledError as cancelled:
+            failure = cancelled
+        self.service_observed = True
+        if failure is None:
+            self.service_future.result()  # completed successfully; never waits here
+        else:
+            self.service_failure = str(failure)
+            if not revoke or not isinstance(failure, Exception):
+                return failure
+        return None
+
+    def _cleanup_transport(self, *, deadline, revoke):
         self.stop.set()
         self.wire.close()
-        if not self.io_lock.acquire(timeout=2):
-            raise RuntimeStoreError('guest_service_unretired')
-        try:
+        failures = []
+        if revoke:
             try:
                 self.endpoint.revoke()
-            finally:
-                self._close_io()
-        finally:
+            except (ValueError, OSError, sqlite3.Error) as failure:
+                failures.append(failure)
+        try:
+            self._close_io()
+        except (ValueError, OSError) as failure:
+            failures.append(failure)
+        remaining = max(0, min(2, deadline - time.monotonic()))
+        acquired = self.io_lock.acquire(timeout=remaining)
+        if acquired:
             self.io_lock.release()
-            from gateway.session_guest_inference import OwnerResponses
-            if isinstance(self.inference, OwnerResponses):
+        else:
+            failures.append(RuntimeStoreError('guest_service_unretired'))
+        service_failure = self._join_service(deadline, revoke=revoke)
+        if service_failure is not None:
+            failures.append(service_failure)
+        from gateway.session_guest_inference import OwnerResponses
+        if isinstance(self.inference, OwnerResponses):
+            try:
                 self.inference.close()
+            except (ValueError, OSError, RuntimeError) as failure:
+                failures.append(failure)
+        if time.monotonic() > deadline:
+            failures.append(RuntimeStoreError('guest_transport_close_deadline'))
+        if failures and not revoke:
+            try:
+                self.endpoint.revoke()
+            except (ValueError, OSError, sqlite3.Error) as failure:
+                failures.append(failure)
+        self.cleanup_errors.extend(str(failure) for failure in failures)
+        if failures:
+            for additional in failures[1:]:
+                failures[0].add_note('Additional Guest cleanup failure: ' + str(additional))
+            raise failures[0]
+        self.transport_joined.set()
+        return self.physical_observation()
 
+    def finish_transport(self, *, deadline=None):
+        """Close a verified healthy result without claiming physical retirement.
+
+        Only the original physical finalizer may release its accounting entry.
+        This path cannot erase UNKNOWN or accept a Guest-provided retirement.
+        """
+        if self.endpoint.revoked or self.unknown_persisted.is_set():
+            raise RuntimeStoreError('guest_healthy_finish_revoked')
+        self._verify_finished()
+        return self._cleanup_transport(deadline=deadline or time.monotonic() + 2, revoke=False)
+
+    def close_transport(self, *, deadline=None):
+        """Close all owned resources, preserving revoke and cleanup failures."""
+        return self._cleanup_transport(deadline=deadline or time.monotonic() + 2, revoke=True)
+
+    def physical_observation(self):
+        """Read facts only: this neither opens serial nor releases exclusion."""
+        from gateway.session_guest_inference import OwnerResponses
+        pump = self.wire.pump
+        writer = self.wire.lock.acquire(blocking=False)
+        if writer:
+            self.wire.lock.release()
+        service = self.io_lock.acquire(blocking=False)
+        if service:
+            self.io_lock.release()
+        inference = self.inference
+        http_complete = (not isinstance(inference, OwnerResponses) or
+                         (inference.closed and (inference.pending is None or inference.pending.done())
+                          and all(not thread.is_alive() for thread in inference.executor._threads)))
+        result = {'scope': dict(self.endpoint.scope), 'serial_observer': 'ORIGINAL_OWNER_SERIALWIRE',
+                  'peer_eof': self.peer_eof.is_set(), 'descriptor_closed': self.wire.fd == -1,
+                  'receive_pump_joined': pump is not None and not pump.is_alive(),
+                  'writer_joined': writer and self.wire.closed.is_set(),
+                  'service_joined': service and self.service_observed and self.service_future is not None
+                                    and self.service_future.done(),
+                  'http_joined': http_complete, 'transport_joined': self.transport_joined.is_set(),
+                  'logical_finished': self.finished.is_set() and self.persisted_finish.is_set(),
+                  'ready': self.ready.is_set(), 'ready_at': self.ready_at, 'result_at': self.result_at,
+                  'finished_at': self.finished_at, 'peer_eof_at': self.peer_eof_at,
+                  'service_failure': self.service_failure,
+                  'cleanup_errors': list(self.cleanup_errors)}
+        fields = ('peer_eof', 'descriptor_closed', 'receive_pump_joined', 'writer_joined',
+                  'service_joined', 'http_joined', 'transport_joined')
+        result['complete'] = all(result[field] is True for field in fields) and not self.cleanup_errors
+        return result
 
     def cancel(self, *, send=True):
         self.stop.set()  # authority closes immediately, before either independent action

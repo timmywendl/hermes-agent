@@ -41,9 +41,10 @@ It leaves PR13's nine-path candidate and the preserved Q2 candidate unchanged.
 On macOS with Xcode's SDK installed:
 
 ```sh
+probe_dir="$(mktemp -d)"
 xcrun clang -std=c17 -fblocks -Wall -Wextra -Werror \
-  native/vz_observer/rights_visibility_probe.c -o /tmp/rights-visibility
-/tmp/rights-visibility
+  native/vz_observer/rights_visibility_probe.c -o "$probe_dir/rights-visibility"
+"$probe_dir/rights-visibility"
 scripts/run_tests.sh tests/native/test_vz_observer_visibility.py
 ```
 

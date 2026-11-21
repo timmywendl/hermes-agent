@@ -337,6 +337,15 @@ Controlled localhost Sandbox calibration 是独立的无 VM OS canary，不是 F
 不运行历史事故 Gateway/loopback 集成测试，不发外部网络请求。
 若 Human grant 不包含这些 OS 控制，保持 NOT_RUN，不偷用已花费 Q1 grant。
 
+控制执行分层必须明确：VM前先用与最终App相同entitlements/打包规则、相同预检对象代码的
+无Hypervisor canary做unrestricted/sandboxed/recheck；它不是QEMU进程。
+每个实际QEMU Helper也在本slot内、进入hv_vm_create之前执行自身签名/FD/Sandbox预检并留下codeidentity。
+若实际Helper预检失败，该QEMU进程已消费slot，立即停止，不另起一个Helper补测。
+Serial nonce和scratch-sector读写只在canary自己的独立公开fixture FD上进行，不能污染真实Worker的framed UART，
+也不能预检改写实际Guest ext4元数据。实际Helper仅检查其授权FD身份/accessmode和预检允许表，
+真实Developer写能力由Slot1的实际Worker写盘与停机后内容核验共同证明。
+不为了跑Helper --preflight/--version而额外启动第四个QEMU；没有绕过预算的诊断模式。
+
 ## 8. 三 Slot：实际命令、输入与证据
 
 下面是未来原 Owner 内部生成的 argv 模板，不在 Phase A 执行。Host 不接受任意用户 argv。

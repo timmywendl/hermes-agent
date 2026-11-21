@@ -1,7 +1,8 @@
-"""Q1-C1 pure wire contracts against compiled Swift; no VZ, Owner or VM execution.
+"""Q1 candidate wire contracts against compiled Swift; no VZ API or VM execution.
 
-Build only the conditional contract_check harness, never sign/apply entitlements.
-The descriptor is fixture data, not an approved native artifact or identity proof.
+Compile the pure harness and native candidate; execute only pure logic and native
+admission denial. Never sign/apply entitlements. Fixture descriptors are neither
+approved artifacts nor original Owner identity proof.
 """
 
 from __future__ import annotations
@@ -11,7 +12,9 @@ import hashlib
 import json
 import plistlib
 import shutil
+import socket
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -345,3 +348,95 @@ def test_pure_swift_lifecycle_and_illegal_transitions(tmp_path: Path) -> None:
 def test_entitlement_is_minimal_declaration() -> None:
     with (ROOT / "native/vz_adapter/owner.entitlements").open("rb") as stream:
         assert plistlib.load(stream) == {"com.apple.security.virtualization": True}
+
+
+@pytest.fixture(scope="module")
+def owner_adapter(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """Compile the native implementation; do not execute a VZ API."""
+    compiler = shutil.which("swiftc")
+    assert compiler
+    binary = tmp_path_factory.mktemp("q1c-owner-gate") / "owner_adapter"
+    build = subprocess.run(
+        [compiler, "-parse-as-library", "-warnings-as-errors", "-D", "Q1C_OWNER_ADAPTER",
+         str(ROOT / "native/vz_adapter/main.swift"), "-o", str(binary)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    return binary
+
+
+def adapter_denial(binary: Path, packet: JSON) -> tuple[JSON | None, bytes]:
+    """Negative transport test, never an original Owner or a native launch driver."""
+    parent, child = socket.socketpair()
+    parent.settimeout(10)
+    # The inert exec shim only establishes the fixed inherited FD. No caller JSON
+    # can establish native authority, including a claimed grant or readiness proof.
+    shim = ("import os,sys; fd=int(sys.argv[1]); os.dup2(fd,3); "
+            "os.set_inheritable(3,True); "
+            "os.close(fd) if fd!=3 else None; os.execv(sys.argv[2],[sys.argv[2]])")
+    try:
+        with subprocess.Popen(
+            [sys.executable, "-c", shim, str(child.fileno()), str(binary)],
+            pass_fds=(child.fileno(),), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        ) as process:
+            child.close()
+            body = json.dumps(packet).encode()
+            wire = len(body).to_bytes(4, "big") + body
+            # Exercise short/fractured reads of a real private socket stream.
+            for offset in range(0, len(wire), 7):
+                parent.sendall(wire[offset:offset + 7])
+            response = bytearray()
+            while part := parent.recv(65_536):
+                response.extend(part)
+            stdout, stderr = process.communicate(timeout=10)
+            assert process.returncode == 0 and stdout == b""
+            if not response:
+                return None, stderr
+            count = int.from_bytes(response[:4], "big")
+            assert 0 < count <= 65_536 and len(response) == count + 4
+            return json.loads(response[4:]), stderr
+    finally:
+        parent.close()
+        child.close()
+
+
+def test_owner_socket_cannot_self_authorize_native(owner_adapter: Path) -> None:
+    # All artifact paths are deliberately nonexistent. The denial must precede
+    # artifact opening, VZ configuration construction, validation and start.
+    result, stderr = adapter_denial(owner_adapter, {"descriptor": json.dumps(descriptor())})
+    assert stderr == b""
+    assert result == {
+        "code": "CONTAINMENT_UNVERIFIED", "native": "NOT_RUN", "stop_verified": False,
+        "missing": ["HOST_POLICY_DENIAL_WITNESS", "INDEPENDENT_PER_VM_OBSERVER", "PROTECTED_HASH_BOUND_APPROVAL"],
+    }
+
+
+def test_owner_socket_rejects_caller_supplied_grant(owner_adapter: Path) -> None:
+    result, stderr = adapter_denial(
+        owner_adapter, {"descriptor": json.dumps(descriptor()), "readiness": {"native_grant": True}})
+    assert result is None and stderr == b"INVALID_FRAME\n"
+
+
+def test_owner_adapter_never_takes_stdio_or_argv_authority(owner_adapter: Path) -> None:
+    result = subprocess.run(
+        [str(owner_adapter), "--native-grant", "true"], input=json.dumps(descriptor()).encode(),
+        capture_output=True, timeout=10, check=False, close_fds=True,
+    )
+    assert result.returncode == 0 and result.stdout == b"" and result.stderr == b"NATIVE_NOT_AUTHORIZED\n"
+
+
+def test_compiled_native_factory_refuses_before_vz(tmp_path: Path) -> None:
+    compiler = shutil.which("swiftc")
+    assert compiler
+    binary = tmp_path / "native_gate"
+    build = subprocess.run(
+        [compiler, "-parse-as-library", "-warnings-as-errors", "-D", "Q1C_NATIVE_IMPLEMENTATION",
+         str(ROOT / "native/vz_adapter/main.swift"), str(ROOT / "tests/native/test_vz_no_nic.swift"),
+         "-o", str(binary)],
+        capture_output=True, text=True, timeout=120, check=False,
+    )
+    assert build.returncode == 0, build.stderr
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10, check=False)
+    assert result.returncode == 0, result.stderr
+    assert "VZ_API_OPERATIONS=NOT_RUN" in result.stdout

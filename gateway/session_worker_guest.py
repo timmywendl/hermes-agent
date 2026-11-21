@@ -345,4 +345,3 @@ class GuestOwnerEndpoint:
                 conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
                              (self.scope['session_id'],))
             self.authority.db._execute_write(write)
-

@@ -10,6 +10,7 @@ import os
 import re
 from pathlib import Path
 import signal
+import socket
 import sqlite3
 import sys
 import subprocess
@@ -120,10 +121,10 @@ class HVFCandidate:
                 raise RuntimeStoreError('hvf_artifact_changed', detail=name)
         _verify_signature(self.helper)
 
-    def argv(self):
+    def argv(self, serial_fd):
         return [str(self.helper), '--hermes-hvf-q1', str(self.plan), '-L', str(self.plan.parent),
                 '-nodefaults', '-display', 'none', '-monitor', 'none', '-qmp', 'stdio',
-                '-chardev', 'ringbuf,id=serial,size=1048576', '-serial', 'chardev:serial',
+                '-chardev', f'socket,id=serial,fd={serial_fd}', '-serial', 'chardev:serial',
                 '-nic', 'none', '-accel', 'hvf', '-machine', 'virt', '-cpu', 'host',
                 '-smp', '2', '-m', '2048', '-no-reboot',
                 '-kernel', str(self.kernel), '-initrd', str(self.initramfs),
@@ -214,6 +215,7 @@ class HVFHandle:
         self.stop = threading.Event()
         self.process = None
         self.identity = None
+        self.serial = None
 
     def control(self, frame):
         if frame != {'type': 'stop'}:
@@ -387,10 +389,14 @@ def _execute(authority, candidate, handle, campaign_deadline):
     try:
         with connect_closing(candidate.board) as board, write_txn(board):
             _guard(board, handle)
-            child = subprocess.Popen(candidate.argv(), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, bufsize=0, start_new_session=True, close_fds=True,
-                                     cwd=candidate.plan.parent,
-                                     env={'PATH': '/usr/bin:/bin', 'HOME': str(candidate.profile / 'host-home')})
+            handle.serial, guest_serial = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                child = subprocess.Popen(candidate.argv(guest_serial.fileno()), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE, bufsize=0, start_new_session=True, close_fds=True,
+                                         pass_fds=(guest_serial.fileno(),), cwd=candidate.plan.parent,
+                                         env={'PATH': '/usr/bin:/bin', 'HOME': str(candidate.profile / 'host-home')})
+            finally:
+                guest_serial.close()
             handle.process = child
             handle.identity = child_identity(child, candidate.helper)
             _persist(board, handle, {**handle.record, 'phase': 'CHILD_BOOKED', 'native_spawned': True,
@@ -402,7 +408,7 @@ def _execute(authority, candidate, handle, campaign_deadline):
             if os.write(child.stdin.fileno(), RELEASE) != len(RELEASE):
                 raise RuntimeStoreError('hvf_partial_release_frame')
         proof = observe_child(child, handle.identity, handle.record['mode'], handle.stop,
-                              candidate.output / f'slot-{handle.record["slot"]}', started, deadline)
+                              candidate.output / f'slot-{handle.record["slot"]}', started, deadline, handle.serial)
         candidate.verify(authority)
         proof['owner_fds_before'] = baseline_fds
         proof['owner_fds_after'] = psutil.Process().num_fds()
@@ -412,6 +418,9 @@ def _execute(authority, candidate, handle, campaign_deadline):
     except BaseException:
         _contain_failed_child(handle)
         raise
+    finally:
+        if handle.serial is not None:
+            handle.serial.close()
 
 
 def _retire(candidate, handle, proof):

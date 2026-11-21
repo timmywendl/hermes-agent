@@ -88,3 +88,32 @@ source delivery and notices, not merely an SPDX inventory.
 The evidence receipt must distinguish SOURCE_VERIFIED, OFFICIAL_DOCUMENTATION,
 DESIGN_INFERENCE, UNKNOWN and NOT_RUN. Passing this package qualifies only the
 exact inert build/host lifecycle. Stage 3 and Worker dispatch remain unqualified.
+
+## First Native campaign: stopped; qualification NOT_PASS
+
+Exact executed source: `39a1443d35460d25fdecfd38cc799cdee284ce53`.
+Frozen helper SHA256:
+`ecfc393fb8e1dc93303befc7bd17a7fe016ba4269dc6aa3be7f1828ed1c95696`.
+Only slot 1 ran. Its real Sandbox controls, `hv_vm_create`, Guest READY, two
+vCPUs, 2 GiB RAM, no network and the read-only 128 MiB disk were observed.
+Normal stop timed out after 30 seconds: upstream `ringbuf-write` appends to the
+output ring rather than delivering Guest serial input. No Guest shutdown event
+or successful `hv_vm_destroy` marker was captured. The campaign immediately
+latched STOP_UNCERTAIN; slots 2–5 were not started. Absence of the child later
+is not retirement evidence. The failure path did not persist the child's exact
+wait status, so that status is UNKNOWN, not an inferred successful shutdown.
+
+The subsequent source correction uses upstream's connected socket chardev over
+an explicitly inherited unnamed AF_UNIX socketpair. This is a local serial
+capability, with no pathname listener, NIC, netdev, TCP/UDP or network entitlement.
+Both endpoints belong to the original Owner/its exact child; the parent closes
+its child endpoint immediately after Popen, drains serial alongside QMP/stderr,
+and includes the serial descriptor in physical completion. A real signed inert
+Sandbox canary verifies duplex inherited-FD I/O without a VM.
+
+This correction is **OFFLINE_TESTED / NATIVE_NOT_RUN**. The executed candidate,
+failed Board/Owner records and grant remain unchanged. The spent grant cannot
+be resumed or reused. No result in this PR qualifies normal or abnormal VM
+retirement, resource nonaccumulation, Stage 3 or Worker dispatch. Main Control
+must adjudicate any future bounded campaign; no authorization is inferred from
+unused later slots.

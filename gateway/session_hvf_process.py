@@ -56,10 +56,11 @@ def group_members(pgid):
 class ChildPipes:
     """One synchronous Owner task drains both pipes; no unjoined reader threads."""
 
-    def __init__(self, process):
+    def __init__(self, process, serial=None):
         self.process = process
         self.selector = selectors.DefaultSelector()
-        self.buffers = {'stdout': bytearray(), 'stderr': bytearray()}
+        self.buffers = {'stdout': bytearray(), 'stderr': bytearray(), 'serial': bytearray()}
+        self.serial = serial
         self.pending = bytearray()
         self.responses = {}
         self.events = []
@@ -69,6 +70,9 @@ class ChildPipes:
         for label, stream in (('stdout', process.stdout), ('stderr', process.stderr)):
             os.set_blocking(stream.fileno(), False)
             self.selector.register(stream, selectors.EVENT_READ, label)
+        if serial is not None:
+            serial.setblocking(False)
+            self.selector.register(serial, selectors.EVENT_READ, 'serial')
         os.set_blocking(process.stdin.fileno(), False)
 
     def pump(self, deadline):
@@ -141,6 +145,8 @@ class ChildPipes:
         for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
             if stream is not None and not stream.closed:
                 stream.close()
+        if self.serial is not None:
+            self.serial.close()
         self.closed = True
 
     def drain_and_wait(self, deadline):
@@ -201,9 +207,9 @@ def guest_shutdown_seen(pipes):
                and event.get('data', {}).get('reason') == 'guest-shutdown' for event in pipes.events)
 
 
-def observe_child(process, identity, mode, stop, output, started, deadline):
+def observe_child(process, identity, mode, stop, output, started, deadline, serial_socket):
     """Returns physical evidence only; original Owner performs retirement/accounting."""
-    pipes = ChildPipes(process)
+    pipes = ChildPipes(process, serial_socket)
     startup = min(started + 60, deadline)
     serial = ''
     try:
@@ -212,13 +218,10 @@ def observe_child(process, identity, mode, stop, output, started, deadline):
         while '"event":"READY"' not in serial:
             if stop.is_set():
                 raise RuntimeStoreError('hvf_owner_stop_during_startup')
-            serial += pipes.request('ringbuf-read', {'device': 'serial', 'size': 65536}, deadline=startup)
-            if len(serial) > 2 * 1024 * 1024:
-                raise RuntimeStoreError('hvf_guest_console_overflow')
+            pipes.pump(startup)
+            serial = pipes.buffers['serial'].decode('utf-8', errors='replace')
             if '"event":"WINDOW_EXPIRED"' in serial or '"event":"POWEROFF_FAILED"' in serial:
                 raise RuntimeStoreError('hvf_guest_startup_failed')
-            if '"event":"READY"' not in serial:
-                pipes.pump(min(startup, time.monotonic() + 0.25))
         actual = inventory(pipes, startup)
         verify_child(process, identity)
         if group_members(identity['pgid']) != (process.pid,):
@@ -227,13 +230,9 @@ def observe_child(process, identity, mode, stop, output, started, deadline):
             raise RuntimeStoreError('hvf_owner_stop_requested')
         deadline = min(deadline, time.monotonic() + 30)
         if mode == 'normal':
-            try:
-                pipes.request('ringbuf-write', {'device': 'serial', 'data': STOP}, deadline=deadline)
-            except RuntimeStoreError as exc:
-                # A completed Guest poweroff may close QMP before the command's reply.
-                # Only the authoritative expected terminal event makes that EOF normal.
-                if exc.reason != 'hvf_control_eof' or not guest_shutdown_seen(pipes):
-                    raise
+            frame = STOP.encode('ascii')
+            if serial_socket.send(frame) != len(frame):
+                raise RuntimeStoreError('hvf_serial_stop_partial_write')
         else:
             os.kill(process.pid, signal.Signals['SIGKILL'] if mode == 'sigkill' else signal.SIGABRT)
         code = pipes.drain_and_wait(deadline)
@@ -253,5 +252,4 @@ def observe_child(process, identity, mode, stop, output, started, deadline):
         output.mkdir(parents=True, exist_ok=True)
         for label, data in pipes.buffers.items():
             (output / f'{label}.log').write_bytes(data)
-        (output / 'serial.log').write_text(serial, encoding='utf-8')
         pipes.close()

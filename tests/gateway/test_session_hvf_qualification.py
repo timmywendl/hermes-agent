@@ -271,7 +271,7 @@ def test_actual_admission_child_released_only_after_durable_booking(owner, tmp_p
     candidate.files[str(binary)] = 'a' * 64
     candidate.plan = tmp_path / 'plan.json'
     candidate.verify = lambda authority: None
-    candidate.argv = lambda: [str(binary)]
+    candidate.argv = lambda fd: [str(binary)]
     adapter._grant(authority, candidate)
     handle = adapter._reserve(authority, candidate, 1)
     # This gate deliberately has no QMP or Hypervisor. Releasing it must fail
@@ -301,3 +301,79 @@ def test_durable_grant_revoke_blocks_final_spawn(owner, monkeypatch):
     with pytest.raises(RuntimeStoreError, match='hvf_native_grant_changed'):
         adapter._execute(authority, candidate, handle, time.monotonic() + 300)
     assert not spawned
+
+
+@pytest.mark.platforms('macos')
+def test_real_sandbox_allows_only_explicit_inherited_serial_socket(tmp_path):
+    import plistlib
+    import socket
+    app = tmp_path / 'SerialCanary.app'
+    macos = app / 'Contents/MacOS'
+    macos.mkdir(parents=True)
+    source, binary = tmp_path / 'serial-canary.c', macos / 'serial-canary'
+    source.write_text('''#include <stdlib.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <poll.h>
+#include <string.h>
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    int fd = atoi(argv[1]);
+    struct sockaddr_storage peer; socklen_t size = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &size) || peer.ss_family != AF_UNIX) return 3;
+    struct pollfd p = {fd, POLLIN, 0};
+    if (poll(&p, 1, 5000) != 1) return 4;
+    char data[32]; ssize_t count = read(fd, data, sizeof(data));
+    if (count != 19 || memcmp(data, "HERMES_HVF_STOP_V1\\n", 19)) return 5;
+    return write(fd, data, count) == count ? 0 : 6;
+}
+''', encoding='utf-8')
+    subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', str(source), '-o', str(binary)],
+                   check=True, capture_output=True, timeout=30)
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier':'org.hermes.pr15.serial-test',
+        'CFBundleExecutable':'serial-canary', 'CFBundlePackageType':'APPL', 'CFBundleVersion':'1'}))
+    entitlement = Path(adapter.__file__).resolve().parents[1] / 'native/qemu_hvf/helper.entitlements'
+    subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', str(entitlement), str(app)],
+                   check=True, capture_output=True, timeout=30)
+    parent, guest = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    child = None
+    try:
+        child = subprocess.Popen([str(binary), str(guest.fileno())], pass_fds=(guest.fileno(),),
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        guest.close()
+        parent.settimeout(5)
+        parent.sendall(physical.STOP.encode())
+        assert parent.recv(32) == physical.STOP.encode()
+        assert child.wait(timeout=5) == 0
+        assert parent.recv(1) == b''
+    finally:
+        parent.close()
+        guest.close()
+        if child is not None:
+            if child.poll() is None:
+                child.kill()
+            child.wait(timeout=5)
+            child.stdout.close()
+            child.stderr.close()
+
+
+@pytest.mark.platforms('macos')
+def test_open_serial_endpoint_blocks_retirement_after_child_exit():
+    import socket
+    parent, guest = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True, bufsize=0)
+    pipes = physical.ChildPipes(child, parent)
+    try:
+        with pytest.raises(RuntimeStoreError, match='hvf_control_timeout'):
+            pipes.drain_and_wait(time.monotonic() + 2)
+        assert child.wait(timeout=5) == 0
+        assert parent.fileno() >= 0
+    finally:
+        pipes.close()
+        guest.close()
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=5)
+    assert parent.fileno() == -1
+    assert all(stream.closed for stream in (child.stdin, child.stdout, child.stderr))

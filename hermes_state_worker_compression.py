@@ -23,7 +23,7 @@ def _number(value):
     return value
 
 
-def worker_compression_lock(db, conn, sid, payload, *, action):
+def worker_compression_lock(db, conn, sid, payload, *, action, holder_is_dead=None):
     if action == 'holder':
         _fields(payload, ())
         row = conn.execute('SELECT holder FROM compression_locks WHERE session_id=? AND expires_at>?',
@@ -38,7 +38,7 @@ def worker_compression_lock(db, conn, sid, payload, *, action):
     if action == 'acquire':
         from hermes_state import _compression_lock_holder_process_is_dead
         value = _claim_lease_row(conn, 'compression_locks', 'session_id', sid, holder, now, now + ttl,
-                                lambda h, e: e < now or _compression_lock_holder_process_is_dead(h))[0]
+                                lambda h, e: e < now or (holder_is_dead or _compression_lock_holder_process_is_dead)(h))[0]
     elif action == 'renew':
         value = conn.execute('UPDATE compression_locks SET expires_at=? WHERE session_id=? AND holder=?',
                              (now + ttl, sid, holder)).rowcount > 0

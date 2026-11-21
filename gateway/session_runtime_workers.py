@@ -21,7 +21,8 @@ def uncounted_runtime_work(runner):
     hvf = sum(len({*getattr(authority, '_hvf_retained', ()),
                    *(key for key, handle in getattr(authority, '_hvf_workers', {}).items()
                      if not handle.closed.is_set())}) for authority in authorities)
-    return (managed + hvf + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+    q2 = sum(len(getattr(authority, '_q2_guest_channels', {})) for authority in authorities)
+    return (managed + hvf + q2 + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
             + sum(len(mutation_tasks(authority)) for authority in authorities))
 
@@ -131,6 +132,9 @@ def physical_workers(authority):
 
 
 def stop_authority_work(authority):
+    if getattr(authority, '_q2_guest_channels', {}):
+        from gateway.session_guest_serial import stop_guest_channels
+        stop_guest_channels(authority)
     from gateway.run_runtime import stop_authority_turns
     from agent.interrupt_compat import request_hard_interrupt
     stop_authority_turns(authority, in_process=True)
@@ -147,7 +151,8 @@ async def join_authority_work(authority, timeout):
         stop_authority_work(authority)
         hvf_pending = (bool(getattr(authority, '_hvf_retained', ()))
                        or any(not h.closed.is_set() for h in getattr(authority, '_hvf_workers', {}).values()))
-        if (not hvf_pending and not list(physical_workers(authority))
+        if (not hvf_pending and not getattr(authority, '_q2_guest_channels', {})
+                and not list(physical_workers(authority))
                 and not list(executing_sessions(authority)) and not mutation_tasks(authority)):
             return
         if asyncio.get_running_loop().time() >= deadline:

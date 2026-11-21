@@ -186,6 +186,20 @@ class SessionAuthority:
         lookup = getattr(self.runner, '_resident_agent_for', None) or self.runner._cached_agent_for
         return lookup(self.sessions[ref.session_id].route)
 
+    async def qualify_hvf(self, candidate):
+        """Explicit inert-only qualification through this registered original Owner."""
+        from gateway.session_hvf_adapter import qualify_hvf, signal_hvf_stop
+        from gateway.session_runtime_workers import track_mutation
+        import threading
+        self.__dict__.setdefault('_hvf_campaign_stop', threading.Event())
+        task = track_mutation(self, qualify_hvf(self, candidate))
+        self._hvf_campaign_task = task
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            signal_hvf_stop(self)
+            raise
+
     def _pending_rows(self, ref):
         """Pending admissions as the event stream presents them: a settlement committed but not yet
         published (``LiveSession.settling``) still reads as its started claim. Callers that pair the
@@ -1083,6 +1097,8 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     await asyncio.to_thread(backfill_legacy_session_owners, db)
     authority = SessionAuthority(runner, profile_id=profile_id, instance_id=instance_id, db=db, epoch=epoch)
+    from gateway.session_hvf_adapter import recover_hvf_reservations
+    recover_hvf_reservations(authority)
     if register:
         runner.session_authority = authority
     from gateway.session_cron import bind_owner

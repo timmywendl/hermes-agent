@@ -15,7 +15,7 @@ from hermes_state_runtime import RuntimeStoreError
 
 
 class OwnerSerialSession:
-    def __init__(self, endpoint, fd, work, *, inference=None, activity=None):
+    def __init__(self, endpoint, fd, work, *, inference=None, activity=None, heartbeat_interval=5, heartbeat_lease=90):
         if not isinstance(endpoint, GuestOwnerEndpoint) or work['assignment'] != endpoint.scope:
             raise RuntimeStoreError('guest_scope_mismatch')
         from gateway.session_hvf_adapter import _require_owner
@@ -27,6 +27,9 @@ class OwnerSerialSession:
         self.inference = inference
         self.activity = activity
         self.stop = threading.Event()
+        self.stop_sent = threading.Event()
+        self.unknown_persisted = threading.Event()
+        self.stop_lock = threading.Lock()
         self.io_lock = threading.Lock()
         self.inference_count = 0
         self.wire = None
@@ -45,6 +48,7 @@ class OwnerSerialSession:
             workers[key] = self  # retained on EOF, cancel, result or Owner loss
         try:
             endpoint.authority.db._execute_write(attach)
+            self.wire.start_heartbeat(interval=heartbeat_interval, lease=heartbeat_lease, on_failure=self.stop.set)
         except Exception as failure:
             self.stop.set()
             if self.wire is not None:
@@ -58,7 +62,7 @@ class OwnerSerialSession:
 
     def serve_one(self):
         with self.io_lock:
-            if self.wire.closed.is_set():
+            if self.wire.closed.is_set() and self.wire.failure is None:
                 raise SerialError('guest_transport_closed')
             self._serve_one()
 
@@ -78,19 +82,31 @@ class OwnerSerialSession:
             except RuntimeStoreError as exc:
                 payload = {'error': exc.reason}
             self.wire.send(frame['channel'], 'reply', payload, reply_to=frame['seq'])
-        except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError):
-            self.cancel(send=False)
-            import os
-            import socket
-            with socket.socket(fileno=os.dup(self.wire.fd)) as connection:
-                try:
-                    connection.shutdown(socket.SHUT_RDWR)
-                except OSError as exc:
-                    import errno
-                    if exc.errno != errno.ENOTCONN:
-                        raise
-            self.wire.close()
+        except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError) as failure:
+            try:
+                self.cancel(send=False)
+            except (sqlite3.Error, OSError, RuntimeStoreError) as storage_failure:
+                failure.add_note('UNKNOWN persistence failed: ' + str(storage_failure))
+            finally:
+                self._close_io()
             raise
+
+    def _close_io(self):
+        """Always close the descriptor even if shutdown or pump joining fails."""
+        import os
+        import socket
+        import errno
+        try:
+            if self.wire.fd >= 0:
+                with socket.socket(fileno=os.dup(self.wire.fd)) as connection:
+                    try:
+                        connection.shutdown(socket.SHUT_RDWR)
+                    except OSError as exc:
+                        if exc.errno != errno.ENOTCONN:
+                            raise
+        finally:
+            self.wire.close()
+            self.wire.release_fd()
 
     def _dispatch(self, channel, payload):
         if self.stop.is_set():
@@ -143,18 +159,23 @@ class OwnerSerialSession:
             try:
                 self.endpoint.revoke()
             finally:
-                self.wire.release_fd()
+                self._close_io()
         finally:
             self.io_lock.release()
 
 
     def cancel(self, *, send=True):
-        self.stop.set()
-        self.endpoint.revoke()
-        if send:
-            self.wire.send('lifecycle', 'control', {'type': 'stop'})
-        # Physical Stop/wait/retirement stays with the original Owner's approved
-        # HVF acquisition. This source-only phase cannot mint a Native proof.
+        self.stop.set()  # authority closes immediately, before either independent action
+        try:
+            with self.stop_lock:
+                if send and not self.stop_sent.is_set():
+                    self.wire.send('lifecycle', 'control', {'type': 'stop'})
+                    self.stop_sent.set()
+        finally:
+            self.endpoint.revoke()
+            self.unknown_persisted.set()
+        # STOP transmission does not prove retirement; the original Owner retains
+        # its physical obligation even when UNKNOWN cannot yet be persisted.
 
 
 def interrupt_guest(authority, session_id, generation):
@@ -171,6 +192,8 @@ def stop_guest_channels(authority):
     import asyncio
     from gateway.session_runtime_workers import track_mutation
     for channel in getattr(authority, '_q2_guest_channels', {}).values():
-        if not channel.stop.is_set():
+        pending = getattr(channel, 'cancel_task', None)
+        if (not (channel.stop_sent.is_set() and channel.unknown_persisted.is_set())
+                and (pending is None or pending.done())):
             channel.stop.set()  # closes authorization before the off-loop writer waits
             channel.cancel_task = track_mutation(authority, asyncio.to_thread(channel.cancel))

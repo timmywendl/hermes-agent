@@ -24,8 +24,14 @@ request is in flight. Request IDs must match; loss, replay or malformed data
 revokes authority, preserves UNKNOWN and never resumes. The canonical persistence
 sequence/digest receipt is separate from the wire sequence, so committed lost-ACK
 writes remain idempotent in the existing outbox. Default I/O budget is 30 seconds
-per header/body/write, with a 2-second receive-thread join budget. Idle transport
-expiry fails closed; this is a finite candidate, not an unlimited idle session.
+per started header/body/write, with a 2-second receive-thread join budget. A
+scoped heartbeat kind on the lifecycle channel carries bounded ping/ack counters
+in both directions, independently of business dispatch. Default pulse interval is
+5 seconds and the unacknowledged pulse lease is 90 seconds (at most 120); normal
+silent work therefore does not spend a 30-second frame deadline. RPC completion
+has a separate maximum 300-second budget. Heartbeats neither extend that deadline
+nor renew admission, Owner epoch, claim or execution authority. Native APPLY must
+pin these budgets and enforce its overall execution deadline independently.
 
 Dependencies are the repository's existing Python runtime, OpenAI SDK and httpx,
 Git and Linux tty/block/ext4 support. Reuse the accepted pinned QEMU/HVF build
@@ -48,11 +54,17 @@ No credentials, provider config, SSH keys/agent, Host profile, Board or SessionD
 are packaged. Package SBOM/provenance must pin the distro, rootfs, initramfs,
 kernel, Python wheels, source HEAD, QEMU binary and every device SHA256.
 
-`image_contract.GuestImage` verifies distinct exact artifacts and emits the finite
-No-NIC device arguments; it does not spawn. `guest_entry` validates a distinct
+`image_contract.GuestImage` verifies distinct underlying device/inode identities,
+single-link regular files, byte digests and a canonical `manifest_json`. The
+manifest binds role, directory-snapshot HEAD/mount policy, each drive's path,
+digest, device/inode and read-only mode; mismatches are refused before emitting
+No-NIC arguments. It does not spawn. `guest_entry` validates a distinct
 block-backed `/task`, exact Git HEAD, unprivileged UID and reviewer kernel RO
 mount before contacting Owner. Developer and Reviewer have separate object stores
-and disks made from `prepare_workspace`; no linked worktree, shared common-dir,
+and disks built separately from `prepare_workspace` directory snapshots. The
+helper does not create a block image or qualify a mount. Destinations inside the
+Host source/common-dir are refused before creation; Git metadata independence is
+verified after init and checkout. No linked worktree, shared common-dir,
 remote, hooks, credential helper, alternates or Host FETCH_HEAD is copied. Reviewer
 is detached at the supplied exact SHA; its entire device must be QEMU read-only
 and mounted read-only. Developer receives a private writable task device.
@@ -79,7 +91,11 @@ original Owner's accounting. Slot validation, descriptor duplication and slot
 publication share the existing SQLite writer transaction; competing acquisition
 threads cannot replace the slot or reset its budget. An uncertain attachment
 commit retains exclusion and closes its owned descriptor. Existing Stop routes to it; shutdown cannot report
-zero pending work while a channel remains. Revocation/EOF/result are never physical
+zero pending work while a channel remains. STOP is attempted before durable
+UNKNOWN persistence; stop-requested, stop-sent and UNKNOWN-persisted are distinct.
+Shutdown retries unfinished delivery/persistence. Malformed frames/EOF always
+shut down and close owned descriptors in a finally path, including revoke-write
+failure. Revocation/EOF/result are never physical
 retirement. Restart recovery leaves the original worker/admission UNKNOWN and
 retains the assignment bytes; old epochs cannot adopt. No source-only API clears
 this fence or accepts a Guest retirement receipt. Native acquisition/retirement
@@ -102,6 +118,9 @@ logical result-ready closes Host operations while lost-ACK persistence replay
 remains idempotent. Transport cleanup joins its service section and closes the
 duplicated descriptor, retaining UNKNOWN and Owner accounting. Cancellation revokes the assignment independently of
 the inference request; results are rechecked against the current epoch after it.
+D2 acceptance must also bind an independent Host request deadline, cancellation
+and usage receipt: heartbeat acknowledgments prove transport liveness only, never
+model progress, permission renewal, successful execution or physical retirement.
 
 D2 remains **NOT_ACCEPTED**. The Owner endpoint returns `d2_not_accepted` by default;
 the callable injection is an offline fixture seam, not a production Cockpit

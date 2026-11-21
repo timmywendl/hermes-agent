@@ -50,13 +50,13 @@ def guest_owner_fixture(tmp_path, monkeypatch):
 
 
 @contextmanager
-def serial(owner, **kwargs):
+def serial(owner, *, client_options=None, **kwargs):
     _authority, _row, scope, endpoint = owner
     host, guest = socket.socketpair()
     host.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
     guest.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
     server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, **kwargs)
-    client = GuestSerialClient(SerialWire(guest.fileno(), scope))
+    client = GuestSerialClient(SerialWire(guest.fileno(), scope, **(client_options or {})))
     try:
         yield server, client
     finally:
@@ -69,7 +69,7 @@ def serial(owner, **kwargs):
 
 def test_serial_real_sqlite_original_owner_and_large_short_writes(owner, tmp_path):
     authority, _row, scope, _endpoint = owner
-    with serial(owner) as (server, client), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner) as (server, client):
         def serve():
             for _ in range(5):
                 server.serve_one()
@@ -124,7 +124,7 @@ def test_invalid_wire_revokes_original_owner_without_losing_assignment(owner, da
 
 
 def test_serial_cockpit_default_denied_and_no_route_fields(owner):
-    with serial(owner) as (server, client), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner) as (server, client):
         serving = pool.submit(server.serve_one)
         with pytest.raises(WorkerPersistenceError, match='d2_not_accepted'):
             client.call('inference', {'input': 'offline input'})
@@ -136,7 +136,7 @@ def test_serial_cockpit_default_denied_and_no_route_fields(owner):
                                   {'tools': [{'type': 'web_search'}]}])
 def test_serial_inference_cannot_select_routes_or_remote_tools(owner, extra):
     invoked = []
-    with serial(owner, inference=lambda payload: invoked.append(payload)) as (server, client), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner, inference=lambda payload: invoked.append(payload)) as (server, client):
         serving = pool.submit(server.serve_one)
         with pytest.raises((SerialError, EOFError)):
             client.call('inference', {'input': 'offline input', **extra})
@@ -151,7 +151,7 @@ def test_cancellation_reaches_controls_while_inference_waits(owner):
         entered.set()
         assert release.wait(5)
         return {'events': []}
-    with serial(owner, inference=inference) as (server, client), ThreadPoolExecutor(2) as pool:
+    with ThreadPoolExecutor(2) as pool, serial(owner, inference=inference) as (server, client):
         serving = pool.submit(server.serve_one)
         reply = pool.submit(client.call, 'inference', {'input': 'offline input'})
         try:
@@ -177,7 +177,7 @@ def test_real_sdk_responses_uses_serial_and_cannot_connect_network(owner, monkey
             'status': 'completed', 'model': 'owner-fixed', 'output': []}}]}
     def forbidden(*args, **kwargs):
         raise AssertionError('no HTTP socket or real model allowed')
-    with serial(owner, inference=inference) as (server, channel), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner, inference=inference) as (server, channel):
         monkeypatch.setattr(socket.socket, 'connect', forbidden)
         serving = pool.submit(server.serve_one)
         with httpx.Client(transport=SerialHTTPTransport(channel)) as http:
@@ -240,7 +240,7 @@ def test_task_private_git_and_reviewer_exact_readonly_device_contract(tmp_path):
     assert (source / 'code.txt').read_text() == 'original\n'
     assert 'HOST_SECRET_CANARY' not in (developer.root / '.git/config').read_text()
     assert not (developer.root / '.git/objects/info/alternates').exists()
-    assert reviewer.device_contract() == {'mount': '/task', 'head': head, 'role': 'reviewer',
+    assert reviewer.device_contract() == {'kind': 'directory_snapshot', 'mount': '/task', 'head': head, 'role': 'reviewer',
                                           'readonly': True, 'host_share': False}
     with pytest.raises(ValueError, match='exact_head'):
         prepare_workspace(source, tmp_path / 'moving-review', head='HEAD', role='reviewer')
@@ -316,7 +316,7 @@ def test_original_managed_loop_over_serial_uses_canonical_owner(owner, tmp_path,
     monkeypatch.setattr('gateway.session_policy.policy_scope', frozen_scope)
     monkeypatch.setattr('run_agent.AIAgent', OfflineAgent)
     monkeypatch.setattr('agent.title_generator.wait_for_title_upgrades', lambda: None)
-    with serial(owner, activity=events.append) as (server, client), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner, activity=events.append) as (server, client):
         def serve():
             while not events or events[-1]['type'] != 'finished':
                 server.serve_one()
@@ -345,7 +345,7 @@ def test_image_plan_pins_distinct_artifacts_and_readonly_review_device(tmp_path)
         artifact.write_bytes(('offline-' + name).encode())
         files.append(artifact)
     hashes = {str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in files}
-    image = module.GuestImage(*files, hashes, 'reviewer')
+    image = module.GuestImage(*files, hashes, 'reviewer', image_manifest(files, hashes, 'reviewer'))
     argv = image.device_args(7)
     assert argv[argv.index('-nic') + 1] == 'none'
     assert argv[argv.index('-chardev') + 1] == 'socket,id=worker,fd=7'
@@ -396,20 +396,46 @@ def test_inference_request_cannot_fetch_remote_items_or_select_native_tools(payl
         validate_request(payload)
 
 
-def test_transport_close_joins_service_and_preserves_unknown(owner):
+@pytest.mark.parametrize('servicing', [True, False])
+def test_transport_close_joins_service_and_preserves_unknown(owner, servicing):
     authority, _row, _scope, endpoint = owner
     host, guest = socket.socketpair()
     server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work)
     with ThreadPoolExecutor(1) as pool:
-        future = pool.submit(server.serve_one)
+        future = pool.submit(server.serve_one) if servicing else None
         server.close_transport()
-        with pytest.raises((SerialError, EOFError, OSError)):
-            future.result(timeout=5)
+        if future is not None:
+            with pytest.raises((SerialError, EOFError, OSError)):
+                future.result(timeout=5)
     assert server.wire.fd == -1
     assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
     assert authority._q2_guest_channels['owned'] is server
     host.close()
     guest.close()
+
+
+@pytest.mark.parametrize('damage', ['identity', 'sequence', 'duplicate'])
+def test_invalid_wire_rejected_before_peer_eof(damage):
+    # An eventual EOF must not mask acceptance of an invalid application frame.
+    host, guest = socket.socketpair()
+    wire = SerialWire(host.fileno(), {'vm_id': 'offline'})
+    frame = {'version': 2, 'scope': {'vm_id': 'offline'}, 'seq': 1,
+             'channel': 'context', 'kind': 'request', 'reply_to': 0, 'payload': {}}
+    if damage == 'identity':
+        frame['scope']['vm_id'] = 'foreign'
+    elif damage == 'sequence':
+        frame['seq'] = 2
+    raw = json.dumps(frame, separators=(',', ':')).encode()
+    if damage == 'duplicate':
+        raw = raw.replace(b'"seq":1', b'"seq":2,"seq":1')
+    try:
+        guest.sendall(struct.pack('!I', len(raw)) + raw)
+        with pytest.raises(SerialError):
+            wire.receive()
+    finally:
+        wire.release_fd()
+        host.close()
+        guest.close()
 
 
 def test_logical_finish_and_request_budget_close_host_inference(owner, tmp_path):
@@ -527,7 +553,7 @@ def test_compression_auxiliary_reuses_serial_owner_and_closes_scoped_clients(own
         ]}
     def forbidden(*args, **kwargs):
         raise AssertionError('auxiliary must use serial; no model socket, provider discovery or global cache')
-    with serial(owner, inference=inference) as (server, channel), ThreadPoolExecutor(1) as pool:
+    with ThreadPoolExecutor(1) as pool, serial(owner, inference=inference) as (server, channel):
         monkeypatch.setattr(socket.socket, 'connect', forbidden)
         monkeypatch.setattr(aux, '_client_cache_key', forbidden)
         with bind_serial_inference(channel, 'owner-fixed'):
@@ -660,3 +686,233 @@ def test_attachment_commit_ack_loss_keeps_unknown_and_closes_owned_fd(owner, mon
     finally:
         host.close()
         guest.close()
+
+
+def image_manifest(files, hashes, role):
+    devices = {}
+    for name, path in zip(('root', 'task', 'assignment'), files[2:]):
+        info = path.stat()
+        devices[name] = {'path': str(path), 'sha256': hashes[str(path)], 'st_dev': info.st_dev, 'st_ino': info.st_ino,
+                         'readonly': name != 'task' or role == 'reviewer'}
+    return json.dumps({'role': role, 'workspace': {'kind': 'directory_snapshot', 'mount': '/task', 'head': 'a' * 40,
+        'role': role, 'readonly': role == 'reviewer', 'host_share': False}, 'devices': devices},
+        sort_keys=True, separators=(',', ':'))
+
+
+def test_bidirectional_heartbeat_keeps_silent_local_work_alive_over_30_seconds(owner):
+    import subprocess
+    import sys
+    from agent.managed_worker import WorkerControls
+    with ThreadPoolExecutor(1) as pool, serial(owner) as (server, client):
+        controls = WorkerControls(client, 'offline:silent', client.controls)
+        serving = pool.submit(server.serve_one)  # no business traffic during the local work
+        try:
+            child = subprocess.run([sys.executable, '-c', 'import threading; threading.Event().wait(32)'],
+                                   capture_output=True, timeout=45, check=True)
+            assert child.returncode == 0
+            assert not server.stop.is_set() and not controls.stopped.is_set()
+            assert server.wire.heartbeat_acks >= 2 and client.wire.heartbeat_acks >= 2
+            assert client.call('context', {'operation': 'assignment'}) == server.work
+            serving.result(timeout=5)
+            server.wire.send('lifecycle', 'control', {'type': 'finish'})
+            controls.reader.join(timeout=5)
+            assert controls.finish.is_set() and not controls.reader.is_alive()
+        finally:
+            client.controls.close_reader()
+            controls.reader.join(timeout=5)
+
+
+def test_missing_heartbeat_ack_revokes_actual_owner(owner):
+    authority, _row, _scope, endpoint = owner
+    host, guest = socket.socketpair()  # peer deliberately stays open without acknowledging
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                heartbeat_interval=.05, heartbeat_lease=.3)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            pending = pool.submit(server.serve_one)
+            try:
+                with pytest.raises(TimeoutError, match='heartbeat_expired'):
+                    pending.result(timeout=5)
+            finally:
+                server.wire.close()
+        assert server.wire.fd == -1 and server.stop.is_set()
+        assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    finally:
+        server.wire.close()
+        server.wire.release_fd()
+        host.close()
+        guest.close()
+
+
+def test_heartbeat_does_not_extend_rpc_deadline(owner):
+    entered, release = threading.Event(), threading.Event()
+    def inference(_payload):
+        entered.set()
+        assert release.wait(5)
+        return {'events': []}
+    with ThreadPoolExecutor(1) as pool, serial(owner, client_options={'request_timeout': .3}, inference=inference) as (server, client):
+        serving = pool.submit(server.serve_one)
+        try:
+            with pytest.raises(SerialError, match='reply_timeout'):
+                client.call('inference', {'input': 'offline bounded request'})
+            assert entered.is_set() and client.controls.failure is not None
+        finally:
+            release.set()
+        serving.result(timeout=5)  # a late result is not delivered to the timed-out Guest caller
+        assert owner[0].db._read_one('SELECT status FROM worker_executions')[0] != 'terminal'
+
+
+def test_stop_is_delivered_before_unknown_storage_completes(owner, monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    with ThreadPoolExecutor(2) as pool, serial(owner) as (server, client):
+        original = server.endpoint.revoke
+        def unavailable():
+            entered.set()
+            assert release.wait(5)
+            raise OSError('offline UNKNOWN storage failure')
+        monkeypatch.setattr(server.endpoint, 'revoke', unavailable)
+        pending = pool.submit(server.cancel)
+        try:
+            assert entered.wait(5)
+            receiving = pool.submit(client.controls.readline)
+            assert json.loads(receiving.result(timeout=5)) == {'type': 'stop'}
+            assert server.stop_sent.is_set() and not server.unknown_persisted.is_set()
+        finally:
+            release.set()
+            client.controls.close_reader()
+        with pytest.raises(OSError, match='UNKNOWN storage'):
+            pending.result(timeout=5)
+        monkeypatch.setattr(server.endpoint, 'revoke', original)
+        server.cancel()  # retries persistence without sending a duplicate STOP
+        assert server.unknown_persisted.is_set()
+        assert owner[0].db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retries_unsent_stop_after_first_send_failure(owner, monkeypatch):
+    from gateway.session_guest_serial import stop_guest_channels
+    with serial(owner) as (server, client):
+        original = server.wire.send
+        fail = True
+        def send(channel, kind, payload, **kwargs):
+            nonlocal fail
+            if payload == {'type': 'stop'} and fail:
+                fail = False
+                raise OSError('offline STOP send failure')
+            return original(channel, kind, payload, **kwargs)
+        monkeypatch.setattr(server.wire, 'send', send)
+        stop_guest_channels(owner[0])
+        with pytest.raises(OSError, match='STOP send'):
+            await server.cancel_task
+        assert server.stop.is_set() and not server.stop_sent.is_set()
+        stop_guest_channels(owner[0])
+        await server.cancel_task
+        assert server.stop_sent.is_set() and server.unknown_persisted.is_set()
+        assert json.loads(client.controls.readline()) == {'type': 'stop'}
+
+
+@pytest.mark.parametrize('failure', ['malformed', 'eof'])
+def test_fault_cleanup_closes_fd_despite_revoke_write_failure(owner, monkeypatch, failure):
+    authority, _row, scope, endpoint = owner
+    before = authority.db.get_meta('guest.assignment.v1:' + scope['execution_id'])
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work)
+    def unavailable(_write, *args, **kwargs):
+        raise OSError('offline revoke database failure')
+    monkeypatch.setattr(authority.db, '_execute_write', unavailable)
+    try:
+        if failure == 'malformed':
+            guest.sendall(struct.pack('!I', 2) + b'{}')
+        else:
+            guest.close()
+        with pytest.raises((SerialError, EOFError)) as error:
+            server.serve_one()
+        assert any('UNKNOWN persistence failed' in note for note in error.value.__notes__)
+        assert server.wire.fd == -1 and not server.wire.pump.is_alive()
+        assert authority._q2_guest_channels['owned'] is server
+        assert authority.db.get_meta('guest.assignment.v1:' + scope['execution_id']) == before
+    finally:
+        server.wire.close()
+        server.wire.release_fd()
+        host.close()
+        guest.close()
+
+
+@pytest.fixture
+def image_candidate(tmp_path):
+    import hashlib
+    import importlib.util
+    from pathlib import Path
+    path = Path(__file__).resolve().parents[2] / 'native/qemu_guest/image_contract.py'
+    spec = importlib.util.spec_from_file_location('q2_remediation_image', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    files = [tmp_path / name for name in ('kernel', 'initramfs', 'root', 'task', 'assignment')]
+    for path in files:
+        path.write_bytes(('inert-' + path.name).encode())
+    hashes = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}
+    return module, files, hashes
+
+
+def test_developer_image_rejects_underlying_hardlink_alias(image_candidate):
+    import hashlib
+    import os
+    module, files, hashes = image_candidate
+    files[3].unlink()
+    os.link(files[2], files[3])
+    hashes[str(files[3])] = hashlib.sha256(files[3].read_bytes()).hexdigest()
+    image = module.GuestImage(*files, hashes, 'developer', image_manifest(files, hashes, 'developer'))
+    with pytest.raises(ValueError, match='inode_alias'):
+        image.device_args(7)
+
+
+@pytest.mark.parametrize(('keys', 'value'), [
+    (('role',), 'developer'), (('workspace', 'head'), 'moving-branch'),
+    (('devices', 'task', 'readonly'), False), (('devices', 'root', 'readonly'), False),
+    (('devices', 'task', 'st_ino'), -1),
+])
+def test_image_manifest_binds_role_workspace_and_device_modes(image_candidate, keys, value):
+    module, files, hashes = image_candidate
+    body = json.loads(image_manifest(files, hashes, 'reviewer'))
+    target = body
+    for key in keys[:-1]:
+        target = target[key]
+    target[keys[-1]] = value
+    encoded = json.dumps(body, sort_keys=True, separators=(',', ':'))
+    with pytest.raises(ValueError, match='manifest_'):
+        module.GuestImage(*files, hashes, 'reviewer', encoded).device_args(7)
+
+
+@pytest.mark.parametrize('destination', ['same', 'child', 'symlink-child'])
+def test_workspace_refuses_nested_host_source_without_writes(tmp_path, destination):
+    import subprocess
+    from gateway.session_guest_workspace import prepare_workspace
+    source = tmp_path / 'host-project'
+    source.mkdir()
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(source), *args], text=True).strip()
+    git('init', '-q')
+    git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'base', '--allow-empty')
+    head = git('rev-parse', 'HEAD')
+    before = sorted(str(path.relative_to(source)) for path in source.rglob('*'))
+    target = source if destination == 'same' else source / 'exports/guest'
+    if destination == 'symlink-child':
+        link = tmp_path / 'alias'
+        link.symlink_to(source, target_is_directory=True)
+        target = link / 'exports/guest'
+    with pytest.raises(ValueError, match='nested_source'):
+        prepare_workspace(source, target, head=head, role='developer')
+    assert sorted(str(path.relative_to(source)) for path in source.rglob('*')) == before
+    assert git('status', '--porcelain') == ''
+
+
+def test_workspace_detects_real_linked_git_common_dir(tmp_path):
+    import subprocess
+    from gateway.session_guest_workspace import verify_common_dir
+    source, linked = tmp_path / 'host-project', tmp_path / 'linked'
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    subprocess.run(['git', '-C', str(source), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                    'commit', '-qm', 'base', '--allow-empty'], check=True)
+    subprocess.run(['git', '-C', str(source), 'worktree', 'add', '-q', '--detach', str(linked)], check=True)
+    with pytest.raises(ValueError, match='shared_common_dir'):
+        verify_common_dir(linked, source / '.git')

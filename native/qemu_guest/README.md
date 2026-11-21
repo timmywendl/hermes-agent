@@ -102,7 +102,11 @@ this fence or accepts a Guest retirement receipt. Native acquisition/retirement
 must use the original Owner's process-owned HVF proof path after Q2 APPLY; this
 candidate intentionally exposes no physical launch grant.
 
-## Minimal D2 decision requested
+## Historical PR16 D2 proposal
+
+The following section records the PR16 source-ready proposal and its policy
+status at that submission. The accepted-policy section below supersedes those
+policy-status statements; the default unconfigured endpoint still fails closed.
 
 Approve **one fixed, bounded Responses operation** through the existing original
 Owner and Cockpit interface. Owner pins route, account, model, credentials,
@@ -135,3 +139,63 @@ change to the accepted Owner architecture.
 See [BUILD.md](BUILD.md) for the separate pinned ARM64 Q2 artifact builder,
 read-only raw-image verification and remaining Native qualification requirements.
 Artifact construction does not qualify boot, Worker execution or D2 inference.
+
+## Accepted D2 policy: offline Host Responses integration
+
+Human accepted `D2_HOST_ONLY_COCKPIT_RESPONSES` on2026-11-21 in
+AI Colleague Issue139 comment7063951967. This accepts policy and offline testing,
+not live credentials/models, Native Guest/Worker, Runtime Apply or Board dispatch.
+
+`gateway.session_guest_inference.OwnerResponses` attaches only through original
+`OwnerSerialSession` Host injection. There is no default HTTP transport, credential
+discovery, config switch or public Guest method that enables it. A protected Host
+caller supplies the original endpoint, an immutable policy, authentication headers
+and an explicit HTTPX transport. Tests use only deterministic Fake Cockpit.
+
+The fixed operation is POST to a numeric loopback `/v1/responses` URL. Redirects,
+proxy environment, automatic retries/fallback and Guest route/model/header/cache
+selection are excluded. Model, streaming/store mode and output budget are Host
+pinned. The original Guest SDK/serial protocol remains unchanged. Host policy
+`binding_id` is a declaration to bind to future protected Cockpit qualification;
+it is not independent evidence of live account, route, cache or fallback policy.
+
+Bounds:1MiB actual request including Host fields;2MiB raw SSE response;64KiB
+individual SSE data event;1024 events;8192 output tokens;32 requests per original
+channel and durable execution;120-second total deadline and30-second HTTP idle
+timeout at most. A single original Owner helper thread handles each operation.
+Heartbeat never extends that deadline or renews authority. There is no second
+Owner, inference Router, service, Store or Worker runtime.
+
+Request reservations and outcomes use original SessionDB `state_meta`, bound to
+the existing Task/Run/VM/Session/Owner scope, policy digest and request digest.
+Neither prompts nor HTTP authorization headers enter these records. Token usage
+is recorded only when reported; actual billing remains UNKNOWN, never zero.
+`RECEIVED` means the Host received and closed a valid response, not that the Guest
+received it or that execution retired. A durable issued-request cursor is created
+in the serial attachment writer transaction. Before another operation, exact
+keys 1 through issued, immutable Owner/policy
+bindings and Owner-held request digests must match; missing, malformed, reset or
+unfinished history refuses I/O and revokes the channel. The cursor is never
+recreated after attachment, and Owner restart cannot resume this execution.
+Original Owner epoch checks run before and after I/O.
+
+Cancellation/deadline closes authorization and suppresses late results. A blocked
+HTTP operation remains strongly owned by the original serial slot until its
+Future completes and its thread/client/stream can be joined/closed. Cancellation
+is checked during response reads; an uninterruptible header/read cannot be proven
+physically stopped by a timer. Close refuses unresolved work, still attempts all
+known resource cleanup after a close failure, and retains failed resources.
+STOP_UNCERTAIN remains even when a late response provides known usage or cleanup
+later succeeds. None of this produces a Guest/VM retirement receipt.
+
+Offline tests cover the real SDK→serial→original SQLite Owner→Fake Cockpit path,
+fixed policy, request/response bounds, single-attempt errors/redirects, finite
+usage receipts, cancellation/late completion, Owner restart, corrupted records,
+failed HTTP close and SQLite-failure/serial-FD cleanup. They do not execute a
+Worker, contact Cockpit or qualify actual network timeout/abort behavior.
+
+PR17's separately frozen offline image/artifact evidence is unchanged. A future
+Native grant must bind the accepted Host integration HEAD and exact Guest source
+and artifact identities separately. Live Cockpit account/route/header/retry/cache
+policy, credentials, real-model streaming/cancellation/billing and full original
+Owner physical retirement require their own explicit operational qualification.

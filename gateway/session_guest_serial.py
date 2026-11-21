@@ -22,8 +22,8 @@ class OwnerSerialSession:
         _require_owner(endpoint.authority)
         from agent.runtime_session_guest import validate_guest_work
         self.endpoint, self.work = endpoint, validate_guest_work(work)
-        # A future protected D2 binding supplies this fixed Responses callable;
-        # no config flag or Guest request can enable real inference today.
+        # Protected Host injection only; D2 policy acceptance does not enable
+        # a live connector, credential discovery or a Guest-selected route.
         self.inference = inference
         self.activity = activity
         self.stop = threading.Event()
@@ -33,6 +33,7 @@ class OwnerSerialSession:
         self.io_lock = threading.Lock()
         self.inference_count = 0
         self.wire = None
+        from gateway.session_guest_inference import OwnerResponses
         encoded = json.dumps(self.work, sort_keys=True, separators=(',', ':'), allow_nan=False)
         def attach(conn):
             endpoint._verify(conn)
@@ -44,6 +45,8 @@ class OwnerSerialSession:
                                  ('guest.work.v1:' + endpoint.scope['execution_id'],)).fetchone()
             if saved is None or saved[0] != encoded or getattr(endpoint, '_prepared_work', None) != encoded:
                 raise RuntimeStoreError('guest_work_not_prepared')
+            if isinstance(inference, OwnerResponses):
+                inference.bind(endpoint, self.stop, conn)
             self.wire = SerialWire(fd, endpoint.scope)
             workers[key] = self  # retained on EOF, cancel, result or Owner loss
         try:
@@ -162,6 +165,9 @@ class OwnerSerialSession:
                 self._close_io()
         finally:
             self.io_lock.release()
+            from gateway.session_guest_inference import OwnerResponses
+            if isinstance(self.inference, OwnerResponses):
+                self.inference.close()
 
 
     def cancel(self, *, send=True):

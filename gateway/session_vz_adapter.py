@@ -13,9 +13,6 @@ import threading
 import time
 import uuid
 
-from gateway.session_worker_guest import (
-    GuestBinding, GuestOwnerEndpoint, reserve_guest_admission,
-)
 from hermes_state_runtime import RuntimeStoreError, _admission, _epoch, _session
 
 PREFIX = 'q1.native.v1:'
@@ -53,16 +50,39 @@ def _metadata(raw):
 
 
 @dataclass(frozen=True)
+class Q1Binding:
+    """Non-secret identity of one inert diagnostic VM, never a Worker scope."""
+
+    task_id: str
+    run_id: int
+    vm_id: str
+    connection_generation: int
+    image_digest: str
+    policy_digest: str
+
+    def __post_init__(self):
+        if any(not isinstance(value, str) or not value or len(value) > 256
+               for value in (self.task_id, self.vm_id)):
+            raise RuntimeStoreError('invalid_q1_binding')
+        if any(type(value) is not int or value < 1 for value in (self.run_id, self.connection_generation)):
+            raise RuntimeStoreError('invalid_q1_binding')
+        if any(not isinstance(value, str) or len(value) != 64
+               or any(char not in '0123456789abcdef' for char in value)
+               for value in (self.image_digest, self.policy_digest)):
+            raise RuntimeStoreError('invalid_q1_binding')
+
+
+@dataclass(frozen=True)
 class Q1Diagnostic:
     """An inert disposable assignment, never a product dispatch selector."""
 
     board_path: Path
-    binding: GuestBinding
+    binding: Q1Binding
     manifest_digest: str
     witness_plan_digest: str
 
     def __post_init__(self):
-        if not isinstance(self.binding, GuestBinding) or not isinstance(self.board_path, Path):
+        if not isinstance(self.binding, Q1Binding) or not isinstance(self.board_path, Path):
             raise RuntimeStoreError('invalid_q1_assignment')
         for digest in (self.manifest_digest, self.witness_plan_digest):
             if (not isinstance(digest, str) or len(digest) != 64
@@ -125,6 +145,7 @@ def _reserve_board(authority, row, diagnostic, attempt):
             'task_id': task.id, 'run_id': run['id'], 'claim_digest':
                 hashlib.sha256(task.claim_lock.encode()).hexdigest(),
             'session_id': row['target_session_id'], 'admission_id': row['admission_id'],
+            'principal_id': row['principal_id'],
             'generation': row['generation'], 'owner_epoch': authority.epoch,
             'owner_instance': authority.instance_id, 'launch_attempt': attempt,
             'binding': asdict(diagnostic.binding), 'board_path': str(board),
@@ -152,10 +173,9 @@ class Q1OwnerHandle:
     is intentionally no PID-based close/kill fallback or public clear method.
     """
 
-    def __init__(self, authority, record, endpoint=None):
+    def __init__(self, authority, record):
         self.authority = authority
         self.record = record
-        self.endpoint = endpoint
         self.closed = threading.Event()
         self.stop = threading.Event()
         self.revocation_task = None
@@ -183,26 +203,45 @@ class Q1OwnerHandle:
             if conn.execute('SELECT value FROM state_meta WHERE key=?', (self.key,)).fetchone()[0] != encoded:
                 raise RuntimeStoreError('q1_reservation_unavailable')
 
-    def _check_admission(self, conn):
-        _require_owner(self.authority)
+    def _check_admission(self, conn, *, revoking=False):
+        if not revoking:
+            _require_owner(self.authority)
         _epoch(conn, self.record['owner_epoch'])
         instance = conn.execute('SELECT instance_id FROM runtime_epoch WHERE singleton=1').fetchone()[0]
         if instance != self.record['owner_instance']:
             raise RuntimeStoreError('stale_epoch')
         admission = _admission(conn, self.record['admission_id'])
-        if (admission['status'] != 'started'
+        session = _session(conn, self.record['session_id'])
+        allowed = ('started', 'unknown') if revoking else ('started',)
+        if (admission['status'] not in allowed
                 or admission['owner_epoch'] != self.record['owner_epoch']
                 or admission['target_session_id'] != self.record['session_id']
                 or admission['generation'] != self.record['generation']
-                or _session(conn, self.record['session_id'])['source'] != 'q1_diagnostic'):
+                or admission['principal_id'] != self.record['principal_id']
+                or session['runtime_generation'] != self.record['generation']
+                or session['source'] != 'q1_diagnostic'):
             raise RuntimeStoreError('q1_disposable_admission_required')
+
+    def verify_acquisition(self, conn):
+        self._check_admission(conn)
+        row = conn.execute('SELECT value FROM state_meta WHERE key=?', (self.key,)).fetchone()
+        if row is None or row[0] != _canonical(self.record):
+            raise RuntimeStoreError('q1_reservation_unavailable')
 
     def revoke(self):
         self.stop.set()
-        # Endpoint revocation only downgrades the original admission. If an
-        # epoch was replaced, its existing recovery fence must remain intact.
-        if self.endpoint is not None:
-            self.endpoint.revoke()
+        # Downgrade the original Owner's admission, without a Worker execution,
+        # Guest persistence endpoint or result protocol. Custody stays in its
+        # immutable recovery index and Board record, even after logical Discard.
+        def write(conn):
+            self._check_admission(conn, revoking=True)
+            changed = conn.execute(
+                "UPDATE session_admissions SET status='unknown' WHERE admission_id=? AND status='started'",
+                (self.record['admission_id'],)).rowcount
+            if changed:
+                conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
+                             (self.record['session_id'],))
+        self.authority.db._execute_write(write)
 
     def control(self, frame):
         if frame != {'type': 'stop'}:
@@ -238,11 +277,6 @@ def reserve_q1_diagnostic(authority, ref, row, diagnostic):
         if workers or getattr(authority, '_q1_native_retained', ()):
             raise RuntimeStoreError('q1_unretired_execution')
         handle = _reserve_board(authority, row, diagnostic, str(uuid.uuid4()))
-        scope = reserve_guest_admission(authority, admission_id=row['admission_id'],
-                                       principal_id=row['principal_id'], binding=diagnostic.binding)
-        if (scope['session_id'] != ref.session_id or scope['generation'] != row['generation']):
-            raise RuntimeStoreError('invalid_q1_assignment')
-        handle.endpoint = GuestOwnerEndpoint(authority, scope, principal_id=row['principal_id'])
         if handle.stop.is_set():
             handle.revoke()
         return handle

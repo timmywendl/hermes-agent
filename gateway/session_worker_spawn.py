@@ -11,7 +11,7 @@ def check_q1_acquisition(handle, diagnostic):
     reachable until an effective protected authority verifier exists.
     """
     from gateway.session_vz_adapter import (
-        NAMESPACE, _board_claim, _canonical, _check_history, _metadata, require_native_readiness,
+        NAMESPACE, _board_claim, _check_history, _metadata, require_native_readiness,
     )
     from hermes_cli.kanban_db_connect import connect_closing, write_txn
     from hermes_state_runtime import RuntimeStoreError
@@ -22,7 +22,7 @@ def check_q1_acquisition(handle, diagnostic):
             or diagnostic.manifest_digest != handle.record['manifest_digest']
             or diagnostic.witness_plan_digest != handle.record['witness_plan_digest']):
         raise RuntimeStoreError('q1_reservation_changed')
-    if handle.stop.is_set() or handle.endpoint is None:
+    if handle.stop.is_set():
         raise RuntimeStoreError('q1_revoked')
     with connect_closing(diagnostic.board_path) as conn, write_txn(conn):
         task, run = _board_claim(conn, diagnostic, handle.record['session_id'])
@@ -31,10 +31,7 @@ def check_q1_acquisition(handle, diagnostic):
             raise RuntimeStoreError('q1_reservation_changed')
         _check_history(conn, task, reservation=handle.record)
         with handle.authority.db._read_ctx() as owner_conn:
-            handle.endpoint._verify(owner_conn)
-            row = owner_conn.execute('SELECT value FROM state_meta WHERE key=?', (handle.key,)).fetchone()
-            if row is None or row[0] != _canonical(handle.record):
-                raise RuntimeStoreError('q1_reservation_unavailable')
+            handle.verify_acquisition(owner_conn)
             if handle.stop.is_set():
                 raise RuntimeStoreError('q1_revoked')
             require_native_readiness()

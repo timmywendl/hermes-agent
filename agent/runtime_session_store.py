@@ -148,14 +148,11 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 # publication moves it to the child); anything else is not this successor's outbox.
                 raise WorkerPersistenceError('outbox_scope_mismatch')
             if is_worker_process():
-                self._bind_process_ledger()
+                from tools.async_delegation_worker import bind_worker_delegation_store
+                bind_worker_delegation_store(self)
         except Exception:
             self._outbox_owner.close()
             raise
-
-    def _bind_process_ledger(self):
-        from tools.async_delegation_worker import bind_worker_delegation_store
-        bind_worker_delegation_store(self)
 
     def _reconcile_adopted(self, adopted):
         """Carry a retained outbox across verified owner replacement.

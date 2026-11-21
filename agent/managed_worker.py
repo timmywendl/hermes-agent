@@ -152,9 +152,8 @@ def _die_with_owner():
 
 
 class WorkerControls:
-    def __init__(self, channel, route, stream=None):
+    def __init__(self, channel, route):
         self.channel, self.route = channel, route
-        self.stream = sys.stdin.buffer if stream is None else stream
         self.agent = None
         self.stopped = threading.Event()
         self.finish = threading.Event()
@@ -177,7 +176,7 @@ class WorkerControls:
         from tools.approval import resolve_gateway_approval
         try:
             while True:
-                frame = read_frame(self.stream)
+                frame = read_frame(sys.stdin.buffer)
                 if frame == {'type': 'stop'}:
                     self.stop()
                     continue
@@ -322,19 +321,6 @@ def execute(frame, channel):
     # (F24); adopt them so process_manage in this turn can poll and kill them.
     from tools.process_registry import process_registry
     process_registry.recover_from_checkpoint()
-    try:
-        run_adopted(frame, channel, store, control_stream=sys.stdin.buffer, ready_identity={'pid': os.getpid()})
-    finally:
-        store.close()
-
-
-def run_adopted(frame, channel, store, *, control_stream, ready_identity):
-    """Run the original AIAgent after transport-specific policy and adoption.
-
-    The local caller binds Host Kanban/process recovery before entering. A Guest
-    caller supplies its own store, independent control stream and non-PID identity.
-    """
-    scope = dict(frame['scope'])
     # Store construction binds the delegation ledger before tool discovery.
     from gateway.session_policy import restore_policy, policy_scope, register_worker_hooks
     policy = restore_policy(frame['policy'])
@@ -347,7 +333,7 @@ def run_adopted(frame, channel, store, *, control_stream, ready_identity):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    controls = WorkerControls(channel, frame['route'], control_stream)
+    controls = WorkerControls(channel, frame['route'])
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
@@ -376,7 +362,7 @@ def run_adopted(frame, channel, store, *, control_stream, ready_identity):
             if controls.stopped.is_set():
                 from agent.interrupt_compat import request_hard_interrupt
                 request_hard_interrupt(agent)
-            channel.send('ready', **ready_identity)
+            channel.send('ready', pid=os.getpid())
             history = store.get_messages_as_conversation(scope['session_id'])
             from gateway.session_kanban import run_worker_turns
             if 'attachments_v1' in frame:
@@ -410,6 +396,7 @@ def run_adopted(frame, channel, store, *, control_stream, ready_identity):
         unregister_gateway_notify(frame['route'])
         if agent is not None:
             retire_agent(agent)
+        store.close()
 
 
 def _agent_runtime_route(frame, policy):

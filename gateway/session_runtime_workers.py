@@ -12,13 +12,21 @@ def executing_sessions(authority):
             yield sid, live, execution['execution_generation']
 
 
+def q1_reservations(authority):
+    """The recovery index and a live handle can name the same reservation."""
+    return (set(getattr(authority, '_q1_native_retained', ()))
+            | {handle.key for handle in getattr(authority, '_q1_native_workers', {}).values()
+               if not handle.closed.is_set()})
+
+
 def uncounted_runtime_work(runner):
     """Count claims absent from the ordinary agent map, including pre-bootstrap managed turns."""
     running = getattr(runner, '_running_agents', {})
     authorities = all_authorities(runner)
     managed = sum(not worker.closed.is_set() for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+    q1 = sum(len(q1_reservations(authority)) for authority in authorities)
+    return (managed + q1 + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
             + sum(len(mutation_tasks(authority)) for authority in authorities))
 
@@ -142,7 +150,8 @@ async def join_authority_work(authority, timeout):
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         stop_authority_work(authority)
-        if not list(physical_workers(authority)) and not list(executing_sessions(authority)) and not mutation_tasks(authority):
+        if (not q1_reservations(authority) and not list(physical_workers(authority))
+                and not list(executing_sessions(authority)) and not mutation_tasks(authority)):
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError('Profile workers did not stop; ownership retained')

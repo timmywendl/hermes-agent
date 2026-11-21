@@ -873,7 +873,7 @@ def execute_attempt(handle, image, fake, loop):
                      device_exit_verified=True, stopped_devices=stopped_devices,
                      owner_fds_before=baseline, owner_fds_after=psutil.Process().num_fds(),
                      fake_requests=fake.calls, fake_late_returned=fake.late_returned)
-        if (proof['owner_fds_after'] > baseline or not handle.guest_serial_closed
+        if (time.monotonic() > stop_deadline or proof['owner_fds_after'] > baseline or not handle.guest_serial_closed
                 or not handle.bootstrap_closed or handle.parent_device_observation.get('closed') is not True
                 or (handle.record['mode'] == 'cancellation' and not fake.late_returned)):
             raise RuntimeStoreError('q2_owner_resources_unretired')

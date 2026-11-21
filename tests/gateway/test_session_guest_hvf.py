@@ -946,3 +946,75 @@ def test_missing_or_replaced_sandbox_socket_fixture_refuses_preflight(sandbox_so
             replacement.bind(str(paths[0]))
     with pytest.raises((RuntimeStoreError, OSError)):
         batch.verify_sandbox_fixtures()
+
+
+def test_device_cleanup_crossing_stop_deadline_keeps_original_owner_unknown(owner, monkeypatch):
+    """Synthetic completed-observer facts exercise the final deadline; no child or VM."""
+    authority, batch, source, head = owner
+    handle, _work = reserve(owner)
+    handle.endpoint({'method': 'worker.adopt', 'scope': handle.scope, 'params': {}})
+    handle.endpoint({'method': 'worker.persist', 'scope': handle.scope,
+        'params': {'sequence': 1, 'operation': 'execution.finish', 'payload': {}}})
+    clock = [time.monotonic()]
+    handle.spawned_at = clock[0]
+    handle.slot_deadline = handle.batch_deadline = clock[0] + 300
+    handle.executor = ThreadPoolExecutor(1)
+    handle.service = handle.executor.submit(lambda: None)
+    handle.service.result(timeout=5)
+    handle.executor.shutdown(wait=True)
+    handle.service_done.set()
+    handle.parent_device_observation = {'closed': True}
+    handle.bootstrap_closed = handle.guest_serial_closed = True
+    ready = threading.Event()
+    ready.set()
+    observations = []
+
+    def forbidden_spawn(*_args, **_kwargs):
+        raise AssertionError('Synthetic deadline regression must never create a child')
+
+    def attach_synthetic_channel(current, _image, inference, _bootstrap):
+        current.channel = SimpleNamespace(ready=ready, result_ready=ready,
+            ready_at=clock[0], result_at=clock[0],
+            finish_transport=lambda **_kwargs: inference.close(),
+            close_transport=lambda **_kwargs: inference.close(),
+            cancel=handle.endpoint.revoke, physical_observation=lambda: {'synthetic': True})
+
+    class CompletedObserver:
+        def __init__(self, *_args, **_kwargs):
+            self.closed = False
+
+        def start(self, _deadline):
+            observations.append('started')
+
+        def finish(self, deadline, serial_observation):
+            assert clock[0] < deadline
+            serial_observation()
+            observations.append('observer_finished_within_deadline')
+            return synthetic_retirement_record()['proof']
+
+        def close(self):
+            self.closed = True
+            observations.append('observer_closed')
+
+    def late_device_completion(_handle, _image):
+        assert observations[-1] == 'observer_closed'
+        clock[0] += 31
+        observations.append('device_cleanup_completed_after_deadline')
+        return {'synthetic': 'completed_after_deadline'}
+
+    from gateway import session_hvf_process
+    monkeypatch.setattr(q2.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(q2.subprocess, 'Popen', forbidden_spawn)
+    monkeypatch.setattr(q2, 'acquire_child', attach_synthetic_channel)
+    monkeypatch.setattr(q2, '_device_exit_facts', late_device_completion)
+    monkeypatch.setattr(session_hvf_process, 'Q2ProcessObserver', CompletedObserver)
+    with pytest.raises(RuntimeStoreError, match='q2_owner_resources_unretired'):
+        q2.execute_attempt(handle, SimpleNamespace(role='developer'), q2.FixtureResponses('developer'), None)
+    assert observations == ['started', 'observer_finished_within_deadline', 'observer_closed',
+                            'device_cleanup_completed_after_deadline']
+    assert handle.process is None and handle.proof is None and not handle.closed.is_set()
+    assert q2.metadata(authority.db.get_meta(handle.key))['state'] == 'STOP_UNCERTAIN'
+    assert q2.metadata(authority.db.get_meta(q2.GRANTS + batch.sha256))['status'] == 'STOP_UNCERTAIN'
+    assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    with pytest.raises(RuntimeStoreError):
+        q2.reserve_attempt(authority, batch, 2, source=source, head=head)

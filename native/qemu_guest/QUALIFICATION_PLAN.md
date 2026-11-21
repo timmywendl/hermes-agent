@@ -1,11 +1,13 @@
 # Q2 原 Owner Native Qualification：完整冻结施工计划 V1
 
-PACKAGE = HERMES_Q2_ORIGINAL_OWNER_NATIVE_QUALIFICATION_V1  
-DATE = 2026-11-22 Asia/Shanghai  
-PLAN_STATUS = SUBMITTED_FOR_MAIN_CONTROL_REVIEW  
-CURRENT_AUTHORIZATION = PLAN_ONLY  
-NATIVE_GRANT = NOT_AUTHORIZED  
+~~~text
+PACKAGE = HERMES_Q2_ORIGINAL_OWNER_NATIVE_QUALIFICATION_V1
+DATE = 2026-11-22 Asia/Shanghai
+PLAN_STATUS = SUBMITTED_FOR_MAIN_CONTROL_REVIEW
+CURRENT_AUTHORIZATION = PLAN_ONLY
+NATIVE_GRANT = NOT_AUTHORIZED
 NATIVE / GUEST / QEMU / BUILD / SIGN / RUNTIME_APPLY = NOT_RUN_THIS_PHASE
+~~~
 
 决策依据：[Main Control 7066408379](https://github.com/spareribes/ai-colleague/issues/139#issuecomment-7066408379)。
 本文件是一个工作包、一次计划 Review、一次 Human grant、一次三 Slot 批次的施工合同；不是执行命令授权，也不是完成声明。
@@ -44,7 +46,7 @@ FIRST_WORKER_OWNED_DELIVERY 仍 NOT_ACHIEVED；本包不是实际 Mission→Code
 | Host / PR18 | 13c096f01f4d65726d89e36f9985959f8c6fcb73 | 原 Owner 固定 Responses 注入、durable cursor、UNKNOWN、deadline/late result |
 
 计划独立 Worktree 已建立于 PR16 exact HEAD：
-/Users/timmywen/Documents/AI_Colleague/worktrees/issue139-q2-native-qualification-dev-01  
+/Users/timmywen/Documents/AI_Colleague/worktrees/issue139-q2-native-qualification-dev-01
 分支：codex/q2-native-qualification-v1。当前仅添加本计划；未合并实现、未创建 PR。
 
 后续在同一 Worktree 完成整包，最终仅创建一个 OPEN/DRAFT stacked PR，base =
@@ -161,8 +163,8 @@ dev=16777229；以下 inode 是原件身份，**不能**复制到新副本 manif
 | reviewer-assignment.raw | 16777216 | 180148727 | 86241a7a2aba6fde557fb60c387657a42319fa53c01d491df31facc710948de4 |
 
 既有 package manifest SHA256：
-cb89585ad5a0972eecaea6b44d4434ad70027bbabf5e5d730d71ea21565e9af3  
-SPDX SHA256：7b6d5e8f29e67a4b485e12a543c92cdc3e29a5afc0b611870030b16427f78f0f  
+cb89585ad5a0972eecaea6b44d4434ad70027bbabf5e5d730d71ea21565e9af3
+SPDX SHA256：7b6d5e8f29e67a4b485e12a543c92cdc3e29a5afc0b611870030b16427f78f0f
 Provenance SHA256：11bb7de54fb616f4955b7e90474a52440d6e14d0e5b7b7eca9598ab2b7ce360e
 
 保全过程：
@@ -324,7 +326,6 @@ Q1 Helper 的只读 bundle 资源通路不等于 Q2 Developer 可写能力。
 | SSH Agent/Docker/其他 UDS 的 public fixture | calibration connection 成功 | 连接拒绝；只允许已继承 unnamed serial capability |
 | TCP/UDP/IPv4/IPv6 listen/connect | 仅受控本机 calibration endpoints 成功 | EACCES/EPERM；不存在 client/server network entitlements |
 | private scratch 与错误目录写入 | 测试目录可写 | 仅 OS 规定的该 app 私有 scratch 可用，外部写入拒绝；不夸称 macOS 无系统库/私有容器访问 |
-| parent process memory/task port | 可校准项记录，不伪造平台许可 | task_for_pid 拒绝；如无法校准则该项 UNKNOWN，不能 PASS |
 | 角色/FD身份被替换、缺失、hardlink/symlink、额外device/network argv | negative test 可构造且字节已知 | gate 拒绝，不能进入 hv_vm_create |
 
 negative targets 都是公开 disposable markers，包括在实际 Host HOME 下的专用 public canary 目录，

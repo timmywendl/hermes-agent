@@ -48,7 +48,7 @@ def channel(owner, handler, **policy_options):
 
 
 def receipt(owner):
-    rows = owner[0].db._read_all("SELECT value FROM state_meta WHERE key LIKE 'guest.inference.v1:%'")
+    rows = owner[0].db._read_all("SELECT value FROM state_meta WHERE key LIKE 'guest.inference.v1:%' AND key NOT LIKE '%:cursor'")
     assert len(rows) == 1
     return json.loads(rows[0][0])
 
@@ -90,7 +90,7 @@ def test_guest_cannot_change_cockpit_policy_or_remote_capabilities(owner, extra)
         with pytest.raises(ValueError):
             server._dispatch('inference', {'input': 'offline', **extra})
         assert calls == []
-        assert owner[0].db._read_all("SELECT key FROM state_meta WHERE key LIKE 'guest.inference.v1:%'") == []
+        assert owner[0].db._read_all("SELECT key FROM state_meta WHERE key LIKE 'guest.inference.v1:%' AND key NOT LIKE '%:cursor'") == []
 
 
 @pytest.mark.parametrize('url', ['http://192.0.2.1/v1/responses', 'http://127.0.0.1/v1/models',
@@ -213,16 +213,17 @@ def test_request_snapshot_does_not_alias_guest_mutable_payload():
     assert body['input'][0]['content'] == 'offline'
 
 
-@pytest.mark.parametrize('damage', ['starting', 'malformed', 'wrong-policy'])
+@pytest.mark.parametrize('damage', ['starting', 'malformed', 'wrong-policy', 'wrong-request-hash'])
 def test_previous_unknown_or_damaged_receipt_blocks_new_request(owner, damage):
     calls = []
     with channel(owner, lambda request: calls.append(request) or response()) as (server, _client, _adapter):
         server._dispatch('inference', {'input': 'offline'})
         raw = receipt(owner)
         changes = {'starting': lambda: raw | {'status': 'STARTING'},
-                   'malformed': list, 'wrong-policy': lambda: raw | {'policy_sha256': 'foreign'}}
+                   'malformed': list, 'wrong-policy': lambda: raw | {'policy_sha256': 'foreign'},
+                   'wrong-request-hash': lambda: raw | {'request_sha256': 'f' * 64}}
         owner[0].db._execute_write(lambda conn: conn.execute(
-            "UPDATE state_meta SET value=? WHERE key LIKE 'guest.inference.v1:%'", (json.dumps(changes[damage]()),)))
+            "UPDATE state_meta SET value=? WHERE key LIKE 'guest.inference.v1:%' AND key NOT LIKE '%:cursor'", (json.dumps(changes[damage](), sort_keys=True),)))
         with pytest.raises(RuntimeStoreError):
             server._dispatch('inference', {'input': 'new call forbidden'})
         assert len(calls) == 1
@@ -333,3 +334,73 @@ def test_actual_request_byte_bound_includes_fixed_host_fields():
     policy = ResponsesPolicy('http://127.0.0.1/v1/responses', 'fixed', 'offline-policy')
     with pytest.raises(RuntimeStoreError, match='request_too_large'):
         request_body({'input': 'x' * (1024 * 1024 - 15)}, policy)
+
+
+@pytest.mark.parametrize('damage', ['missing-last', 'missing-first', 'missing-cursor', 'reset-cursor', 'malformed-cursor', 'duplicate-cursor-key'])
+def test_durable_high_water_refuses_deleted_history_before_serial_http(owner, damage):
+    calls = []
+    with channel(owner, lambda request: calls.append(request) or response()) as (server, client, adapter), ThreadPoolExecutor(1) as pool:
+        for _ in range(2):
+            serving = pool.submit(server.serve_one)
+            assert client.call('inference', {'input': 'offline historical request'})['events']
+            serving.result(timeout=3)
+        def damage_history(conn):
+            def remove(index):
+                conn.execute('DELETE FROM state_meta WHERE key=?', (adapter.prefix + str(index),))
+            def replace_cursor(value):
+                conn.execute('UPDATE state_meta SET value=? WHERE key=?', (value, adapter.ledger_key))
+            cursor = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (adapter.ledger_key,)).fetchone()[0])
+            changes = {'missing-last': lambda: remove(2), 'missing-first': lambda: remove(1),
+                       'missing-cursor': lambda: remove('cursor'),
+                       'reset-cursor': lambda: replace_cursor(json.dumps(cursor | {'issued': 0}, sort_keys=True)),
+                       'malformed-cursor': lambda: replace_cursor('null'),
+                       'duplicate-cursor-key': lambda: replace_cursor(json.dumps(cursor, sort_keys=True).replace(
+                           '"issued": 2', '"issued": 0, "issued": 2'))}
+            changes[damage]()
+        owner[0].db._execute_write(damage_history)
+        serving = pool.submit(server.serve_one)
+        with pytest.raises(WorkerPersistenceError):
+            client.call('inference', {'input': 'must not spend a third operation'})
+        serving.result(timeout=3)
+        assert len(calls) == 2
+        assert owner[0].db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert owner[0].db._read_all('SELECT key FROM state_meta WHERE key=?', (adapter.prefix + '3',)) == []
+
+
+def test_malformed_current_receipt_still_revokes_original_owner(owner):
+    entered, release = threading.Event(), threading.Event()
+    def handler(_request):
+        entered.set()
+        assert release.wait(4)
+        return response()
+    with channel(owner, handler) as (server, _client, adapter), ThreadPoolExecutor(1) as pool:
+        future = pool.submit(server._dispatch, 'inference', {'input': 'offline'})
+        try:
+            assert entered.wait(2)
+            owner[0].db._execute_write(lambda conn: conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                ('null', adapter.prefix + '1')))
+        finally:
+            release.set()
+        with pytest.raises(RuntimeStoreError):
+            future.result(timeout=3)
+        assert owner[0].db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert owner[0].db.get_meta(adapter.prefix + '1') == 'null'
+        assert adapter.persistence_failure is not None
+
+
+def test_cockpit_operation_observes_committed_reservation_on_independent_connection(owner):
+    from contextlib import closing
+    import sqlite3
+    observed = []
+    def handler(_request):
+        with closing(sqlite3.connect(owner[0].db.db_path)) as conn:
+            cursor = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (adapter.ledger_key,)).fetchone()[0])
+            reservation = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (adapter.prefix + '1',)).fetchone()[0])
+            observed.append((cursor, reservation))
+        return response()
+    with channel(owner, handler) as (server, _client, adapter):
+        server._dispatch('inference', {'input': 'offline'})
+        cursor, reservation = observed[0]
+        assert cursor['issued'] == 1
+        assert reservation['status'] == 'STARTING' and reservation['network_complete'] is False
+        assert cursor['scope'] == reservation['scope'] == owner[2]

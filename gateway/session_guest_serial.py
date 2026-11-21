@@ -34,8 +34,6 @@ class OwnerSerialSession:
         self.inference_count = 0
         self.wire = None
         from gateway.session_guest_inference import OwnerResponses
-        if isinstance(inference, OwnerResponses):
-            inference.bind(endpoint, self.stop)
         encoded = json.dumps(self.work, sort_keys=True, separators=(',', ':'), allow_nan=False)
         def attach(conn):
             endpoint._verify(conn)
@@ -47,6 +45,8 @@ class OwnerSerialSession:
                                  ('guest.work.v1:' + endpoint.scope['execution_id'],)).fetchone()
             if saved is None or saved[0] != encoded or getattr(endpoint, '_prepared_work', None) != encoded:
                 raise RuntimeStoreError('guest_work_not_prepared')
+            if isinstance(inference, OwnerResponses):
+                inference.bind(endpoint, self.stop, conn)
             self.wire = SerialWire(fd, endpoint.scope)
             workers[key] = self  # retained on EOF, cancel, result or Owner loss
         try:

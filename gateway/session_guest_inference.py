@@ -153,6 +153,16 @@ class EventCollector:
         return {'events': self.events}
 
 
+def metadata_value(raw):
+    try:
+        value = json.loads(raw)
+        if json.dumps(value, sort_keys=True, allow_nan=False) != raw:
+            raise ValueError('noncanonical metadata')
+    except (ValueError, TypeError, RecursionError):
+        raise RuntimeStoreError('cockpit_metadata_invalid') from None
+    return value
+
+
 class OwnerResponses:
     """One finite HTTP operation, retained by the original Owner's serial slot.
 
@@ -176,44 +186,77 @@ class OwnerResponses:
         self.persistence_failure = None
         self.active_response = None
         self.closed = False
+        self.issued = 0
+        self.expected_hashes = {}
+        self.prefix = "guest.inference.v1:" + endpoint.scope["execution_id"] + ":"
+        self.ledger_key = self.prefix + "cursor"
         self.policy_digest = hashlib.sha256(json.dumps(asdict(policy), sort_keys=True).encode()).hexdigest()
 
-    def bind(self, endpoint, stop):
+    def bind(self, endpoint, stop, conn):
         if endpoint is not self.endpoint or self.stop is not None:
             raise RuntimeStoreError('cockpit_owner_binding_mismatch')
-        self.endpoint.require_host_operation()
+        endpoint._verify(conn)
+        if conn.execute('SELECT 1 FROM state_meta WHERE substr(key,1,?)=?',
+                        (len(self.prefix), self.prefix)).fetchone():
+            raise RuntimeStoreError('cockpit_ledger_already_bound')
+        cursor = {'scope': endpoint.scope, 'policy_sha256': self.policy_digest, 'issued': 0}
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
+                     (self.ledger_key, json.dumps(cursor, sort_keys=True)))
         self.stop = stop
+
+    def _ledger(self, conn):
+        rows = dict(conn.execute('SELECT key,value FROM state_meta WHERE substr(key,1,?)=?',
+                                 (len(self.prefix), self.prefix)).fetchall())
+        cursor = metadata_value(rows.pop(self.ledger_key, 'null'))
+        expected = {'scope': self.endpoint.scope, 'policy_sha256': self.policy_digest, 'issued': self.issued}
+        if (cursor != expected or not isinstance(cursor, dict) or type(cursor.get('issued')) is not int
+                or not 0 <= self.issued <= 32
+                or set(rows) != {self.prefix + str(index) for index in range(1, self.issued + 1)}):
+            raise RuntimeStoreError('cockpit_ledger_unavailable')
+        return {key: self._receipt(key, raw) for key, raw in rows.items()}
+
+    def _receipt(self, key, raw):
+        record = metadata_value(raw)
+        fields = {'scope', 'policy_sha256', 'request_sha256', 'status', 'network_complete', 'usage'}
+        if (not isinstance(record, dict) or set(record) != fields
+                or record['scope'] != self.endpoint.scope or record['policy_sha256'] != self.policy_digest
+                or record['request_sha256'] != self.expected_hashes.get(key)
+                or record['status'] not in ('STARTING', 'RECEIVED', 'STOP_UNCERTAIN')
+                or type(record['network_complete']) is not bool or not isinstance(record['usage'], dict)):
+            raise RuntimeStoreError('cockpit_receipt_unavailable')
+        return record
 
     def _reserve(self, body):
         encoded = json.dumps(body, sort_keys=True, separators=(',', ':'), allow_nan=False)
-        prefix = 'guest.inference.v1:' + self.endpoint.scope['execution_id'] + ':'
         def write(conn):
             self.endpoint._verify(conn)
             self.endpoint.require_host_operation()
-            rows = conn.execute('SELECT value FROM state_meta WHERE substr(key,1,?)=?',
-                                (len(prefix), prefix)).fetchall()
-            if len(rows) >= 32:
+            records = self._ledger(conn)
+            if self.issued >= 32:
                 raise RuntimeStoreError('guest_inference_budget_spent')
-            for row in rows:
-                prior = json.loads(row[0])
-                if (not isinstance(prior, dict) or prior.get('scope') != self.endpoint.scope or prior.get('policy_sha256') != self.policy_digest
-                        or prior.get('status') != 'RECEIVED' or prior.get('network_complete') is not True):
-                    raise RuntimeStoreError('cockpit_previous_request_unknown')
-            key = prefix + str(len(rows) + 1)
+            if any(row['status'] != 'RECEIVED' or row['network_complete'] is not True for row in records.values()):
+                raise RuntimeStoreError('cockpit_previous_request_unknown')
+            issued = self.issued + 1
+            key = self.prefix + str(issued)
             record = {'scope': self.endpoint.scope, 'policy_sha256': self.policy_digest,
                       'request_sha256': hashlib.sha256(encoded.encode()).hexdigest(),
                       'status': 'STARTING', 'network_complete': False, 'usage': usage_receipt({})}
             conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (key, json.dumps(record, sort_keys=True)))
-            return key
-        return self.endpoint.authority.db._execute_write(write)
+            cursor = {'scope': self.endpoint.scope, 'policy_sha256': self.policy_digest, 'issued': issued}
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?',
+                         (json.dumps(cursor, sort_keys=True), self.ledger_key))
+            return key, issued
+        key, self.issued = self.endpoint.authority.db._execute_write(write)
+        self.expected_hashes[key] = hashlib.sha256(encoded.encode()).hexdigest()
+        return key
 
     def _record(self, key, *, status, network_complete, usage=None):
         def write(conn):
             self.endpoint._verify(conn, allow_unknown=True)
-            row = conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()
-            record = json.loads(row[0])
-            if record['scope'] != self.endpoint.scope or record['policy_sha256'] != self.policy_digest:
-                raise RuntimeStoreError('cockpit_receipt_binding_mismatch')
+            records = self._ledger(conn)
+            if key not in records:
+                raise RuntimeStoreError('cockpit_receipt_unavailable')
+            record = records[key]
             record.update(status='STOP_UNCERTAIN' if self.stop.is_set() or record['status'] == 'STOP_UNCERTAIN' else status,
                           network_complete=record['network_complete'] or network_complete)
             if usage is not None:
@@ -257,7 +300,8 @@ class OwnerResponses:
     def _uncertain(self, key):
         self.stop.set()
         try:
-            self._record(key, status='STOP_UNCERTAIN', network_complete=False)
+            if key is not None:
+                self._record(key, status='STOP_UNCERTAIN', network_complete=False)
         except (ValueError, OSError, sqlite3.Error) as failure:
             self.persistence_failure = failure
         try:
@@ -268,6 +312,7 @@ class OwnerResponses:
     def __call__(self, payload):
         if self.stop is None or self.stop.is_set() or self.closed:
             raise RuntimeStoreError('cockpit_binding_unavailable')
+        body = request_body(payload, self.policy)
         if not self.lock.acquire(blocking=False):
             raise RuntimeStoreError('cockpit_request_in_flight')
         key = None
@@ -275,7 +320,6 @@ class OwnerResponses:
             if self.pending is not None and not self.pending.done():
                 raise RuntimeStoreError('cockpit_request_unretired')
             self.endpoint.require_host_operation()
-            body = request_body(payload, self.policy)
             key = self._reserve(body)
             deadline = time.monotonic() + self.policy.deadline
             self.pending = self.executor.submit(self._perform, body, key)
@@ -293,8 +337,7 @@ class OwnerResponses:
             self.endpoint.require_host_operation()
             return result
         except (ValueError, TypeError, KeyError, OSError, RuntimeError, httpx.HTTPError, sqlite3.Error):
-            if key is not None:
-                self._uncertain(key)
+            self._uncertain(key)
             raise RuntimeStoreError('cockpit_request_unsettled') from None
         finally:
             self.lock.release()

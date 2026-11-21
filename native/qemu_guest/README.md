@@ -165,8 +165,13 @@ the existing Task/Run/VM/Session/Owner scope, policy digest and request digest.
 Neither prompts nor HTTP authorization headers enter these records. Token usage
 is recorded only when reported; actual billing remains UNKNOWN, never zero.
 `RECEIVED` means the Host received and closed a valid response, not that the Guest
-received it or that execution retired. Missing/damaged/unfinished prior records
-refuse another request. Original Owner epoch checks run before and after I/O.
+received it or that execution retired. A durable issued-request cursor is created
+in the serial attachment writer transaction. Before another operation, exact
+keys 1 through issued, immutable Owner/policy
+bindings and Owner-held request digests must match; missing, malformed, reset or
+unfinished history refuses I/O and revokes the channel. The cursor is never
+recreated after attachment, and Owner restart cannot resume this execution.
+Original Owner epoch checks run before and after I/O.
 
 Cancellation/deadline closes authorization and suppresses late results. A blocked
 HTTP operation remains strongly owned by the original serial slot until its

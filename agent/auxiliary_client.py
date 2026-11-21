@@ -41,6 +41,7 @@ from agent.codex_headers import (
 )
 from agent.codex_runtime import _codex_event_has_content
 from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
+from agent.guest_inference import serial_auxiliary_route
 
 # `openai.OpenAI` is imported lazily (~240 ms cold); `OpenAI` below is a proxy
 # so in-module calls, `auxiliary_client.OpenAI` reads and
@@ -184,14 +185,7 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
         return _AuxProbeClientStub(api_key=api_key, base_url=base_url)
     kwargs = {**_openai_http_client_kwargs(base_url), **kwargs}
     _apply_required_codex_headers(kwargs, access_token=api_key, base_url=base_url)
-    # Hermes owns aux retry/fallback policy; the SDK default (max_retries=2) would triple
-    # wall time on a hung endpoint before Hermes sees one failure.
-    # Hermes owns auxiliary retry + provider/model fallback policy (the same-provider transient retry in
-    # call_llm plus the except-chain fallback). The OpenAI SDK's own default (max_retries=2 → up to 3
-    # attempts) silently multiplies the effective wall time of every aux call by 3× on a slow/hung endpoint,
-    # so a 120s timeout can stall ~360s before Hermes sees a single failure (issue #54465). Disable
-    # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
-    # via kwargs.
+    # Hermes owns retry/fallback policy; SDK retries would multiply its budget (#54465).
     kwargs.setdefault("max_retries", 0)
     return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
@@ -5406,6 +5400,7 @@ _EXPLICIT_PROVIDER_BRANCHES: dict[str, Callable[[_ResolveRequest], _ResolveResul
 }
 
 
+@serial_auxiliary_route
 def resolve_provider_client(
     provider: str, model: str | None = None, async_mode: bool = False, raw_codex: bool = False,
     explicit_base_url: str | None = None, explicit_api_key: Optional[str | Callable[[], str]] = None,
@@ -5998,6 +5993,7 @@ def _compat_model(client: Any, model: Optional[str], cached_default: Optional[st
     return model or cached_default
 
 
+@serial_auxiliary_route
 def _get_cached_client(
     provider: str, model: str | None = None, async_mode: bool = False, base_url: str | None = None,
     api_key: str | None = None, api_mode: str | None = None, main_runtime: Optional[dict[str, Any]] = None,

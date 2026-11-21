@@ -648,6 +648,11 @@ class SessionAuthority:
         handle = self._handle(ref)
         if handle.execution_generation != generation:
             raise RuntimeStoreError('stale_generation')
+        if getattr(self, '_q2_guest_channels', {}).get(ref.session_id) is not None:
+            from gateway.session_guest_serial import interrupt_guest
+            from gateway.session_runtime_workers import tracked_write
+            await tracked_write(self, partial(interrupt_guest, self, ref.session_id, generation))
+            return self._handle(ref)
         live, agent = self.sessions[ref.session_id], None
         if handle.execution_state == 'running':
             # Latches are written under the lock adopt_agent takes on the executor thread, BEFORE the

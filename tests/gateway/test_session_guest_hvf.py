@@ -1070,7 +1070,11 @@ def test_q2_observer_natural_exit_windows_and_pid_reuse_guard(monkeypatch, windo
     if window in ('reused', 'unverified_gone'):
         with pytest.raises(RuntimeStoreError, match='q2_child_identity_'):
             observer.check_child()
-        assert observer.observation == {}
+        if window == 'unverified_gone':
+            assert observer.observation['identity_lookup_failure']['historical_identity_matches'] is False
+            assert 'exact_child_exit' not in observer.observation
+        else:
+            assert observer.observation == {}
     elif window == 'live':
         assert observer.check_child() is True
         assert observer.observation == {}
@@ -1146,3 +1150,48 @@ def test_stopped_disk_diagnostic_binds_original_manifest_and_booked_device(tmp_p
     result = q2.inspect_failed_startup(handle, observation, time.monotonic() + 5)
     assert result['retirement_proof'] is False
     assert result['status'] == ('OBSERVED_UNTRUSTED' if damage == 'none' else 'UNKNOWN')
+
+
+@pytest.mark.parametrize('historical_matches,returncode,classification', [
+    (True, None, 'EXIT_NOT_YET_OBSERVED'),
+    (False, None, 'UNVERIFIED_HISTORY'),
+    (False, 0, 'UNVERIFIED_HISTORY'),
+    (True, 0, 'EXACT_CHILD_EXIT'),
+    (True, -15, 'EXACT_CHILD_EXIT'),
+])
+def test_lookup_disappearance_records_the_contemporaneous_poll_branch(monkeypatch, historical_matches,
+                                                                     returncode, classification):
+    from gateway import session_hvf_process as process
+    identity = {'pid': 123, 'created': 10, 'executable': '/fixture'}
+    history = dict(identity) if historical_matches else identity | {'created': 11}
+    polls = []
+
+    def poll():
+        polls.append(returncode)
+        return returncode
+
+    child = SimpleNamespace(pid=123, poll=poll, _q2_verified_identity=history)
+    observer = object.__new__(process.Q2ProcessObserver)
+    observer.process, observer.identity, observer.observation = child, identity, {}
+
+    def disappeared(*_args):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(process, 'child_identity', disappeared)
+    if classification != 'EXACT_CHILD_EXIT':
+        with pytest.raises(RuntimeStoreError, match='q2_child_identity_unavailable') as error:
+            observer.check_child()
+        assert isinstance(error.value.__cause__, ProcessLookupError)
+        assert 'exact_child_exit' not in observer.observation
+    else:
+        assert observer.check_child() is False
+        assert observer.observation['exact_child_exit']['returncode'] == returncode
+    actual = observer.observation['identity_lookup_failure']
+    assert polls == [returncode]
+    assert actual['poll_returncode'] == returncode
+    assert actual['classification'] == classification
+    assert actual['historical_identity'] == history and actual['expected_identity'] == identity
+    assert actual['historical_identity_matches'] is historical_matches
+    assert actual['lookup_exception'] == 'ProcessLookupError' and actual['observed_monotonic'] > 0
+    assert child._q2_verified_identity == history
+    assert not any(value == 'RETIRED' for value in observer.observation.values())

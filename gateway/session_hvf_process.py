@@ -450,8 +450,16 @@ class Q2ProcessObserver:
             actual = child_identity(self.process, self.identity['executable'])
         except (ProcessLookupError, psutil.NoSuchProcess) as error:
             code = self.process.poll()
-            if historical != self.identity or code is None:
-                raise RuntimeStoreError('q2_child_identity_unavailable') from error
+            matches = historical == self.identity
+            classification = ('UNVERIFIED_HISTORY' if not matches else
+                              'EXIT_NOT_YET_OBSERVED' if code is None else 'EXACT_CHILD_EXIT')
+            lookup = {'historical_identity': dict(historical) if isinstance(historical, dict) else None,
+                      'expected_identity': dict(self.identity), 'historical_identity_matches': matches,
+                      'poll_returncode': code, 'lookup_exception': type(error).__name__,
+                      'observed_monotonic': time.monotonic(), 'classification': classification}
+            self.observation['identity_lookup_failure'] = lookup
+            if not matches or code is None:
+                raise RuntimeStoreError('q2_child_identity_unavailable', detail=json.dumps(lookup)) from error
             return self._exited(historical, code)
         if actual != self.identity:
             raise RuntimeStoreError('q2_child_identity_changed')

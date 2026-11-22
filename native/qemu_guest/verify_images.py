@@ -138,6 +138,24 @@ def verify_manifest(directory):
     return manifest
 
 
+def verify_startup_directory(fs, role):
+    """Offline build contract, not proof that PID1 reached this directory."""
+    name = '.hermes-q2-startup-v1'
+    entries = {node.filename for node in fs.get('/').iterdir()}
+    if role == 'reviewer':
+        if name in entries:
+            raise ValueError('reviewer_startup_directory_forbidden')
+        return 'ABSENT'
+    if name not in entries:
+        raise ValueError('developer_startup_directory_required')
+    node = fs.get('/' + name)
+    if (node.filetype != stat.S_IFDIR or node.inode.i_uid != 1000 or node.inode.i_gid != 1000 or
+            stat.S_IMODE(node.inode.i_mode) != 0o700 or
+            any(child.filename not in ('.', '..') for child in node.iterdir())):
+        raise ValueError('developer_startup_directory_invalid')
+    return 'PREPROVISIONED_EMPTY_1000_1000_0700'
+
+
 def verify_content(directory):
     from dissect.extfs import ExtFS
     directory = Path(directory).resolve()
@@ -164,7 +182,10 @@ def verify_content(directory):
                 or any(name in task for name in ('.git', '.git/commondir', '.git/gitdir', '.git/objects/info/alternates'))):
             raise ValueError('independent_git_metadata_required')
         with (directory / (role + '-task.raw')).open('rb') as stream:
-            if git_head(ExtFS(stream)) != facts['task_fixture_head']:
+            task_fs = ExtFS(stream)
+            if facts.get('startup_directory', {}).get('developer_preprovisioned'):
+                verify_startup_directory(task_fs, role)
+            if git_head(task_fs) != facts['task_fixture_head']:
                 raise ValueError('task_device_head_mismatch')
         with (directory / (role + '-assignment.raw')).open('rb') as stream:
             fs = ExtFS(stream)

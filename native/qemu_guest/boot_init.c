@@ -31,7 +31,7 @@ static int diagnostic_directory(void) {
     close(task);
     struct stat info;
     if (fd >= 0 && (fstat(fd, &info) || info.st_uid != Q2_UID ||
-                    info.st_gid != Q2_GID || (info.st_mode & 0777) != 0700)) {
+                    info.st_gid != Q2_GID || (info.st_mode & 07777) != 0700)) {
         close(fd); fd = -1;
     }
     return fd;
@@ -180,9 +180,12 @@ static void mount_private_storage(void) {
     checked_mount("/dev/vdb", "/task", "ext4", flags, "");
     stage = Q2_STAGE_TASK_MOUNTED;
     if (developer) {
-        if (mkdir("/task/.hermes-q2-startup-v1", 0700) ||
-                chown("/task/.hermes-q2-startup-v1", Q2_UID, Q2_GID)) fail("diagnostic_directory");
+        /* The offline image owns bootstrap. A directory-creation failure must
+         * not be a prerequisite for enabling its own failure recorder. */
+        int diagnostic = diagnostic_directory();
+        if (diagnostic < 0) fail("diagnostic_directory");
         diagnostic_enabled = 1;
+        if (close(diagnostic) != 0) fail("diagnostic_directory_close");
     }
 }
 

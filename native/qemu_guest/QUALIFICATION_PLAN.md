@@ -819,3 +819,54 @@ No normal QEMU, VM, Guest or Worker execution is authorized by this RCA. Any nex
 three-slot batch needs a fresh reviewed source/artifact/Helper binding, new
 profile/reservations, Main Control review and a new Human grant. Old grants may
 not be replayed. FIRST_WORKER_OWNED_DELIVERY remains NOT_ACHIEVED.
+
+## Third Native failure: bounded offline bootstrap correction (7082116400)
+
+The ac0b111 batch spent exactly one Developer slot and stopped without READY,
+Worker receipt, inference or candidate. The third STOP_UNCERTAIN history joins
+the two earlier histories unchanged and nonresumable. HVF destroy0, exact wait0,
+empty group, closed pipes and actual serial EOF do not establish retirement.
+
+Copies-only reconstruction binds all38 raw outputs, immutable SQLite backups,
+actual root/task/assignment disks, frozen initramfs/kernel and baseline source.
+Only operator entry, grant start and serial EOF have persisted monotonic times.
+Child birth and QMP shutdown have wall times without a contemporaneous clock
+bridge. Spawn/release/lookup/poll/wait exact monotonic timestamps are absent;
+only source/stream partial ordering is proven. No runtime Q2_INIT_FAILURE marker
+survived. Host q2_child_identity_unavailable does not identify the Guest stage
+or which transient guard branch occurred. Guest stage remains UNKNOWN before
+canonical READY. Task bytes/HEAD were unchanged and no diagnostic directory
+survived; neither fact proves the failing operation.
+
+Confirmed source defect: runtime mkdir/chown was required before enabling its
+own failure recorder. This is a self-blind diagnostic prerequisite, not a proven
+cause of the Native shutdown. The existing offline builder now provisions the
+reserved empty Developer directory with mode0700; existing ext4 normalization
+sets UID/GID1000. Both the static package and original Owner slot-device builder
+use the same preparation function. Incoming reserved source paths remain
+rejected, Git excludes the diagnostic path, and Reviewer has no such directory.
+PID1 opens/validates the supplied directory after mounting task; it no longer
+creates/chowns it as the prerequisite for enabling diagnostics.
+
+Post-stop inspection distinguishes ABSENT, VALID_EMPTY (UNKNOWN, no receipt),
+and VALID_RECEIPT (untrusted numeric hint only). Extra entries, bad ownership,
+mode/link/type or malformed receipt reject. Candidate extraction validates then
+excludes the reserved path, including a valid empty directory. An empty path or
+a valid numeric receipt supplies no Worker-result or retirement authority.
+
+Future Host lookup-disappearance observations record one contemporaneous poll
+returncode, the exact saved identity/match, exception class, monotonic timestamp
+and guard classification. None/unverified history still rejects; PID reuse and
+live ambiguity remain closed. No historical branch is filled in retroactively.
+Pre-READY EOF still cannot fabricate a receive-pump join or RETIRED.
+
+New Guest bytes are separately frozen with SHA256/SBOM/provenance; previous
+packages and three failed campaigns are never overwritten. The current signed
+Helper is unchanged and not executed. Its bundled initramfs remains the old
+package; it is not a binding for new Guest bytes. No fresh grant candidate or
+profile execution is prepared by this offline correction. Any future qualified
+binding requires a separate explicit decision. Early root transition, mounts,
+assignment-role/task-mount and directory-validation failures can still precede
+a usable task receipt; Reviewer remains intentionally read-only. No fourth VM
+is authorized to resolve those unknowns. This bounded package ends after source,
+artifact and evidence delivery, without claiming a specific Guest root cause.

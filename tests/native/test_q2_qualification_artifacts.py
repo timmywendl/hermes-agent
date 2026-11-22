@@ -827,3 +827,132 @@ def test_startup_disk_open_binds_the_actual_descriptor_before_ext4_parse(tmp_pat
     with pytest.raises(ValueError, match='q2_startup_device_changed'):
         artifacts.inspect_startup(manifest['manifest_path'],
                                   expected_manifest_sha256=manifest['manifest_sha256'])
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('role', ['developer', 'reviewer'])
+def test_real_slot_device_preprovisions_only_private_developer_diagnostic(repository, tmp_path, ext4_tools, role):
+    from dissect.extfs import ExtFS
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup
+    source, base = repository
+    parent = None
+    if role == 'reviewer':
+        disk, base, head = candidate_disk(repository, tmp_path, ext4_tools)
+        parent = freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+        source, base = Path(parent['snapshot_path']), head
+    record = prepare_slot_devices(work(base, role), source, tmp_path / 'slot',
+                                  mke2fs=ext4_tools[0], parent_candidate=parent['manifest_path'] if parent else None)
+    with Path(record['task']['path']).open('rb') as stream:
+        fs = ExtFS(stream)
+        if role == 'developer':
+            node = fs.get('/' + STARTUP_DIRECTORY)
+            assert node.inode.i_uid == node.inode.i_gid == 1000
+            assert node.inode.i_mode & 0o7777 == 0o700
+            assert set(child.filename for child in node.iterdir()) == {'.', '..'}
+            exclude = fs.get('/.git/info/exclude').open().read()
+            assert ('/' + STARTUP_DIRECTORY + '/').encode() in exclude
+        else:
+            assert STARTUP_DIRECTORY not in {node.filename for node in fs.get('/').iterdir()}
+    advisory = inspect_startup(record['manifest_path'], expected_manifest_sha256=record['manifest_sha256'])
+    assert advisory['status'] == 'UNKNOWN' and advisory['retirement_proof'] is False
+    assert advisory['diagnostic_directory'] == ('VALID_EMPTY' if role == 'developer' else 'ABSENT')
+    from native.qemu_guest.verify_images import verify_startup_directory
+    with Path(record['task']['path']).open('rb') as stream:
+        assert verify_startup_directory(ExtFS(stream), role) == (
+            'PREPROVISIONED_EMPTY_1000_1000_0700' if role == 'developer' else 'ABSENT')
+    assert 'receipt' not in advisory
+    assert not (source / STARTUP_DIRECTORY).exists()
+    assert STARTUP_DIRECTORY not in git(source, 'ls-tree', '-r', '--name-only', 'HEAD')
+
+
+@pytest.mark.platforms('posix')
+def test_empty_preprovisioned_directory_is_unknown_and_excluded_from_real_candidate(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    (root / 'result.txt').write_text('actual disposable commit\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    provision_startup_directory(root, 'developer')
+    assert not git(root, 'status', '--porcelain')
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2EMPTYDIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {'schema': 'HERMES_Q2_SLOT_DEVICES_V1',
+        'task': file_record(disk), 'scope': work(base)['assignment'], 'role': 'developer'})
+    advisory = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+    assert advisory['reason'] == 'EMPTY_PREPROVISIONED_DIRECTORY' and advisory['status'] == 'UNKNOWN'
+    assert advisory['retirement_proof'] is False and 'receipt' not in advisory
+    candidate = freeze_candidate(disk, tmp_path / 'snapshot', expected_base=base)
+    assert 'result.txt' in candidate['content']
+    assert not any(name.startswith(STARTUP_DIRECTORY) for name in candidate['content'])
+    assert not (Path(candidate['snapshot_path']) / STARTUP_DIRECTORY).exists()
+
+
+@pytest.mark.parametrize('kind', ['empty_directory', 'file', 'symlink', 'tracked'])
+def test_incoming_source_cannot_supply_the_reserved_bootstrap_directory(repository, tmp_path, kind):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, _base = repository
+    reserved = root / STARTUP_DIRECTORY
+    actions = {'empty_directory': lambda: reserved.mkdir(), 'file': lambda: reserved.write_text('fake'),
+               'symlink': lambda: reserved.symlink_to(tmp_path / 'missing'),
+               'tracked': lambda: (reserved.mkdir(), (reserved / 'fake').write_text('fake'),
+                                  git(root, 'add', '.'), git(root, 'commit', '-qm', 'fake diagnostic'))}
+    actions[kind]()
+    for role in ('developer', 'reviewer'):
+        with pytest.raises(ValueError, match='q2_reserved_startup_path'):
+            provision_startup_directory(root, role)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['empty', 'missing', 'wrong_mode', 'special_mode', 'wrong_owner'])
+def test_real_ext4_empty_directory_metadata_and_absence_are_not_worker_success(repository, tmp_path, ext4_tools, damage):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    provision_startup_directory(root, 'developer')
+    folder = root / STARTUP_DIRECTORY
+    actions = {'empty': lambda: None, 'missing': folder.rmdir,
+               'wrong_mode': lambda: folder.chmod(0o755),
+               'special_mode': lambda: folder.chmod(0o1700), 'wrong_owner': lambda: None}
+    actions[damage]()
+    disk = tmp_path / 'task.raw'
+    ext4(root, disk, label='Q2METADIAG', mib=64, tool=ext4_tools[0], config=ext4_tools[1],
+         owner=0 if damage == 'wrong_owner' else 1000)
+    manifest = _write_manifest(tmp_path, 'slot.json', {'schema': 'HERMES_Q2_SLOT_DEVICES_V1',
+        'task': file_record(disk), 'scope': work(base)['assignment'], 'role': 'developer'})
+    if damage in ('wrong_mode', 'special_mode', 'wrong_owner'):
+        from dissect.extfs import ExtFS
+        from native.qemu_guest.verify_images import verify_startup_directory
+        with disk.open('rb') as stream, pytest.raises(ValueError, match='developer_startup_directory_invalid'):
+            verify_startup_directory(ExtFS(stream), 'developer')
+        with pytest.raises(ValueError, match='q2_startup_node_invalid'):
+            inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+    else:
+        result = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+        assert result['diagnostic_directory'] == ('VALID_EMPTY' if damage == 'empty' else 'ABSENT')
+        assert result['status'] == 'UNKNOWN' and result['retirement_proof'] is False
+        assert 'receipt' not in result
+
+
+def test_reserved_diagnostic_stays_out_of_real_git_add(repository):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, _base = repository
+    provision_startup_directory(root, 'developer')
+    (root / STARTUP_DIRECTORY / 'receipt.json').write_text('untrusted diagnostic fixture\n')
+    (root / 'real-change.txt').write_text('ordinary task change\n')
+    git(root, 'add', '.')
+    assert git(root, 'diff', '--cached', '--name-only').splitlines() == ['real-change.txt']
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_rejects_invalid_empty_diagnostic_directory(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, base = repository
+    (root / 'result.txt').write_text('committed fixture\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    provision_startup_directory(root, 'developer')
+    (root / STARTUP_DIRECTORY).chmod(0o755)
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2INVALIDEMPTY')
+    with pytest.raises(ValueError, match='q2_startup_node_invalid'):
+        freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)

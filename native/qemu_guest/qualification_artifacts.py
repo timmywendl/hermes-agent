@@ -19,7 +19,7 @@ from gateway.session_guest_workspace import prepare_workspace
 from native.qemu_guest.artifact_fs import ext4
 from native.qemu_guest.artifact_inventory import file_record, verify_tree
 from native.qemu_guest.build_artifacts import (
-    MKE2FS_CONFIG, STARTUP_DIRECTORY, STARTUP_STAGES, private_git_snapshot,
+    MKE2FS_CONFIG, STARTUP_DIRECTORY, STARTUP_STAGES, private_git_snapshot, provision_startup_directory,
 )
 from native.qemu_guest.build_inputs import canonical
 from native.qemu_guest.image_contract import GuestImage
@@ -139,7 +139,8 @@ def inspect_startup(manifest, *, expected_manifest_sha256):
     if any(before[key] != disk[key] for key in ('st_dev', 'st_ino', 'size')):
         raise ValueError('q2_startup_device_changed')
     result = {'authority': 'UNTRUSTED_GUEST_DIAGNOSTIC_ONLY', 'retirement_proof': False,
-              'status': 'UNKNOWN', 'reason': 'NO_DURABLE_RECEIPT', 'task': before,
+              'status': 'UNKNOWN', 'reason': 'NO_DURABLE_RECEIPT',
+              'diagnostic_directory': 'ABSENT', 'task': before,
               'scope': record['scope']}
     with os.fdopen(os.open(disk['path'], os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
         opened = os.fstat(stream.fileno())
@@ -153,13 +154,18 @@ def inspect_startup(manifest, *, expected_manifest_sha256):
                 raise ValueError('q2_reviewer_diagnostic_forbidden')
             directory = fs.get('/' + STARTUP_DIRECTORY)
             _startup_node(directory, directory=True)
-            if {entry.filename for entry in directory.iterdir() if entry.filename not in ('.', '..')} != {'receipt.json'}:
+            entries = {entry.filename for entry in directory.iterdir() if entry.filename not in ('.', '..')}
+            if entries - {'receipt.json'}:
                 raise ValueError('q2_startup_incomplete_or_extra_files')
-            node = fs.get('/' + STARTUP_DIRECTORY + '/receipt.json')
-            _startup_node(node)
-            with node.open() as source:
-                receipt = startup_receipt(source.read(160))
-            result.update(status='OBSERVED_UNTRUSTED', reason=None, receipt=receipt)
+            if not entries:
+                result.update(diagnostic_directory='VALID_EMPTY', reason='EMPTY_PREPROVISIONED_DIRECTORY')
+            else:
+                node = fs.get('/' + STARTUP_DIRECTORY + '/receipt.json')
+                _startup_node(node)
+                with node.open() as source:
+                    receipt = startup_receipt(source.read(160))
+                result.update(status='OBSERVED_UNTRUSTED', diagnostic_directory='VALID_RECEIPT',
+                              reason=None, receipt=receipt)
     if file_record(disk['path']) != before:
         raise ValueError('q2_startup_device_changed')
     return result
@@ -191,11 +197,7 @@ def prepare_slot_devices(work, source, output, *, mke2fs, config=None, parent_ca
             for name in _tree_files(workspace.root, workspace.head)):
         raise ValueError('q2_reserved_startup_path')
     private_git_snapshot(workspace.root)
-    if work['role'] == 'developer':
-        exclude = workspace.root / '.git/info/exclude'
-        exclude.parent.mkdir(exist_ok=True)
-        with exclude.open('a') as stream:
-            stream.write('\n/' + STARTUP_DIRECTORY + '/\n')
+    provision_startup_directory(workspace.root, work['role'])
     verify_tree(workspace.root)
     assignment = output / 'assignment-tree'
     assignment.mkdir()
@@ -275,7 +277,6 @@ def _disk_files(task_disk):
             raise ValueError('q2_candidate_owner_invalid')
         head = git_head(fs)
         total, nodes = 0, 0
-        diagnostic_present = diagnostic_recorded = False
         for name, node in walk(fs.get('/')):
             nodes += 1
             if nodes > MAX_FILES:
@@ -284,7 +285,6 @@ def _disk_files(task_disk):
             _safe_name(name)
             if name == STARTUP_DIRECTORY:
                 _startup_node(node, directory=True)
-                diagnostic_present = True
                 continue
             if name.startswith(STARTUP_DIRECTORY + '/'):
                 if name != STARTUP_DIRECTORY + '/receipt.json':
@@ -292,7 +292,6 @@ def _disk_files(task_disk):
                 _startup_node(node)
                 with node.open() as source:
                     startup_receipt(source.read(160))
-                diagnostic_recorded = True
                 continue
             if node.inode.i_uid != 1000 or node.inode.i_gid != 1000 or node.inode.i_mode & 0o6000:
                 raise ValueError('q2_candidate_owner_invalid')
@@ -311,8 +310,6 @@ def _disk_files(task_disk):
             records[name] = {'sha256': _digest(data), 'size': len(data),
                              'mode': '100755' if node.inode.i_mode & 0o111 else '100644'}
             contents[name] = data
-    if diagnostic_present != diagnostic_recorded:
-        raise ValueError('q2_startup_incomplete_or_extra_files')
     if file_record(task_disk) != before:
         raise ValueError('q2_candidate_disk_changed')
     return before, head, records, contents

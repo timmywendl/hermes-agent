@@ -243,6 +243,24 @@ def assignment_tree(output, role, head):
     return root
 
 
+def provision_startup_directory(root, role):
+    """Builder-owned reserved path; ext4 normalization supplies UID/GID1000."""
+    root = Path(root)
+    reserved = root / STARTUP_DIRECTORY
+    if reserved.exists() or reserved.is_symlink():
+        raise ValueError('q2_reserved_startup_path')
+    if role not in ('developer', 'reviewer'):
+        raise ValueError('q2_startup_role_invalid')
+    if role == 'reviewer':
+        return
+    reserved.mkdir(mode=0o700)
+    reserved.chmod(0o700)
+    exclude = root / '.git/info/exclude'
+    exclude.parent.mkdir(exist_ok=True)
+    with exclude.open('a') as stream:
+        stream.write('\n/' + STARTUP_DIRECTORY + '/\n')
+
+
 def private_git_snapshot(root):
     """Omit Host stat-cache/reflog data while retaining a valid private index."""
     shutil.rmtree(root / '.git/logs')
@@ -289,6 +307,7 @@ def build(args):
     for role in ('developer', 'reviewer'):
         task = prepare_workspace(fixture, args.output / (role + '-task-tree'), head=head, role=role)
         private_git_snapshot(task.root)
+        provision_startup_directory(task.root, role)
         images[role + '_task'] = ext4(task.root, args.output / (role + '-task.raw'),
             label='Q2DEV' if role == 'developer' else 'Q2REVIEW', mib=64,
             tool=args.mke2fs, config=config, owner=1000)
@@ -301,6 +320,8 @@ def build(args):
              'images': images, 'input_lock_sha256': digest(HERE / 'artifact-inputs.lock.json'),
              'recipe_sha256': {name: digest(HERE / name) for name in (
                  'build_artifacts.py', 'artifact_fs.py', 'build_inputs.py', 'boot_init.c')},
+             'startup_directory': {'developer_preprovisioned': True, 'path': STARTUP_DIRECTORY,
+                                   'uid': 1000, 'gid': 1000, 'mode': '0700', 'reviewer': 'ABSENT'},
              'target_execution': 'NOT_RUN'}
     (args.output / 'build-facts.json').write_text(canonical(facts))
     print(canonical({'output': str(args.output), 'artifacts_constructed': 7, 'boot': 'NOT_RUN'}))

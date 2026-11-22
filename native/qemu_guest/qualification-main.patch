@@ -1,0 +1,26 @@
+--- a/system/main.c
++++ b/system/main.c
+@@ -66,15 +66,19 @@
+ int (*qemu_main)(void) = os_darwin_cfrunloop_main;
+ #endif
+ 
+-extern int hermes_hvf_admission_gate(void);
+-extern int hermes_hvf_preflight(const char *plan_path);
++extern int hermes_q2_gate(const char *plan_path, int argc, char **argv);
++extern int hermes_q2_canary(const char *plan_path, int argc, char **argv);
+ 
+ int main(int argc, char **argv)
+ {
++    if (argc >= 2 && strcmp(argv[1], "--hermes-q2-sandbox-preflight") == 0) {
++        return argc >= 3 ? hermes_q2_canary(argv[2], argc - 3, argv + 3) : 2;
++    }
++
+-    if (argc < 3 || strcmp(argv[1], "--hermes-hvf-q1") != 0) {
++    if (argc < 3 || strcmp(argv[1], "--hermes-hvf-q2") != 0) {
+         return 2;
+     }
+-    if (hermes_hvf_admission_gate() != 0 || hermes_hvf_preflight(argv[2]) != 0) {
++    if (hermes_q2_gate(argv[2], argc - 3, argv + 3) != 0) {
+         return 2;
+     }
+     char *executable = argv[0];

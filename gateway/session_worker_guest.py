@@ -345,3 +345,24 @@ class GuestOwnerEndpoint:
                 conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?',
                              (self.scope['session_id'],))
             self.authority.db._execute_write(write)
+
+
+def retire_guest_physical(endpoint, handle):
+    """Private original-Owner finalizer; no Guest frame can call this operation."""
+    from gateway.session_guest_hvf import require_physical_handle
+    require_physical_handle(endpoint, handle)
+    cancelled = handle.record['mode'] == 'cancellation'
+    def write(conn):
+        worker, admission = endpoint._verify(conn, allow_unknown=cancelled)
+        if cancelled:
+            if worker['status'] != 'unknown' or admission['status'] != 'unknown':
+                raise RuntimeStoreError('guest_cancellation_unknown_required')
+            return  # Physical facts are appended by the Owner; logical UNKNOWN stays.
+        previous = conn.execute('SELECT result_json FROM worker_receipts WHERE execution_id=? '
+                                'ORDER BY sequence DESC LIMIT 1', (endpoint.scope['execution_id'],)).fetchone()
+        if (worker['status'] != 'running' or admission['status'] != 'started'
+                or previous is None or json.loads(previous[0]) != {'status': 'pending_retirement'}):
+            raise RuntimeStoreError('guest_canonical_finish_required')
+        conn.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id=?",
+                     (endpoint.scope['execution_id'],))
+    endpoint.authority.db._execute_write(write)

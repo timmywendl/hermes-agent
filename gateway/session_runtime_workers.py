@@ -21,7 +21,9 @@ def uncounted_runtime_work(runner):
     hvf = sum(len({*getattr(authority, '_hvf_retained', ()),
                    *(key for key, handle in getattr(authority, '_hvf_workers', {}).items()
                      if not handle.closed.is_set())}) for authority in authorities)
-    q2 = sum(len(getattr(authority, '_q2_guest_channels', {})) for authority in authorities)
+    from gateway.session_guest_hvf import physical_pending
+    q2 = sum(len(getattr(authority, '_q2_guest_channels', {})) + physical_pending(authority)
+             for authority in authorities)
     return (managed + hvf + q2 + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
             + sum(len(mutation_tasks(authority)) for authority in authorities))
@@ -151,7 +153,8 @@ async def join_authority_work(authority, timeout):
         stop_authority_work(authority)
         hvf_pending = (bool(getattr(authority, '_hvf_retained', ()))
                        or any(not h.closed.is_set() for h in getattr(authority, '_hvf_workers', {}).values()))
-        if (not hvf_pending and not getattr(authority, '_q2_guest_channels', {})
+        from gateway.session_guest_hvf import physical_pending
+        if (not hvf_pending and not physical_pending(authority) and not getattr(authority, '_q2_guest_channels', {})
                 and not list(physical_workers(authority))
                 and not list(executing_sessions(authority)) and not mutation_tasks(authority)):
             return

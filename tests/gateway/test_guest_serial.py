@@ -916,3 +916,726 @@ def test_workspace_detects_real_linked_git_common_dir(tmp_path):
     subprocess.run(['git', '-C', str(source), 'worktree', 'add', '-q', '--detach', str(linked)], check=True)
     with pytest.raises(ValueError, match='shared_common_dir'):
         verify_common_dir(linked, source / '.git')
+
+
+@pytest.mark.parametrize('bound_service', [True, False])
+def test_healthy_serial_eof_drains_finished_and_preserves_owner_exclusion(owner, tmp_path, bound_service):
+    """A real committed finish plus EOF closes transport, never the worker row."""
+    import time
+    authority, _row, scope, endpoint = owner
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work)
+    client = GuestSerialClient(SerialWire(guest.fileno(), scope))
+    host.close()  # the original Owner retains only SerialWire's owned descriptor
+    with ThreadPoolExecutor(1) as pool:
+        def serve():
+            while server.serve_one():
+                pass
+        service = pool.submit(serve)
+        if bound_service:
+            server.bind_service(service)
+        store = guest_session_store(client, scope, tmp_path / 'actual-receipt-outbox')
+        try:
+            client.send('ready')
+            client.send('result', result={'final_response': 'qualification fixture'})
+            assert json.loads(client.controls.readline()) == {'type': 'finish'}
+            assert store.finish() == {'status': 'pending_retirement'}
+            client.send('finished')
+            client.close()
+            guest.close()
+            service.result(timeout=5)
+            facts = server.finish_transport(deadline=time.monotonic() + 5)
+            assert facts['complete'] is bound_service and facts['logical_finished']
+            assert facts['service_joined'] is bound_service
+            assert facts['serial_observer'] == 'ORIGINAL_OWNER_SERIALWIRE'
+            assert not endpoint.revoked and not server.unknown_persisted.is_set()
+            assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'running'
+            assert authority._q2_guest_channels['owned'] is server
+        finally:
+            store.close()
+            client.close()
+            guest.close()
+            server.wire.release_fd()
+
+
+def test_guest_finished_without_canonical_finish_is_unknown(owner):
+    authority, _row, scope, endpoint = owner
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work)
+    client = SerialWire(guest.fileno(), scope)
+    try:
+        client.send('activity', 'event', {'type': 'result'})
+        server.serve_one()
+        client.receive()  # actual finish control
+        client.send('activity', 'event', {'type': 'finished'})
+        with pytest.raises(SerialError, match='canonical_receipt'):
+            server.serve_one()
+        assert endpoint.revoked
+        assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        with pytest.raises(ValueError, match='healthy_finish_revoked'):
+            server.finish_transport()
+    finally:
+        client.release_fd()
+        server.wire.release_fd()
+        host.close()
+        guest.close()
+
+
+def test_serial_close_facts_do_not_imply_peer_eof(owner):
+    _authority, _row, _scope, endpoint = owner
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work)
+    try:
+        server.close_transport()
+        facts = server.physical_observation()
+        assert facts['descriptor_closed'] and facts['transport_joined']
+        assert facts['peer_eof'] is False and facts['complete'] is False
+    finally:
+        host.close()
+        guest.close()
+
+
+_Q2_PROCESS_FIXTURE = r'''
+import json, os, sys
+pid = os.getpid()
+def emit(value):
+    print(json.dumps(value), flush=True)
+print("HERMES_HVF_CORE_LIMIT_V1 pid=%d current=0 maximum=0" % pid, file=sys.stderr, flush=True)
+print("HERMES_HVF_VM_CREATE_V1 pid=%d result=0" % pid, file=sys.stderr, flush=True)
+print("HERMES_Q2_SANDBOX_RESULT_V1 " + json.dumps({"pid":pid,"pass":True,"vm_created":False}), file=sys.stderr, flush=True)
+emit({"QMP":{"version":{}}})
+readonly = sys.argv[1] == "reviewer"
+blocks = [{"device":name,"inserted":{"ro":ro,"image":{"virtual-size":size}}}
+          for name,ro,size in [("root",True,1073741824),("task",readonly,67108864),("assignment",True,16777216)]]
+table = {"qmp_capabilities":{},"query-cpus-fast":[{},{}],
+         "query-memory-size-summary":{"base-memory":2147483648},"query-rx-filter":[],
+         "query-pci":[],"human-monitor-command":"","query-block":blocks,"query-status":{"running":True}}
+for line in sys.stdin:
+    request = json.loads(line)
+    if request["execute"] == "system_powerdown":
+        emit({"return":{},"id":request["id"]})
+        emit({"event":"SHUTDOWN","data":{"guest":True,"reason":"guest-shutdown"}})
+        print("HERMES_HVF_VM_DESTROY_V1 pid=%d result=0 joined=2" % pid, file=sys.stderr, flush=True)
+        break
+    emit({"return":table[request["execute"]],"id":request["id"]})
+'''
+
+
+@contextmanager
+def q2_process_fixture():
+    """An inert stdio fixture, never QEMU/HVF or evidence of a Native VM."""
+    import subprocess
+    import sys
+    process = subprocess.Popen([sys.executable, '-c', _Q2_PROCESS_FIXTURE, 'developer'],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               start_new_session=True, bufsize=0)
+    try:
+        yield process
+    finally:
+        if process.poll() is None:
+            process.terminate()
+        process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('serial_complete', [True, False])
+def test_q2_process_observer_cannot_substitute_unobserved_serial_eof(tmp_path, serial_complete):
+    import time
+    import sys
+    from gateway.session_hvf_process import Q2ProcessObserver, child_identity
+    host, guest = socket.socketpair()
+    guest.sendall(b'UART must remain exclusively owned by SerialWire')
+    with q2_process_fixture() as process:
+        identity = child_identity(process, sys.executable)
+        observer = Q2ProcessObserver(process, identity, output=tmp_path / 'actual-stdio',
+                                    expected_devices={'root': True, 'task': False, 'assignment': True})
+        deadline = time.monotonic() + 5
+        try:
+            observer.start(deadline)
+            observer.pipes.request('system_powerdown', deadline=deadline)
+            fields = ('peer_eof', 'descriptor_closed', 'receive_pump_joined', 'writer_joined',
+                      'service_joined', 'http_joined', 'transport_joined', 'complete')
+            serial_facts = {field: serial_complete for field in fields}
+            serial_facts.update(serial_observer='ORIGINAL_OWNER_SERIALWIRE', cleanup_errors=[])
+            if serial_complete:
+                proof = observer.finish(deadline, lambda: serial_facts)
+                assert proof['exact_child_waited'] and proof['explicit_vm_destroy']
+                assert proof['serial_read_by_process_observer'] is False
+                assert set(proof['stdio_eof']) == {'stdout', 'stderr'}
+            else:
+                with pytest.raises(ValueError, match='owner_serial_unretired'):
+                    observer.finish(deadline, lambda: serial_facts)
+            assert host.recv(1024, socket.MSG_PEEK) == b'UART must remain exclusively owned by SerialWire'
+        finally:
+            observer.close()
+            host.close()
+            guest.close()
+
+
+def test_q2_runtime_inventory_refuses_writable_review_and_extra_devices():
+    from types import SimpleNamespace
+    from gateway.session_hvf_process import q2_inventory
+    blocks = [{'device': name, 'inserted': {'ro': readonly, 'image': {'virtual-size': 64}}}
+              for name, readonly in [('root', True), ('task', False), ('assignment', True)]]
+    values = {'query-cpus-fast': [{}, {}], 'query-memory-size-summary': {'base-memory': 2 * 1024**3},
+              'query-rx-filter': [], 'query-pci': [], 'human-monitor-command': '',
+              'query-block': blocks, 'query-status': {'running': True}}
+    pipes = SimpleNamespace(request=lambda name, args=None, deadline=None: values[name])
+    with pytest.raises(ValueError, match='block_inventory'):
+        q2_inventory(pipes, 0, {'root': True, 'task': True, 'assignment': True})
+    blocks.append({'device': 'unapproved', 'inserted': {'ro': True, 'image': {'virtual-size': 64}}})
+    with pytest.raises(ValueError, match='runtime_inventory'):
+        q2_inventory(pipes, 0, {'root': True, 'task': False, 'assignment': True})
+
+
+def test_serial_service_future_failure_does_not_skip_http_cleanup(owner):
+    from concurrent.futures import Future
+    from gateway.session_guest_inference import OwnerResponses, ResponsesPolicy
+    _authority, _row, _scope, endpoint = owner
+    adapter = OwnerResponses(endpoint, ResponsesPolicy('http://127.0.0.1:51837/v1/responses', 'fixed', 'fixture'),
+                             transport=httpx.MockTransport(lambda _request: httpx.Response(200)), headers={})
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, inference=adapter)
+    service = Future()
+    service.set_exception(RuntimeError('actual service failure fixture'))
+    server.bind_service(service)
+    try:
+        facts = server.close_transport()
+        assert facts['service_joined'] and facts['service_failure'] == 'actual service failure fixture'
+        assert server.wire.fd == -1 and adapter.closed and endpoint.revoked
+        assert facts['peer_eof'] is False and facts['complete'] is False
+    finally:
+        adapter.close()
+        server.wire.release_fd()
+        host.close()
+        guest.close()
+
+
+@pytest.mark.parametrize('damage', ['missing-destroy', 'wrong-pid', 'duplicate-create',
+                                    'failed-destroy', 'core-limit', 'sandbox-failed'])
+def test_q2_backend_evidence_requires_real_matching_complete_telemetry(damage):
+    """Telemetry grammar tests; these synthetic bytes do not qualify a real VM."""
+    from gateway.session_hvf_process import q2_markers
+    pid = 12345
+    rows = [f'HERMES_HVF_CORE_LIMIT_V1 pid={pid} current=0 maximum=0',
+            f'HERMES_HVF_VM_CREATE_V1 pid={pid} result=0',
+            'HERMES_Q2_SANDBOX_RESULT_V1 ' + json.dumps({'pid': pid, 'pass': True, 'vm_created': False}),
+            f'HERMES_HVF_VM_DESTROY_V1 pid={pid} result=0 joined=2']
+    assert q2_markers(('\n'.join(rows) + '\n').encode(), pid)['destroy_success']
+    mutations = {
+        'missing-destroy': lambda items: items.pop(),
+        'wrong-pid': lambda items: items.__setitem__(-1, items[-1].replace(str(pid), '98765')),
+        'duplicate-create': lambda items: items.append(items[1]),
+        'failed-destroy': lambda items: items.__setitem__(-1, items[-1].replace('result=0', 'result=1')),
+        'core-limit': lambda items: items.__setitem__(0, items[0].replace('maximum=0', 'maximum=1')),
+        'sandbox-failed': lambda items: items.__setitem__(2, items[2].replace('true', 'false')),
+    }
+    mutations[damage](rows)
+    with pytest.raises(ValueError, match='backend_or_sandbox_unverified'):
+        q2_markers(('\n'.join(rows) + '\n').encode(), pid)
+
+
+def test_q2_runtime_inventory_counts_all_attached_disk_bytes():
+    from types import SimpleNamespace
+    from gateway.session_hvf_process import q2_inventory
+    blocks = [{'device': name, 'inserted': {'ro': readonly, 'image': {'virtual-size': 4 * 1024**3}}}
+              for name, readonly in [('root', True), ('task', False), ('assignment', True)]]
+    values = {'query-cpus-fast': [{}, {}], 'query-memory-size-summary': {'base-memory': 2 * 1024**3},
+              'query-rx-filter': [], 'query-pci': [], 'human-monitor-command': '',
+              'query-block': blocks, 'query-status': {'running': True}}
+    pipes = SimpleNamespace(request=lambda name, args=None, deadline=None: values[name])
+    with pytest.raises(ValueError, match='disk_budget_exhausted'):
+        q2_inventory(pipes, 0, {'root': True, 'task': False, 'assignment': True})
+
+
+def test_cancelled_sole_reader_discards_late_frames_until_actual_peer_eof(owner):
+    import time
+    import select
+    authority, _row, scope, endpoint = owner
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                heartbeat_interval=90, heartbeat_lease=120)
+    host.close()
+    wire = SerialWire(guest.fileno(), scope)
+    drained, allow_shutdown = threading.Event(), threading.Event()
+    before = authority.db._read_one('SELECT count(*) FROM worker_receipts')[0]
+    with ThreadPoolExecutor(2) as pool:
+        def serve():
+            count = 0
+            while server.serve_one():
+                count += 1
+                if count == 2:
+                    drained.set()
+        service = pool.submit(serve)
+        server.bind_service(service)
+        def peer_waits_for_test_release():
+            assert allow_shutdown.wait(10)
+            guest.shutdown(socket.SHUT_WR)
+        peer = pool.submit(peer_waits_for_test_release)
+        try:
+            server.cancel()
+            assert wire.receive()['payload'] == {'type': 'stop'}
+            request = wire.send('persistence', 'request', {'method': 'worker.persist', 'params': {'operation': 'execution.finish'}})
+            wire.send('activity', 'event', {'type': 'result', 'result': 'must be discarded'})
+            assert drained.wait(5)
+            assert not service.done() and not server.peer_eof.is_set()
+            assert not server.result_ready.is_set() and not server.persisted_finish.is_set()
+            assert authority.db._read_one('SELECT count(*) FROM worker_receipts')[0] == before
+            assert select.select([wire.fd], [], [], 2)[0]
+            denial = wire.receive()
+            assert denial['kind'] == 'reply' and denial['reply_to'] == request
+            assert denial['payload'] == {'error': 'guest_channel_revoked'}
+            assert select.select([wire.fd], [], [], 2)[0] == []
+            assert server.physical_observation()['peer_eof'] is False
+            allow_shutdown.set()
+            peer.result(timeout=5)
+            service.result(timeout=5)
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+            assert facts['peer_eof'] and facts['complete'] and facts['service_joined']
+            assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+            assert not server.result_ready.is_set()
+        finally:
+            allow_shutdown.set()
+            wire.close()
+            wire.release_fd()
+            guest.close()
+            server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_deferred_heartbeat_preserves_first_frame_across_guest_uart_flush(owner):
+    import os
+    import pty
+    import select
+    import termios
+    import tty
+    _authority, _row, scope, endpoint = owner
+    master, slave = pty.openpty()
+    server = OwnerSerialSession(endpoint, master, endpoint.test_work,
+                                heartbeat_interval=5, heartbeat_lease=90, defer_heartbeat=True)
+    os.close(master)
+    wire = None
+    with ThreadPoolExecutor(1) as pool:
+        service = pool.submit(server.serve_one)
+        try:
+            assert server.wire.pump is None and server.wire.timeout == 60
+            assert select.select([slave], [], [], 2)[0] == []
+            assert server.wire.sent == 0 and server.wire.received == 0
+            tty.setraw(slave, when=termios.TCSAFLUSH)
+            wire = SerialWire(slave, scope)
+            request = wire.send('context', 'request', {'operation': 'assignment'})
+            frame = wire.receive()
+            assert frame['kind'] == 'reply' and frame['reply_to'] == request
+            assert frame['seq'] == 1 and frame['payload']['result']['assignment'] == scope
+            service.result(timeout=5)
+            assert server.wire.pump is not None and server.wire.timeout == 30
+            assert server.heartbeat_deferred is False
+        finally:
+            if wire is not None:
+                wire.close()
+                wire.release_fd()
+            os.close(slave)
+            server.wire.close()
+            server.wire.release_fd()
+
+
+@pytest.mark.parametrize('cancel_gap', ['during_inference', 'after_dispatch'])
+def test_cancelled_held_inference_emits_only_denial_after_stop(owner, monkeypatch, cancel_gap):
+    import select
+    _authority, _row, scope, endpoint = owner
+    entered, release = threading.Event(), threading.Event()
+    def held(_payload):
+        if cancel_gap == 'during_inference':
+            entered.set()
+            assert release.wait(5)
+        return {'events': []}
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, inference=held,
+                                heartbeat_interval=90, heartbeat_lease=120)
+    host.close()
+    wire = SerialWire(guest.fileno(), scope)
+    if cancel_gap == 'after_dispatch':
+        dispatch = server._dispatch
+        def paused_after_dispatch(channel, payload):
+            result = dispatch(channel, payload)
+            entered.set()
+            assert release.wait(5)
+            return result
+        monkeypatch.setattr(server, '_dispatch', paused_after_dispatch)
+    with ThreadPoolExecutor(1) as pool:
+        service = pool.submit(server.serve_one)
+        server.bind_service(service)
+        try:
+            request = wire.send('inference', 'request', {'input': 'public held inference fixture'})
+            assert entered.wait(5)
+            server.cancel()
+            assert wire.receive()['payload'] == {'type': 'stop'}
+            release.set()
+            service.result(timeout=5)
+            assert select.select([wire.fd], [], [], 2)[0]
+            denial = wire.receive()
+            assert denial['kind'] == 'reply' and denial['reply_to'] == request
+            assert denial['payload'] == {'error': 'guest_channel_revoked'}
+            assert select.select([wire.fd], [], [], 2)[0] == []
+            assert server.stop_sent.is_set() and server.unknown_persisted.is_set()
+            assert not server.result_ready.is_set()
+        finally:
+            release.set()
+            wire.close()
+            wire.release_fd()
+            guest.close()
+            server.close_transport()
+
+
+def test_real_owner_responses_cancel_unwinds_before_held_http_returns(owner):
+    from gateway.session_guest_inference import OwnerResponses, ResponsesPolicy
+    from hermes_state_runtime import RuntimeStoreError
+    from tests.gateway.test_guest_cockpit import response
+    _authority, _row, _scope, endpoint = owner
+    entered, release = threading.Event(), threading.Event()
+    def held(_request):
+        entered.set()
+        assert release.wait(5)
+        return response()
+    adapter = OwnerResponses(endpoint,
+        ResponsesPolicy('http://127.0.0.1:51837/v1/responses', 'fixed', 'public-cancellation-fixture'),
+        transport=httpx.MockTransport(held), headers={})
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, inference=adapter)
+    with ThreadPoolExecutor(1) as pool:
+        pending = pool.submit(server._dispatch, 'inference', {'input': 'public cancellation fixture'})
+        try:
+            assert entered.wait(2)
+            server.cancel()
+            with pytest.raises(RuntimeStoreError, match='unsettled'):
+                pending.result(timeout=2)
+            assert not release.is_set() and not adapter.pending.done()
+        finally:
+            release.set()
+            if adapter.pending is not None:
+                adapter.pending.result(timeout=3)
+            server.close_transport()
+            host.close()
+            guest.close()
+
+
+@pytest.mark.platforms('posix')
+def test_deferred_pre_ready_peer_eof_is_fact_without_fabricated_pump_or_retirement(owner):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True)
+    host.close()
+    peer.close()
+    try:
+        with pytest.raises(EOFError, match='serial_eof'):
+            server.serve_one()
+        facts = server.physical_observation()
+        assert facts['peer_eof'] is True
+        assert facts['peer_eof_at'] is not None
+        assert facts['receive_pump_started'] is False
+        assert facts['receive_pump_joined'] is False
+        assert facts['frames_received'] == 0 and facts['frames_sent'] == 0
+        assert facts['complete'] is False and not server.ready.is_set()
+    finally:
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+def boot_packet(scope, *, seq=1, stage=1, failed=0, error=0):
+    import json
+    import struct
+    from gateway.session_guest_serial import boot_scope_sha256
+    frame = {'boot': 1, 'errno': error, 'failed': failed, 'scope_sha256': boot_scope_sha256(scope),
+             'seq': seq, 'stage': stage}
+    raw = json.dumps(frame, sort_keys=True, separators=(',', ':')).encode()
+    return struct.pack('!I', len(raw)) + raw
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('prelude', [False, True])
+def test_real_socketpair_boot_prelude_keeps_first_rpc_sequence_one(owner, prelude):
+    import time
+    _authority, _row, scope, endpoint = owner
+    hints = []
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=hints.append)
+    host.close()
+    wire = SerialWire(guest.fileno(), scope)
+    before = _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0]
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(server.serve_one)
+        if prelude:
+            guest.sendall(boot_packet(scope) + boot_packet(scope, seq=2, stage=2))
+        assert wire.send('context', 'request', {'operation': 'assignment'}) == 1
+        reply = wire.receive()
+        assert reply['seq'] == reply['reply_to'] == 1 and reply['payload']['result'] == endpoint.test_work
+        future.result(timeout=5)
+    assert server.wire.received == server.wire.sent == 1
+    assert len(server.wire.boot_hints) == (2 if prelude else 0) and not server.ready.is_set()
+    assert hints == server.wire.boot_hints
+    assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == before
+    try:
+        assert not server.physical_observation()['complete']
+    finally:
+        wire.close(); wire.release_fd(); guest.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['scope', 'duplicate_key', 'extra_key', 'noncanonical', 'gap',
+                                  'stage_gap', 'failed_stage_gap', 'stage_zero', 'errno', 'oversized', 'partial', 'late'])
+def test_real_serial_reader_rejects_bad_boot_prelude_without_rpc_authority(damage):
+    import json
+    import struct
+    from gateway.session_guest_serial import BootSerialWire
+    scope = {'execution_id': 'private-disposable', 'epoch': 1}
+    host, peer = socket.socketpair()
+    hints = []
+    wire = BootSerialWire(host.fileno(), scope, hints.append)
+    host.close()
+    raw = boot_packet(scope)
+    frame = json.loads(raw[4:])
+    changes = {'scope': lambda: frame.update(scope_sha256='f' * 64),
+               'extra_key': lambda: frame.update(extra=1), 'gap': lambda: frame.update(seq=2),
+               'stage_gap': lambda: frame.update(stage=3),
+               'failed_stage_gap': lambda: frame.update(stage=14, failed=1, errno=13), 'stage_zero': lambda: frame.update(stage=0),
+               'errno': lambda: frame.update(errno=4096),
+               'oversized': lambda: frame.update(extra='x' * 200)}
+    if damage in changes:
+        changes[damage]()
+        data = json.dumps(frame, sort_keys=True, separators=(',', ':')).encode()
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'duplicate_key':
+        data = raw[4:-1] + b',"boot":1}'
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'noncanonical':
+        data = json.dumps(frame, sort_keys=True).encode()
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'partial':
+        raw = raw[:13]
+    if damage == 'late':
+        wire.boot_done = True
+    try:
+        peer.sendall(raw)
+        peer.shutdown(socket.SHUT_WR)
+        with pytest.raises((SerialError, EOFError)):
+            wire.receive()
+        assert wire.received == wire.sent == 0 and hints == [] and wire.failed
+    finally:
+        peer.close(); wire.close(); wire.release_fd()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('failed', [0, 1])
+def test_boot_hint_then_eof_or_failure_never_becomes_ready(owner, failed):
+    import time
+    _authority, _row, scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    peer.sendall(boot_packet(scope, failed=failed, error=13 if failed else 0))
+    peer.shutdown(socket.SHUT_WR)
+    try:
+        with pytest.raises((SerialError, EOFError)):
+            server.serve_one()
+        assert len(server.wire.boot_hints) == 1
+        assert not server.ready.is_set() and not server.result_ready.is_set()
+        assert server.wire.received == 0 and server.wire.pump is None
+        assert not server.physical_observation()['complete']
+        assert _authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+    finally:
+        peer.close(); server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_boot_frames_use_existing_service_reader_and_not_a_second_pump(owner):
+    import time
+    from gateway.session_guest_serial import BootSerialWire
+    _authority, _row, scope, endpoint = owner
+    seen = threading.Event()
+    threads = []
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    original = server.wire.on_boot
+
+    def same_reader(frame):
+        assert server.wire.pump is None
+        threads.append(threading.get_ident())
+        original(frame)
+        seen.set()
+
+    server.wire.on_boot = same_reader
+    guest = SerialWire(peer.fileno(), scope)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            peer.sendall(boot_packet(scope))
+            assert seen.wait(5) and not future.done() and server.wire.pump is None
+            peer.sendall(boot_packet(scope, seq=2, stage=2))
+            guest.send('context', 'request', {'operation': 'assignment'})
+            guest.receive()
+            future.result(timeout=5)
+        assert type(server.wire) is BootSerialWire and len(set(threads)) == 1 and len(threads) == 2
+        assert server.wire.pump is not None
+    finally:
+        guest.close(); guest.release_fd(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_first_v2_heartbeat_after_boot_is_still_sequence_one(owner):
+    import time
+    _authority, _row, scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    guest = SerialWire(peer.fileno(), scope)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            peer.sendall(boot_packet(scope))
+            assert guest.send('lifecycle', 'heartbeat', {'ping': 1}) == 1
+            ack = guest.receive()
+            assert ack['seq'] == 1 and ack['payload'] == {'ack': 1}
+            assert guest.send('context', 'request', {'operation': 'assignment'}) == 2
+            assert guest.receive()['reply_to'] == 2
+            future.result(timeout=5)
+        assert server.wire.received == server.wire.sent == 2 and len(server.wire.boot_hints) == 1
+        assert not server.ready.is_set()
+    finally:
+        guest.close(); guest.release_fd(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('bound', [False, True])
+def test_pre_ready_eof_never_started_reader_has_explicit_quiescent_evidence(owner, bound):
+    import time
+    from hermes_state_runtime import RuntimeStoreError
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            if bound:
+                server.bind_service(future)
+            peer.close()
+            with pytest.raises((EOFError, RuntimeStoreError)):
+                future.result(timeout=5)
+            unobserved = server.physical_observation()
+            assert not unobserved['service_joined'] and not unobserved['synchronous_reader_quiescent']
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+        assert facts['complete'] is bound
+        assert facts['receive_pump_state'] == 'NOT_STARTED'
+        assert facts['receive_pump_started'] is False and facts['receive_pump_joined'] is False
+        assert facts['service_joined'] is bound and facts['synchronous_reader_quiescent'] is bound
+        assert facts['peer_eof'] and facts['descriptor_closed'] and facts['complete'] is bound
+        assert not facts['ready'] and not facts['logical_finished']
+        assert _authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+    finally:
+        peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_pre_ready_owner_close_does_not_invent_peer_eof_or_reader_join(owner, monkeypatch):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    entered, release = threading.Event(), threading.Event()
+    receive = server._receive
+
+    def held_receive():
+        entered.set()
+        assert release.wait(5)
+        return receive()
+
+    monkeypatch.setattr(server, '_receive', held_receive)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            server.bind_service(future)
+            assert entered.wait(5)
+            pending = server.physical_observation()
+            assert pending['receive_pump_state'] == 'NOT_STARTED'
+            assert not pending['synchronous_reader_quiescent'] and not pending['service_joined']
+            assert not pending['complete']
+            server.wire.close()  # local cancellation is not a peer EOF observation
+            release.set()
+            with pytest.raises(EOFError, match='serial_closed'):
+                future.result(timeout=5)
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+        assert facts['receive_pump_joined'] is False and facts['synchronous_reader_quiescent']
+        assert facts['service_joined'] and facts['descriptor_closed']
+        assert facts['peer_eof'] is False and facts['complete'] is False
+    finally:
+        release.set(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.parametrize('damage', ['state', 'started', 'joined', 'synchronous', 'service', 'fd'])
+def test_never_started_reader_requires_every_original_owner_quiescence_fact(damage):
+    from gateway.session_guest_serial import serial_reader_quiescent
+    facts = dict(receive_pump_joined=False, receive_pump_started=False, receive_pump_state='NOT_STARTED',
+                 synchronous_reader_quiescent=True, service_joined=True, descriptor_closed=True)
+    assert serial_reader_quiescent(facts)
+    changes = {'state': ('receive_pump_state', 'STARTED_NOT_JOINED'),
+               'started': ('receive_pump_started', True), 'joined': ('receive_pump_joined', True),
+               'synchronous': ('synchronous_reader_quiescent', False),
+               'service': ('service_joined', False), 'fd': ('descriptor_closed', False)}
+    key, value = changes[damage]
+    facts[key] = value
+    assert not serial_reader_quiescent(facts)
+
+
+@pytest.mark.platforms('posix')
+def test_local_shutdown_racing_a_read_zero_cannot_become_peer_eof_proof(owner, monkeypatch):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    entered, shutdown_done = threading.Event(), threading.Event()
+    close_io = server._close_io
+
+    def read_after_local_shutdown():
+        entered.set()
+        assert shutdown_done.wait(5)
+        # An in-flight read may return zero after our own SHUT_RDWR. That
+        # exception is not independent evidence of the peer closing its end.
+        raise EOFError('serial_eof')
+
+    def shutdown_and_release_read():
+        close_io()  # actual socket shutdown and original descriptor close
+        shutdown_done.set()
+
+    monkeypatch.setattr(server, '_receive', read_after_local_shutdown)
+    monkeypatch.setattr(server, '_close_io', shutdown_and_release_read)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            server.bind_service(future)
+            assert entered.wait(5)
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+            with pytest.raises(EOFError, match='serial_eof'):
+                future.result(timeout=5)
+        assert facts['synchronous_reader_quiescent'] and facts['service_joined']
+        assert facts['receive_pump_state'] == 'NOT_STARTED' and not facts['receive_pump_joined']
+        assert facts['descriptor_closed'] and not facts['peer_eof'] and not facts['complete']
+    finally:
+        shutdown_done.set(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)

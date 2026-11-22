@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import subprocess
 import time
 
 import psutil
@@ -370,3 +371,190 @@ def _wait_for_child(handle, timeout):
     code = handle.process.wait(timeout=timeout)
     handle.pipe_observation.update(wait_result='REAPED_BY_ORIGINAL_OWNER', wait_returncode=code)
     return code
+
+
+def q2_inventory(pipes, deadline, expected_devices):
+    """Q2 has three explicit block capabilities and no network device."""
+    get = lambda name, args=None: pipes.request(name, args, deadline=deadline)
+    result = {'cpus': get('query-cpus-fast'), 'memory': get('query-memory-size-summary'),
+              'rx_filters': get('query-rx-filter'), 'pci': get('query-pci'),
+              'network': get('human-monitor-command', {'command-line': 'info network'}),
+              'blocks': get('query-block'), 'status': get('query-status')}
+    blocks = {row.get('device'): row.get('inserted', {}) for row in result['blocks']}
+    if (len(result['cpus']) != 2 or result['memory'].get('base-memory') != 2 * 1024**3
+            or result['rx_filters'] != [] or result['network'].strip() or _network_class(result['pci'])
+            or len(result['blocks']) != 3 or set(blocks) != set(expected_devices)
+            or result['status'].get('running') is not True):
+        raise RuntimeStoreError('q2_runtime_inventory_mismatch')
+    total = 0
+    for name, readonly in expected_devices.items():
+        info = blocks[name]
+        size = info.get('image', {}).get('virtual-size')
+        if (type(readonly) is not bool or info.get('ro') is not readonly
+                or type(size) is not int or not 0 < size <= 8 * 1024**3):
+            raise RuntimeStoreError('q2_block_inventory_mismatch')
+        total += size
+    if total > 8 * 1024**3:
+        raise RuntimeStoreError('q2_disk_budget_exhausted')
+    return result
+
+
+def q2_markers(stderr, pid):
+    """Only original Helper API telemetry proves normal HVF creation/destroy."""
+    text = stderr.decode('utf-8', errors='strict')
+    created = re.findall(r'^HERMES_HVF_VM_CREATE_V1 pid=(\d+) result=(-?\d+)$', text, re.MULTILINE)
+    core = re.findall(r'^HERMES_HVF_CORE_LIMIT_V1 pid=(\d+) current=0 maximum=0$', text, re.MULTILINE)
+    destroyed = re.findall(r'^HERMES_HVF_VM_DESTROY_V1 pid=(\d+) result=(-?\d+) joined=(\d+)$', text, re.MULTILINE)
+    prefix = 'HERMES_Q2_SANDBOX_RESULT_V1 '
+    sandbox = [json.loads(line[len(prefix):]) for line in text.splitlines() if line.startswith(prefix)]
+    if (created != [(str(pid), '0')] or core != [str(pid)] or destroyed != [(str(pid), '0', '2')]
+            or len(sandbox) != 1 or sandbox[0].get('pid') != pid
+            or sandbox[0].get('pass') is not True or sandbox[0].get('vm_created') is not False):
+        raise RuntimeStoreError('q2_backend_or_sandbox_unverified')
+    return {'vm_create_successes': 1, 'core_limit_zero': True, 'sandbox': sandbox[0],
+            'explicit_vm_destroy': True, 'destroy_success': True}
+
+
+class Q2ProcessObserver:
+    """The original Owner's QMP/stdio observer; it has no serial descriptor.
+
+    Q1 ChildPipes' serial=None means NOT_OBSERVED here. A separate actual Owner
+    SerialWire observation is mandatory before any all-pipes-complete claim.
+    """
+
+    def __init__(self, process, identity, *, output, expected_devices, observation=None):
+        if (set(expected_devices) != {'root', 'task', 'assignment'}
+                or expected_devices['root'] is not True or expected_devices['assignment'] is not True
+                or type(expected_devices['task']) is not bool):
+            raise RuntimeStoreError('q2_exact_block_inventory_required')
+        self.process, self.identity = process, dict(identity)
+        self.output = Path(output)
+        self.expected_devices = dict(expected_devices)
+        self.observation = observation if observation is not None else {}
+        self.pipes = ChildPipes(process, observation=self.observation)
+        self.pipes.eof.pop('serial')
+        self.actual = None
+
+    def _exited(self, identity, code):
+        self.observation['exact_child_exit'] = {
+            'identity': dict(identity), 'returncode': code,
+            'exit_code': code if code >= 0 else None,
+            'terminating_signal': -code if code < 0 else None,
+            'identity_source': 'PREVIOUSLY_VERIFIED_ORIGINAL_CHILD',
+        }
+        return False
+
+    def check_child(self, *, deadline=None):
+        """Natural exit is distinct from live identity ambiguity; neither retires."""
+        historical = getattr(self.process, '_q2_verified_identity', None)
+        try:
+            actual = child_identity(self.process, self.identity['executable'])
+        except (ProcessLookupError, psutil.NoSuchProcess) as error:
+            code = self.process.poll()
+            matches = historical == self.identity and self.process.pid == self.identity['pid']
+            classification = ('UNVERIFIED_HISTORY' if not matches else
+                              'EXIT_NOT_YET_OBSERVED' if code is None else 'EXACT_CHILD_EXIT')
+            lookup = {'historical_identity': dict(historical) if isinstance(historical, dict) else None,
+                      'expected_identity': dict(self.identity), 'historical_identity_matches': matches,
+                      'poll_returncode': code, 'lookup_exception': type(error).__name__,
+                      'observed_monotonic': time.monotonic(), 'classification': classification}
+            self.observation['identity_lookup_failure'] = lookup
+            if matches and code is None:
+                # The kernel may remove the process before Popen's nonblocking
+                # poll observes exit. Wait only on this already-owned child;
+                # never signal, look up another PID or replace the birth identity.
+                remaining = 0.25 if deadline is None else min(0.25, max(0, deadline - time.monotonic()))
+                wait = {'timeout_seconds': remaining, 'started_monotonic': time.monotonic()}
+                lookup['bounded_exact_child_wait'] = wait
+                try:
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired('owned-child', remaining)
+                    code = self.process.wait(timeout=remaining)
+                except (subprocess.TimeoutExpired, ChildProcessError, OSError) as failure:
+                    wait.update(result='UNKNOWN', exception=type(failure).__name__,
+                                finished_monotonic=time.monotonic())
+                else:
+                    wait.update(result='REAPED_BY_ORIGINAL_OWNER', returncode=code,
+                                finished_monotonic=time.monotonic())
+            if not matches or code is None:
+                raise RuntimeStoreError('q2_child_identity_unavailable', detail=json.dumps(lookup)) from error
+            return self._exited(historical, code)
+        if actual != self.identity:
+            raise RuntimeStoreError('q2_child_identity_changed')
+        self.process._q2_verified_identity = dict(actual)
+        code = self.process.poll()
+        return True if code is None else self._exited(actual, code)
+
+    def start(self, deadline):
+        if not self.check_child(deadline=deadline):
+            raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
+        self.pipes.until(lambda: self.pipes.greeting is not None, deadline)
+        self.pipes.request('qmp_capabilities', deadline=deadline)
+        self.actual = q2_inventory(self.pipes, deadline, self.expected_devices)
+        if not self.check_child(deadline=deadline):
+            raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
+        if group_members(self.identity['pgid']) != (self.process.pid,):
+            if not self.check_child(deadline=deadline):
+                raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
+            raise RuntimeStoreError('q2_unapproved_descendant')
+        return self.actual
+
+    def poll(self, deadline):
+        if self.check_child(deadline=deadline):
+            members = group_members(self.identity['pgid'])
+            if members != (self.process.pid,) and self.check_child(deadline=deadline):
+                raise RuntimeStoreError('q2_unapproved_descendant')
+            self.observation['last_observed_group_members'] = list(members)
+        return self.pipes.pump(deadline)
+
+    def finish(self, deadline, serial_observation):
+        code = self.pipes.drain_and_wait(deadline, close_input=False)
+        members = group_members(self.identity['pgid'])
+        if code != 0 or members or not guest_shutdown_seen(self.pipes):
+            raise RuntimeStoreError('q2_exit_or_shutdown_unverified')
+        backend = q2_markers(self.pipes.buffers['stderr'], self.process.pid)
+        serial = serial_observation() if callable(serial_observation) else serial_observation
+        from gateway.session_guest_serial import serial_reader_quiescent
+        fields = ('peer_eof', 'descriptor_closed', 'writer_joined',
+                  'service_joined', 'http_joined', 'transport_joined', 'complete')
+        if (not isinstance(serial, dict) or serial.get('serial_observer') != 'ORIGINAL_OWNER_SERIALWIRE'
+                or any(serial.get(field) is not True for field in fields) or not serial_reader_quiescent(serial)
+                or serial.get('cleanup_errors') != []):
+            raise RuntimeStoreError('q2_owner_serial_unretired')
+        pipes = {name: {'closed': getattr(self.process, name).closed} for name in ('stdin', 'stdout', 'stderr')}
+        return {**backend, 'identity': dict(self.identity), 'pid': self.process.pid,
+                'exit_code': code, 'returncode': code, 'terminating_signal': None,
+                'exact_child_waited': True, 'wait_result': self.observation['wait_result'],
+                'process_group_empty': True, 'process_group_members': list(members),
+                'guest_orderly_shutdown': True, 'runtime_inventory': self.actual,
+                'stdio_eof': dict(self.pipes.eof), 'pipes': pipes,
+                'all_pipes_closed': all(value['closed'] for value in pipes.values()),
+                'serial_observation': serial, 'serial_read_by_process_observer': False,
+                'backend_ownership': 'APPLE_PROCESS_OWNED_HYPERVISOR_CONTRACT'}
+
+    def close(self):
+        self.output.mkdir(parents=True, exist_ok=True)
+        try:
+            for name in ('stdout', 'stderr'):
+                with (self.output / (name + '.log')).open('xb') as stream:
+                    stream.write(self.pipes.buffers[name])
+        finally:
+            self.observation['eof'] = dict(self.pipes.eof)
+            self.observation['serial'] = 'NOT_OBSERVED_BY_PROCESS_OBSERVER'
+            self.pipes.close()
+
+
+def observe_q2_child(process, identity, stop, output, started, deadline, serial_observation,
+                     *, expected_devices=None, observation=None):
+    """Observe an already acquired original-Owner child; never spawn or own UART."""
+    devices = {'root': True, 'task': False, 'assignment': True} if expected_devices is None else expected_devices
+    observer = Q2ProcessObserver(process, identity, output=output, expected_devices=devices, observation=observation)
+    try:
+        observer.start(min(started + 60, deadline))
+        while observer.pipes.selector.get_map():
+            if stop.is_set():
+                deadline = min(deadline, time.monotonic() + 30)
+            observer.poll(deadline)
+        return observer.finish(deadline, serial_observation)
+    finally:
+        observer.close()

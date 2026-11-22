@@ -1,0 +1,1173 @@
+"""Actual ext4/FD contracts for Q2 qualification; no VM or Worker is started."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import socket
+import subprocess
+
+import pytest
+
+from native.qemu_guest.artifact_fs import ext4
+from native.qemu_guest.artifact_inventory import file_record
+from native.qemu_guest.build_artifacts import MKE2FS_CONFIG
+from native.qemu_guest.build_inputs import canonical
+from native.qemu_guest.image_contract import GuestImage
+from native.qemu_guest.qualification_artifacts import (
+    freeze_candidate, load_candidate, prepare_slot_devices, slot_image, verify_slot_devices,
+)
+
+
+def git(root, *args):
+    env = {'PATH': '/usr/bin:/bin', 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+           'GIT_AUTHOR_NAME': 'Qualification fixture', 'GIT_AUTHOR_EMAIL': 'fixture@example.invalid',
+           'GIT_COMMITTER_NAME': 'Qualification fixture', 'GIT_COMMITTER_EMAIL': 'fixture@example.invalid'}
+    return subprocess.check_output(['git', '-C', str(root), '-c', 'core.hooksPath=/dev/null',
+                                    '-c', 'commit.gpgsign=false', *args],
+                                   env=env, text=True, timeout=10).strip()
+
+
+@pytest.fixture(autouse=True)
+def private_readonly_test_cleanup(tmp_path):
+    yield
+    for path in sorted(tmp_path.rglob('*'), key=lambda p: len(p.parts)):
+        if not path.is_symlink():
+            path.chmod(0o700 if path.is_dir() else 0o600)
+
+
+@pytest.fixture
+def repository(tmp_path):
+    root = tmp_path / 'source'
+    root.mkdir()
+    git(root, 'init', '-q', '--template=')
+    (root / 'base.txt').write_text('accepted base\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'base')
+    return root, git(root, 'rev-parse', 'HEAD')
+
+
+@pytest.fixture
+def ext4_tools(tmp_path):
+    pytest.importorskip('dissect.extfs')
+    from hermes_platform.resolver import locate_command
+    command = locate_command('mke2fs').command
+    if not command:
+        pytest.skip('pinned external ext4 tool not installed')
+    config = tmp_path / 'mke2fs.conf'
+    config.write_text(MKE2FS_CONFIG)
+    return Path(command[0]), config
+
+
+def image_tree(tree, path, tools, label):
+    tool, config = tools
+    ext4(tree, path, label=label, mib=64, tool=tool, config=config, owner=1000)
+    return path
+
+
+def candidate_disk(repository, tmp_path, ext4_tools, *, commit=True):
+    root, base = repository
+    (root / 'qualification').mkdir()
+    (root / 'qualification/result.txt').write_bytes(b'actual Guest candidate\n')
+    if commit:
+        git(root, 'add', '.')
+        git(root, 'commit', '-qm', 'actual candidate')
+    head = git(root, 'rev-parse', 'HEAD')
+    disk = image_tree(root, tmp_path / 'actual-task.raw', ext4_tools, 'Q2ACTUAL')
+    return disk, base, head
+
+
+def work(head, role='developer', slot=1):
+    scope = {'session_id': f'qualification-{slot}', 'generation': 1, 'epoch': slot,
+             'execution_id': f'admission-worker:qualification-{slot}', 'task_id': f'task-{slot}',
+             'run_id': slot, 'vm_id': f'vm-{slot}', 'connection_generation': 1,
+             'image_digest': 'a' * 64, 'policy_digest': 'b' * 64}
+    return {'version': 'HERMES_GUEST_WORK_V1', 'assignment': scope, 'title': 'Disposable qualification',
+            'body': 'Public fixture only', 'repo': 'offline/qualification', 'base_commit': head,
+            'branch': 'task/guest', 'workspace': '/task', 'role': role, 'model': 'fixed-fake',
+            'completion_contract': 'qualification only'}
+
+
+def inert_image(tmp_path, role='developer'):
+    files = {}
+    for name in ('kernel', 'initramfs', 'root', 'task', 'assignment'):
+        path = tmp_path / (name + '.raw')
+        path.write_bytes(('inert-' + name).encode())
+        files[name] = path
+    manifests = {name: {'path': str(path), 'sha256': file_record(path)['sha256'],
+                       'st_dev': path.stat().st_dev, 'st_ino': path.stat().st_ino,
+                       'readonly': name != 'task' or role == 'reviewer'}
+                 for name, path in files.items() if name in ('root', 'task', 'assignment')}
+    manifest = {'role': role, 'workspace': {'kind': 'directory_snapshot', 'mount': '/task',
+                'head': 'a' * 40, 'role': role, 'readonly': role == 'reviewer', 'host_share': False},
+                'devices': manifests}
+    return GuestImage(**files, role=role, sha256={str(p): file_record(p)['sha256'] for p in files.values()},
+                      manifest_json=canonical(manifest).rstrip('\n'))
+
+
+@pytest.mark.platforms('posix')
+def test_preopened_devices_use_fdsets_and_exact_access_modes(tmp_path):
+    import fcntl
+    image = inert_image(tmp_path)
+    serial, peer = socket.socketpair()
+    with image.open_devices() as devices, serial, peer:
+        descriptors = devices.descriptors()
+        assert set(descriptors) == {'root', 'task', 'assignment'}
+        assert set(devices.fds) == {'root', 'task', 'assignment', 'task_ro'}
+        assert descriptors['task']['ro_fd'] == devices.fds['task_ro']
+        for name, fd in devices.fds.items():
+            assert (fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) == (os.O_RDWR if name == 'task' else os.O_RDONLY)
+        os.lseek(devices.fds['task'], 3, os.SEEK_SET)
+        args = devices.device_args(serial.fileno())
+        assert os.lseek(devices.fds['task'], 0, os.SEEK_CUR) == 3
+        assert args.count('-add-fd') == 4
+        assert 'file=/dev/fdset/2,format=raw,if=none,id=task,readonly=off' in args
+        assert str(image.task) not in args
+        assert 'file=/dev/fdset/1,format=raw,if=none,id=root,readonly=on' in args
+        assert 'file=/dev/fdset/3,format=raw,if=none,id=assignment,readonly=on' in args
+        assert args[args.index('-nic') + 1] == 'none'
+        from native.qemu_guest.qualification_package import qemu_argv
+        projected = qemu_argv(image.kernel.parent, descriptors, serial.fileno(), image.role)
+        assert args[args.index('-add-fd'):] == projected[projected.index('-add-fd'):]
+        assert f'fd={devices.fds["task_ro"]},set=2' in args
+        before = devices.pass_fds
+    assert devices.closed
+    for fd in before:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.platforms('posix')
+def test_reviewer_task_capability_is_kernel_readonly(tmp_path):
+    image = inert_image(tmp_path, 'reviewer')
+    with image.open_devices() as devices:
+        with pytest.raises(OSError):
+            os.pwrite(devices.fds['task'], b'bad', 0)
+        assert devices.descriptors()['task']['readonly'] is True
+        assert set(devices.fds) == {'root', 'task', 'assignment'}
+        assert 'ro_fd' not in devices.descriptors()['task']
+        devices.verify()
+        serial, peer = socket.socketpair()
+        with serial, peer:
+            args = devices.device_args(serial.fileno())
+        assert 'file=/dev/fdset/2,format=raw,if=none,id=task,readonly=on' in args
+        assert args.count('-add-fd') == 3
+
+
+@pytest.mark.platforms('posix')
+def test_developer_task_two_independent_handles_have_real_kernel_permissions(tmp_path):
+    import errno
+    import fcntl
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        assert 'task_ro' in devices.fds
+        rw, ro = devices.fds['task'], devices.fds['task_ro']
+        assert rw != ro
+        assert (os.fstat(rw).st_dev, os.fstat(rw).st_ino, os.fstat(rw).st_size) == (
+            os.fstat(ro).st_dev, os.fstat(ro).st_ino, os.fstat(ro).st_size)
+        assert fcntl.fcntl(ro, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        assert not os.get_inheritable(ro) and not os.get_inheritable(rw)
+        os.lseek(rw, 3, os.SEEK_SET)
+        assert os.lseek(ro, 0, os.SEEK_CUR) == 0
+        devices.verify()
+        assert os.lseek(rw, 0, os.SEEK_CUR) == 3
+        with pytest.raises(OSError) as refused:
+            os.pwrite(ro, b'x', 0)
+        assert refused.value.errno == errno.EBADF
+        assert os.pwrite(rw, os.pread(rw, 1, 0), 0) == 1
+        inherited = devices.pass_fds
+        assert len(inherited) == 4 and ro in inherited and rw in inherited
+    for fd in inherited:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['missing', 'alias', 'writable', 'inode', 'size'])
+def test_developer_readonly_handle_rejects_changed_capability(tmp_path, damage):
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        original = devices.fds['task_ro']
+        saved_identity = devices.identities['task_ro']
+        foreign = tmp_path / 'foreign'
+        foreign.write_bytes(image.task.read_bytes())
+        replacement = os.open(image.task if damage == 'writable' else foreign,
+                              os.O_RDWR if damage == 'writable' else os.O_RDONLY)
+        try:
+            identity = list(saved_identity)
+            identity[2] += 1
+            operations = {
+                'missing': lambda: devices.fds.pop('task_ro'),
+                'alias': lambda: devices.fds.update(task_ro=devices.fds['task']),
+                'size': lambda: devices.identities.update(task_ro=tuple(identity)),
+                'writable': lambda: devices.fds.update(task_ro=replacement),
+                'inode': lambda: devices.fds.update(task_ro=replacement),
+            }
+            operations[damage]()
+            with pytest.raises(ValueError):
+                devices.verify()
+        finally:
+            devices.fds['task_ro'] = original
+            devices.identities['task_ro'] = saved_identity
+            os.close(replacement)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['content', 'rename', 'hardlink', 'symlink'])
+def test_open_capability_refuses_replaced_or_changed_device(tmp_path, damage):
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        task = image.task
+        if damage == 'content':
+            os.pwrite(devices.fds['task'], b'changed', 0)
+        elif damage == 'hardlink':
+            os.link(task, tmp_path / 'alias')
+        else:
+            task.rename(tmp_path / 'previous')
+            if damage == 'rename':
+                task.write_bytes(b'new')
+            else:
+                task.symlink_to(tmp_path / 'previous')
+        with pytest.raises(ValueError):
+            devices.verify()
+
+
+@pytest.mark.platforms('posix')
+def test_fd_argv_refuses_device_as_serial(tmp_path):
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        with pytest.raises(ValueError, match='serial'):
+            devices.device_args(devices.fds['task'])
+
+
+@pytest.mark.platforms('posix')
+def test_actual_candidate_preserves_commit_and_reviewer_uses_actual_output(repository, tmp_path, ext4_tools):
+    disk, base, head = candidate_disk(repository, tmp_path, ext4_tools)
+    prior = file_record(disk)
+    candidate = freeze_candidate(disk, tmp_path / 'frozen', expected_base=base,
+                                 expected_head=head, required_files={'qualification/result.txt': b'actual Guest candidate\n'})
+    assert candidate['candidate_head'] == head and head != base
+    assert file_record(disk) == prior
+    assert load_candidate(candidate['manifest_path']) == candidate
+    result = prepare_slot_devices(work(head, 'reviewer', 2), candidate['snapshot_path'], tmp_path / 'reviewer',
+                                  mke2fs=ext4_tools[0], parent_candidate=candidate['manifest_path'])
+    assert result['head'] == head
+    assert result['parent_candidate_sha256'] == candidate['manifest_sha256']
+    assert result['workspace']['readonly'] is True
+    assert result['task']['st_ino'] != prior['st_ino']
+    from dissect.extfs import ExtFS
+    with Path(result['task']['path']).open('rb') as stream:
+        fs = ExtFS(stream)
+        assert fs.get('/qualification/result.txt').open().read() == b'actual Guest candidate\n'
+    assert git(Path(result['task']['path']).parent / 'task-tree', 'rev-parse', 'HEAD') == head
+    assert git(Path(result['task']['path']).parent / 'task-tree', 'rev-parse', '--path-format=absolute', '--git-common-dir') != str(Path(candidate['snapshot_path']) / '.git')
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_refuses_unchanged_base_and_uncommitted_disk(repository, tmp_path, ext4_tools):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools, commit=False)
+    with pytest.raises(ValueError, match='actual_candidate'):
+        freeze_candidate(disk, tmp_path / 'unchanged', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_refuses_dirty_contents_even_with_real_candidate_commit(repository, tmp_path, ext4_tools):
+    root, base = repository
+    (root / 'result.txt').write_text('committed\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    (root / 'result.txt').write_text('dirty post-commit\n')
+    disk = image_tree(root, tmp_path / 'dirty.raw', ext4_tools, 'Q2DIRTY')
+    with pytest.raises(ValueError, match='worktree_not_committed'):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('kind', ['symlink', 'hardlink'])
+def test_candidate_refuses_image_alias_before_read(repository, tmp_path, ext4_tools, kind):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools)
+    alias = tmp_path / 'alias.raw'
+    if kind == 'symlink':
+        alias.symlink_to(disk)
+    else:
+        os.link(disk, alias)
+    with pytest.raises(ValueError, match='single_link'):
+        freeze_candidate(alias, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_refuses_untrusted_git_config_change_after_freeze(repository, tmp_path, ext4_tools):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools)
+    record = freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+    config = Path(record['snapshot_path']) / '.git/config'
+    config.chmod(0o600)
+    config.write_text('[core]\nfsmonitor = not-an-executable-test-fixture\n')
+    with pytest.raises(ValueError, match='snapshot_changed'):
+        load_candidate(record['manifest_path'])
+
+
+@pytest.mark.platforms('posix')
+def test_developer_devices_are_fresh_and_scope_bound(repository, tmp_path, ext4_tools):
+    root, base = repository
+    one = prepare_slot_devices(work(base), root, tmp_path / 'slot-one', mke2fs=ext4_tools[0])
+    two = prepare_slot_devices(work(base, slot=3), root, tmp_path / 'slot-three', mke2fs=ext4_tools[0])
+    assert one['task_fs']['uuid'] != two['task_fs']['uuid']
+    assert one['task']['st_ino'] != two['task']['st_ino']
+    assert one['assignment']['sha256'] != two['assignment']['sha256']
+    assert verify_slot_devices(one['manifest_path']) == one
+    assert one['workspace']['readonly'] is False
+
+
+@pytest.mark.platforms('posix')
+def test_reviewer_rejects_base_fixture_substitution(repository, tmp_path, ext4_tools):
+    disk, base, head = candidate_disk(repository, tmp_path, ext4_tools)
+    candidate = freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+    with pytest.raises(ValueError, match='candidate_mismatch'):
+        prepare_slot_devices(work(head, 'reviewer', 2), repository[0], tmp_path / 'wrong',
+                             mke2fs=ext4_tools[0], parent_candidate=candidate['manifest_path'])
+    assert not (tmp_path / 'wrong').exists()
+
+
+@pytest.mark.platforms('posix')
+def test_slot_image_binds_real_assignment_and_missing_corruption_refuses(repository, tmp_path, ext4_tools):
+    root, base = repository
+    record = prepare_slot_devices(work(base), root, tmp_path / 'slot', mke2fs=ext4_tools[0])
+    boot = []
+    for name in ('kernel', 'initramfs', 'root'):
+        path = tmp_path / name
+        path.write_bytes(name.encode())
+        boot.append(path)
+    image = slot_image(record, kernel=boot[0], initramfs=boot[1], root=boot[2])
+    image.verify()
+    Path(record['assignment']['path']).write_bytes(b'corrupt')
+    with pytest.raises(ValueError, match='device_changed'):
+        verify_slot_devices(record['manifest_path'])
+    with pytest.raises(ValueError):
+        image.open_devices()
+
+
+@pytest.mark.platforms('posix')
+def test_slot_build_rejects_tool_and_nested_source_before_export(repository, tmp_path, ext4_tools):
+    root, base = repository
+    with pytest.raises(ValueError, match='private_output'):
+        prepare_slot_devices(work(base), root, root / 'nested', mke2fs=ext4_tools[0])
+    assert not (root / 'nested').exists()
+    fake = tmp_path / 'not-pinned'
+    fake.write_text('#!/bin/sh\n: > "$0.called"\nexit 0\n')
+    fake.chmod(0o700)
+    with pytest.raises(ValueError, match='tool_changed'):
+        prepare_slot_devices(work(base), root, tmp_path / 'wrong-tool', mke2fs=fake)
+    assert not fake.with_name(fake.name + '.called').exists()
+
+
+@pytest.mark.platforms('posix')
+def test_close_never_closes_a_reused_descriptor(tmp_path):
+    image = inert_image(tmp_path)
+    devices = image.open_devices()
+    number = devices.fds['task']
+    replacement = tmp_path / 'foreign-owned'
+    replacement.write_bytes(b'foreign')
+    foreign = os.open(replacement, os.O_RDONLY)
+    try:
+        os.dup2(foreign, number)
+        with pytest.raises(ValueError, match='capability_close_incomplete'):
+            devices.close()
+        assert os.pread(number, 7, 0) == b'foreign'
+        assert not devices.closed
+    finally:
+        os.close(foreign)
+        os.close(number)
+        devices.fds.clear()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('kind', ['symlink', 'hardlink', 'untracked'])
+def test_stopped_disk_refuses_non_private_or_uncommitted_entries(repository, tmp_path, ext4_tools, kind):
+    root, base = repository
+    (root / 'candidate.txt').write_text('candidate\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    if kind == 'symlink':
+        (root / 'unsafe').symlink_to('/outside')
+    elif kind == 'hardlink':
+        os.link(root / 'candidate.txt', root / 'unsafe')
+    else:
+        (root / 'untracked').write_text('not committed\n')
+    image = image_tree(root, tmp_path / 'bad.raw', ext4_tools, 'Q2UNSAFE')
+    with pytest.raises(ValueError, match='candidate_file_invalid|worktree_not_committed'):
+        freeze_candidate(image, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_parent_raw_digest_is_immutable(repository, tmp_path, ext4_tools):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools)
+    record = freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+    with disk.open('r+b') as stream:
+        stream.write(b'modified')
+    with pytest.raises(ValueError, match='disk_changed'):
+        load_candidate(record['manifest_path'])
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_secret_inventory_refuses_tracked_host_config(repository, tmp_path, ext4_tools):
+    root, base = repository
+    (root / '.env').write_text('PUBLIC_NEGATIVE_TEST_MARKER=not-a-secret\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'bad config')
+    disk = image_tree(root, tmp_path / 'bad-config.raw', ext4_tools, 'Q2CONFIG')
+    with pytest.raises(ValueError, match='host_configuration'):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_slot_device_manifest_rejects_duplicate_key_and_wrong_role(repository, tmp_path, ext4_tools):
+    root, base = repository
+    record = prepare_slot_devices(work(base), root, tmp_path / 'slot', mke2fs=ext4_tools[0])
+    path = Path(record['manifest_path'])
+    original = path.read_text()
+    path.chmod(0o600)
+    path.write_text(original.rstrip()[:-1] + ',"role":"developer"}\n')
+    with pytest.raises(ValueError, match='manifest_unavailable'):
+        verify_slot_devices(path)
+    data = json.loads(original)
+    data['role'] = 'reviewer'
+    path.write_text(canonical(data))
+    with pytest.raises(ValueError, match='workspace_changed'):
+        verify_slot_devices(path)
+
+
+@pytest.mark.platforms('posix')
+def test_data_only_cli_freezes_actual_disk_and_emits_canonical_manifest(repository, tmp_path, ext4_tools):
+    import sys
+    disk, base, head = candidate_disk(repository, tmp_path, ext4_tools)
+    raw = subprocess.check_output([sys.executable, '-m', 'native.qemu_guest.qualification_artifacts',
+                                   'freeze', '--task-disk', str(disk), '--output', str(tmp_path / 'frozen'),
+                                   '--expected-base', base, '--expected-head', head],
+                                  timeout=20, text=True)
+    record = json.loads(raw)
+    assert canonical(record) == raw
+    assert record['candidate_head'] == head
+    assert load_candidate(record['manifest_path']) == record
+    verified = subprocess.check_output([sys.executable, '-m', 'native.qemu_guest.qualification_artifacts',
+                                       'verify', '--kind', 'candidate', '--manifest', record['manifest_path']],
+                                      timeout=20, text=True)
+    assert json.loads(verified) == record
+
+
+@pytest.mark.platforms('posix')
+def test_data_only_cli_builds_canonical_owner_work_devices(repository, tmp_path, ext4_tools):
+    import sys
+    root, base = repository
+    assignment = tmp_path / 'owner-work.json'
+    assignment.write_text(canonical(work(base)))
+    raw = subprocess.check_output([sys.executable, '-m', 'native.qemu_guest.qualification_artifacts',
+                                   'prepare', '--work', str(assignment), '--source', str(root),
+                                   '--output', str(tmp_path / 'slot'), '--mke2fs', str(ext4_tools[0])],
+                                  timeout=20, text=True)
+    record = json.loads(raw)
+    assert canonical(record) == raw
+    assert verify_slot_devices(record['manifest_path']) == record
+    assert record['work_sha256'] == hashlib.sha256(assignment.read_bytes()).hexdigest()
+
+
+@pytest.mark.platforms('posix')
+def test_slot_manifest_size_bound_rejects_valid_oversized_json(repository, tmp_path, ext4_tools):
+    root, base = repository
+    record = prepare_slot_devices(work(base), root, tmp_path / 'slot', mke2fs=ext4_tools[0])
+    path = Path(record['manifest_path'])
+    data = json.loads(path.read_text())
+    data['untrusted_padding'] = 'x' * 1024**2
+    path.chmod(0o600)
+    path.write_text(canonical(data))
+    with pytest.raises(ValueError, match='manifest_bounds'):
+        verify_slot_devices(path)
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_rejects_oversized_valid_ext4_device(repository, tmp_path, ext4_tools):
+    root, base = repository
+    (root / 'candidate.txt').write_text('actual candidate\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    disk = tmp_path / 'too-large.raw'
+    ext4(root, disk, label='Q2OVERBUDGET', mib=128,
+         tool=ext4_tools[0], config=ext4_tools[1], owner=1000)
+    with pytest.raises(ValueError, match='candidate_bounds'):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_clean_base_is_never_substituted_for_actual_developer_candidate(repository, tmp_path, ext4_tools):
+    root, base = repository
+    disk = image_tree(root, tmp_path / 'base-only.raw', ext4_tools, 'Q2BASEONLY')
+    with pytest.raises(ValueError, match='actual_candidate'):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+
+
+@pytest.mark.platforms('posix')
+def test_reviewer_requires_actual_candidate_head_not_original_base(repository, tmp_path, ext4_tools):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools)
+    candidate = freeze_candidate(disk, tmp_path / 'frozen', expected_base=base)
+    with pytest.raises(ValueError, match='candidate_mismatch'):
+        prepare_slot_devices(work(base, 'reviewer', 2), candidate['snapshot_path'], tmp_path / 'wrong-head',
+                             mke2fs=ext4_tools[0], parent_candidate=candidate['manifest_path'])
+    assert not (tmp_path / 'wrong-head').exists()
+
+
+@pytest.mark.platforms('posix')
+def test_actual_candidate_must_descend_from_owner_expected_base(repository, tmp_path, ext4_tools):
+    root, base = repository
+    git(root, 'checkout', '--orphan', 'unrelated')
+    (root / 'other.txt').write_text('unrelated history\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'unrelated')
+    unrelated = git(root, 'rev-parse', 'HEAD')
+    git(root, 'checkout', '--detach', base)
+    (root / 'candidate.txt').write_text('candidate\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    disk = image_tree(root, tmp_path / 'actual.raw', ext4_tools, 'Q2ANCESTRY')
+    with pytest.raises(subprocess.CalledProcessError):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=unrelated)
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_does_not_replace_wrong_actual_contents_with_expected_fixture(repository, tmp_path, ext4_tools):
+    disk, base, _head = candidate_disk(repository, tmp_path, ext4_tools)
+    with pytest.raises(ValueError, match='required_content_missing'):
+        freeze_candidate(disk, tmp_path / 'frozen', expected_base=base,
+                         required_files={'qualification/result.txt': b'different required actual result\n'})
+
+
+def qemu_unit_function(source, signature):
+    """Compile the pinned upstream function unchanged, not a rewritten matcher."""
+    start = source.index(signature)
+    opening = source.index('{', start)
+    depth = 1
+    end = opening + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+@pytest.fixture
+def pinned_qemu_fdset_unit(tmp_path):
+    import tarfile
+    from native.qemu_guest.qualification_package import QEMU_SHA256
+    archive = Path('/Users/timmywen/Documents/AI_Colleague/evidence/'
+                   'pr15-qemu-hvf-feasibility-20261121/downloads/qemu-11.1.3.tar.xz')
+    if not archive.is_file():
+        pytest.skip('Fixed upstream QEMU source archive unavailable for inert FD-set unit')
+    with archive.open('rb') as stream:
+        assert hashlib.file_digest(stream, 'sha256').hexdigest() == QEMU_SHA256
+    with tarfile.open(archive) as bundle:
+        sources = {name: bundle.extractfile('qemu-11.1.3/' + name).read().decode()
+                   for name in ('monitor/fds.c', 'util/osdep.c', 'include/qemu/queue.h')}
+    monitor, queue = sources['monitor/fds.c'], sources['include/qemu/queue.h']
+    license_text = monitor[:monitor.index('#include')]
+    lists = queue[queue.index('#define QLIST_HEAD('):queue.index('/*\n * Singly-linked List definitions.')]
+    types = monitor[monitor.index('/* file descriptor associated'):monitor.index('static bool monitor_add_fd(')]
+    shims = '''
+#include <stdbool.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+typedef int QemuMutex;
+typedef void Error;
+typedef struct {int64_t fdset_id; int fd;} AddfdInfo;
+#define QEMU_LOCK_GUARD(pointer) ((void)(pointer))
+#define QERR_INVALID_PARAMETER_VALUE "%s %s"
+#define g_malloc0(size) calloc(1,size)
+#define qemu_dup(fd) dup(fd)
+static char *g_strdup(const char *value){return value?strdup(value):NULL;}
+static void error_setg(Error **error,const char *format,...){(void)error;(void)format;}
+'''
+    functions = '\n'.join([
+        qemu_unit_function(sources['util/osdep.c'], 'int qemu_dup_flags('),
+        qemu_unit_function(monitor, 'AddfdInfo *monitor_fdset_add_fd('),
+        qemu_unit_function(monitor, 'int monitor_fdset_dup_fd_add(')])
+    driver = r'''
+int main(int argc,char **argv) {
+    if(argc!=4)return 71;
+    int first=atoi(argv[1]), second=atoi(argv[2]);
+    const char *mode=argv[3]; Error *error=NULL;
+    int set=strcmp(mode,"wrong-set")==0?3:2;
+    if(strcmp(mode,"dual-reverse")==0) {
+        if(!monitor_fdset_add_fd(second,true,set,NULL,&error))return 72;
+        if(!monitor_fdset_add_fd(first,true,set,NULL,&error))return 73;
+    } else {
+        if(!monitor_fdset_add_fd(first,true,set,NULL,&error))return 74;
+        if(strcmp(mode,"dual")==0 && !monitor_fdset_add_fd(second,true,set,NULL,&error))return 75;
+    }
+    errno=0; int ro=monitor_fdset_dup_fd_add(2,O_RDONLY,&error);int ro_error=errno;
+    errno=0; int rw=monitor_fdset_dup_fd_add(2,O_RDWR,&error);int rw_error=errno;
+    struct stat left={0},right={0};
+    bool same=ro>=0 && rw>=0 && !fstat(ro,&left) && !fstat(rw,&right) &&
+        left.st_dev==right.st_dev && left.st_ino==right.st_ino && left.st_size==right.st_size;
+    char byte=0; bool denied=false,writable=false;
+    if(ro>=0){pread(ro,&byte,1,0);errno=0;denied=pwrite(ro,&byte,1,0)==-1 && errno==EBADF;}
+    if(rw>=0){pread(rw,&byte,1,0);writable=pwrite(rw,&byte,1,0)==1;}
+    printf("{\"ro\":%d,\"rw\":%d,\"ro_errno\":%d,\"rw_errno\":%d,"
+           "\"ro_mode\":%d,\"rw_mode\":%d,\"same_inode_size\":%d,"
+           "\"ro_write_rejected\":%d,\"rw_write_accepted\":%d}\n",
+           ro,rw,ro_error,rw_error,ro>=0?(fcntl(ro,F_GETFL)&O_ACCMODE):-1,
+           rw>=0?(fcntl(rw,F_GETFL)&O_ACCMODE):-1,same,denied,writable);
+    if(ro>=0)close(ro);if(rw>=0)close(rw);
+    return 0;
+}
+'''
+    source = tmp_path / 'pinned-fdset-unit.c'
+    source.write_text(license_text + shims + lists + types + functions + driver)
+    binary = tmp_path / 'pinned-fdset-unit'
+    subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', source, '-o', binary],
+                   check=True, capture_output=True, timeout=30)
+    return binary
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('mode', ['dual', 'dual-reverse', 'single-rw', 'readonly', 'wrong-set'])
+def test_pinned_qemu_fdset_production_matcher_uses_real_modes(tmp_path, pinned_qemu_fdset_unit, mode):
+    import errno
+    image = inert_image(tmp_path, 'reviewer' if mode == 'readonly' else 'developer')
+    with image.open_devices() as devices:
+        primary, ro = devices.fds['task'], devices.fds.get('task_ro', -1)
+        fds = (primary, ro) if ro >= 0 else (primary,)
+        result = subprocess.run([pinned_qemu_fdset_unit, str(primary), str(ro), mode],
+                                pass_fds=fds, capture_output=True, text=True, check=True, timeout=5)
+        report = json.loads(result.stdout)
+    if mode.startswith('dual'):
+        assert report['ro'] >= 0 and report['rw'] >= 0
+        assert report['ro_mode'] == os.O_RDONLY and report['rw_mode'] == os.O_RDWR
+        assert report['same_inode_size'] == report['ro_write_rejected'] == report['rw_write_accepted'] == 1
+    elif mode == 'single-rw':
+        assert report['ro'] == -1 and report['ro_errno'] == errno.EACCES
+        assert report['rw'] >= 0 and report['rw_mode'] == os.O_RDWR
+    elif mode == 'readonly':
+        assert report['ro'] >= 0 and report['ro_mode'] == os.O_RDONLY and report['ro_write_rejected'] == 1
+        assert report['rw'] == -1 and report['rw_errno'] == errno.EACCES
+    else:
+        assert report['ro'] == report['rw'] == -1
+        assert report['ro_errno'] == report['rw_errno'] == errno.ENOENT
+
+
+def test_startup_receipt_accepts_only_bounded_numeric_final_status():
+    from native.qemu_guest.qualification_artifacts import startup_receipt
+    record = dict(errno=13, exception=3, exit_code=111, signal=0, stage=9, version=1)
+    assert startup_receipt(canonical(record).encode()) == record
+    for bad in (record | {'secret': 'private'}, record | {'extra': 1}, record | {'errno': True},
+                record | {'errno': 99999}, record | {'stage': 999},
+                record | {'exit_code': -1}, record | {'exit_code': 0, 'signal': 9},
+                record | {'exception': 'password'}, record | {'version': 2}):
+        with pytest.raises(ValueError):
+            startup_receipt(canonical(bad).encode())
+    for raw in (b'x' * 160, b'{}', b'{"errno":1e9999}', canonical(record).encode() + b' '):
+        with pytest.raises(ValueError):
+            startup_receipt(raw)
+
+
+def test_generated_startup_suppresses_exception_text_and_reviewer_writes(tmp_path, monkeypatch):
+    import builtins
+    import io
+    from types import SimpleNamespace
+    from native.qemu_guest.build_artifacts import PYTHON_STARTUP
+    namespace = {'__name__': 'diagnostic_test'}
+    exec(compile(PYTHON_STARTUP, '<generated-startup>', 'exec'), namespace)
+    folder = tmp_path / 'diagnostic'
+    folder.mkdir(mode=0o700)
+    namespace['DIRECTORY'] = str(folder)
+    actual_open = builtins.open
+    role = [b'developer\n']
+
+    def policy_open(path, *args, **kwargs):
+        return io.BytesIO(role[0]) if path == '/assignment/policy' else actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', policy_open)
+
+    def failed():
+        raise PermissionError(13, 'PRIVATE_TOKEN_NEVER_PERSIST')
+
+    with pytest.raises(SystemExit) as stopped:
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert stopped.value.code == 111
+    raw = (folder / 'receipt.json').read_bytes()
+    assert len(raw) < 160 and b'PRIVATE' not in raw and b'Traceback' not in raw
+    assert json.loads(raw)['errno'] == 13 and json.loads(raw)['exception'] == 3
+    (folder / 'receipt.json').unlink()
+    role[0] = b'reviewer\n'
+    with pytest.raises(SystemExit):
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert list(folder.iterdir()) == []
+    role[0] = b'developer\n'
+    (folder / '.pending').write_text('existing state')
+    with pytest.raises(SystemExit) as unavailable:
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert unavailable.value.code == 112
+    assert (folder / '.pending').read_text() == 'existing state'
+
+
+@pytest.mark.platforms('posix')
+def test_actual_ext4_startup_diagnostic_is_advisory_and_excluded_from_candidate(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    (root / 'result.txt').write_text('actual candidate\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    folder = root / STARTUP_DIRECTORY
+    folder.mkdir(mode=0o700)
+    receipt = folder / 'receipt.json'
+    receipt.write_text(canonical(dict(errno=13, exception=3, exit_code=111, signal=0, stage=9, version=1)))
+    receipt.chmod(0o600)
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2DIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
+        'scope': work(base)['assignment'], 'role': 'developer'})
+    with pytest.raises(ValueError, match='q2_startup_manifest_changed'):
+        inspect_startup(manifest['manifest_path'], expected_manifest_sha256='0' * 64)
+    advisory = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+    assert advisory['status'] == 'OBSERVED_UNTRUSTED' and advisory['retirement_proof'] is False
+    assert advisory['receipt']['stage'] == 9
+    candidate = freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+    assert STARTUP_DIRECTORY not in candidate['content']
+    assert not (Path(candidate['snapshot_path']) / STARTUP_DIRECTORY).exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['symlink', 'hardlink', 'mode', 'size', 'pending', 'reviewer'])
+def test_actual_ext4_invalid_startup_receipt_cannot_be_evidence(repository, tmp_path, ext4_tools, damage):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    folder = root / STARTUP_DIRECTORY
+    folder.mkdir(mode=0o700)
+    receipt = folder / 'receipt.json'
+    receipt.write_text(canonical(dict(errno=0, exception=0, exit_code=111, signal=0, stage=9, version=1)))
+    receipt.chmod(0o600)
+    actions = {
+        'symlink': lambda: (receipt.unlink(), receipt.symlink_to('../base.txt')),
+        'hardlink': lambda: os.link(receipt, folder / 'alias'),
+        'mode': lambda: receipt.chmod(0o644),
+        'size': lambda: receipt.write_text('x' * 160),
+        'pending': lambda: (folder / '.pending').write_text('incomplete'),
+        'reviewer': lambda: None,
+    }
+    actions[damage]()
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2BADDIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
+        'scope': work(base)['assignment'], 'role': 'reviewer' if damage == 'reviewer' else 'developer'})
+    with pytest.raises(ValueError, match='q2_'):
+        inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+
+
+@pytest.mark.parametrize('module,function,stage', [
+    ('native.qemu_guest.guest_entry', 'validate_mount', 'PRE_READY_VALIDATION'),
+    ('agent.runtime_session_guest', 'validate_guest_work', 'PRE_READY_VALIDATION'),
+    ('agent.guest_serial', 'receive', 'SERIAL_OPERATION'),
+    ('agent.managed_worker', 'adopt', 'WORKER_RUNTIME'),
+    ('unrecognized', 'arbitrary', 'ENTRY_MAIN'),
+])
+def test_startup_stage_classifier_uses_bounded_names_without_guessing_first_frame(module, function, stage):
+    from native.qemu_guest.build_artifacts import PYTHON_STARTUP, STARTUP_STAGES
+    namespace = {'__name__': 'diagnostic_test'}
+    exec(compile(PYTHON_STARTUP, '<generated-startup>', 'exec'), namespace)
+    fixture = {'__name__': module}
+    exec(compile(f'def {function}():\n    raise ValueError("PRIVATE_TEXT")\n', '<stub-failure>', 'exec'), fixture)
+    try:
+        fixture[function]()
+    except ValueError as failure:
+        assert namespace['classify'](failure, STARTUP_STAGES['ENTRY_MAIN']) == STARTUP_STAGES[stage]
+
+
+def test_manifest_bytes_parsed_are_the_bytes_whose_digest_was_checked(tmp_path, monkeypatch):
+    from native.qemu_guest import qualification_artifacts as artifacts
+    manifest = artifacts._write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'scope': {'run_id': 1},
+        'role': 'developer', 'task': {'path': 'must-not-be-opened.raw'}})
+    original_record = artifacts.file_record
+
+    def replace_after_hash(path):
+        result = original_record(path)
+        if str(path) == manifest['manifest_path']:
+            target = Path(path)
+            target.chmod(0o600)
+            target.write_text(target.read_text().replace('"run_id":1', '"run_id":2'))
+        return result
+
+    monkeypatch.setattr(artifacts, 'file_record', replace_after_hash)
+    with pytest.raises(ValueError, match='q2_manifest_changed'):
+        artifacts.inspect_startup(manifest['manifest_path'],
+                                  expected_manifest_sha256=manifest['manifest_sha256'])
+
+
+def test_startup_disk_open_binds_the_actual_descriptor_before_ext4_parse(tmp_path, monkeypatch):
+    from native.qemu_guest import qualification_artifacts as artifacts
+    disk = tmp_path / 'task.raw'
+    disk.write_bytes(b'not-ext4')
+    alternate = tmp_path / 'alternate.raw'
+    alternate.write_bytes(b'not-ext4')
+    original_record = artifacts.file_record
+    manifest = artifacts._write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'scope': {'run_id': 1},
+        'role': 'developer', 'task': original_record(disk)})
+
+    def replace_disk_after_hash(path):
+        result = original_record(path)
+        if Path(path) == disk:
+            os.replace(alternate, disk)
+        return result
+
+    monkeypatch.setattr(artifacts, 'file_record', replace_disk_after_hash)
+    with pytest.raises(ValueError, match='q2_startup_device_changed'):
+        artifacts.inspect_startup(manifest['manifest_path'],
+                                  expected_manifest_sha256=manifest['manifest_sha256'])
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('role', ['developer', 'reviewer'])
+def test_real_slot_device_preprovisions_only_private_developer_diagnostic(repository, tmp_path, ext4_tools, role):
+    from dissect.extfs import ExtFS
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup
+    source, base = repository
+    parent = None
+    if role == 'reviewer':
+        disk, base, head = candidate_disk(repository, tmp_path, ext4_tools)
+        parent = freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+        source, base = Path(parent['snapshot_path']), head
+    record = prepare_slot_devices(work(base, role), source, tmp_path / 'slot',
+                                  mke2fs=ext4_tools[0], parent_candidate=parent['manifest_path'] if parent else None)
+    with Path(record['task']['path']).open('rb') as stream:
+        fs = ExtFS(stream)
+        if role == 'developer':
+            node = fs.get('/' + STARTUP_DIRECTORY)
+            assert node.inode.i_uid == node.inode.i_gid == 1000
+            assert node.inode.i_mode & 0o7777 == 0o700
+            assert set(child.filename for child in node.iterdir()) == {'.', '..'}
+            exclude = fs.get('/.git/info/exclude').open().read()
+            assert ('/' + STARTUP_DIRECTORY + '/').encode() in exclude
+        else:
+            assert STARTUP_DIRECTORY not in {node.filename for node in fs.get('/').iterdir()}
+    advisory = inspect_startup(record['manifest_path'], expected_manifest_sha256=record['manifest_sha256'])
+    assert advisory['status'] == 'UNKNOWN' and advisory['retirement_proof'] is False
+    assert advisory['diagnostic_directory'] == ('VALID_EMPTY' if role == 'developer' else 'ABSENT')
+    from native.qemu_guest.verify_images import verify_startup_directory
+    with Path(record['task']['path']).open('rb') as stream:
+        assert verify_startup_directory(ExtFS(stream), role) == (
+            'PREPROVISIONED_EMPTY_1000_1000_0700' if role == 'developer' else 'ABSENT')
+    assert 'receipt' not in advisory
+    assert not (source / STARTUP_DIRECTORY).exists()
+    assert STARTUP_DIRECTORY not in git(source, 'ls-tree', '-r', '--name-only', 'HEAD')
+
+
+@pytest.mark.platforms('posix')
+def test_empty_preprovisioned_directory_is_unknown_and_excluded_from_real_candidate(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    (root / 'result.txt').write_text('actual disposable commit\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    provision_startup_directory(root, 'developer')
+    assert not git(root, 'status', '--porcelain')
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2EMPTYDIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {'schema': 'HERMES_Q2_SLOT_DEVICES_V1',
+        'task': file_record(disk), 'scope': work(base)['assignment'], 'role': 'developer'})
+    advisory = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+    assert advisory['reason'] == 'EMPTY_PREPROVISIONED_DIRECTORY' and advisory['status'] == 'UNKNOWN'
+    assert advisory['retirement_proof'] is False and 'receipt' not in advisory
+    candidate = freeze_candidate(disk, tmp_path / 'snapshot', expected_base=base)
+    assert 'result.txt' in candidate['content']
+    assert not any(name.startswith(STARTUP_DIRECTORY) for name in candidate['content'])
+    assert not (Path(candidate['snapshot_path']) / STARTUP_DIRECTORY).exists()
+
+
+@pytest.mark.parametrize('kind', ['empty_directory', 'file', 'symlink', 'tracked'])
+def test_incoming_source_cannot_supply_the_reserved_bootstrap_directory(repository, tmp_path, kind):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, _base = repository
+    reserved = root / STARTUP_DIRECTORY
+    actions = {'empty_directory': lambda: reserved.mkdir(), 'file': lambda: reserved.write_text('fake'),
+               'symlink': lambda: reserved.symlink_to(tmp_path / 'missing'),
+               'tracked': lambda: (reserved.mkdir(), (reserved / 'fake').write_text('fake'),
+                                  git(root, 'add', '.'), git(root, 'commit', '-qm', 'fake diagnostic'))}
+    actions[kind]()
+    for role in ('developer', 'reviewer'):
+        with pytest.raises(ValueError, match='q2_reserved_startup_path'):
+            provision_startup_directory(root, role)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['empty', 'missing', 'wrong_mode', 'special_mode', 'wrong_owner'])
+def test_real_ext4_empty_directory_metadata_and_absence_are_not_worker_success(repository, tmp_path, ext4_tools, damage):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    provision_startup_directory(root, 'developer')
+    folder = root / STARTUP_DIRECTORY
+    actions = {'empty': lambda: None, 'missing': folder.rmdir,
+               'wrong_mode': lambda: folder.chmod(0o755),
+               'special_mode': lambda: folder.chmod(0o1700), 'wrong_owner': lambda: None}
+    actions[damage]()
+    disk = tmp_path / 'task.raw'
+    ext4(root, disk, label='Q2METADIAG', mib=64, tool=ext4_tools[0], config=ext4_tools[1],
+         owner=0 if damage == 'wrong_owner' else 1000)
+    manifest = _write_manifest(tmp_path, 'slot.json', {'schema': 'HERMES_Q2_SLOT_DEVICES_V1',
+        'task': file_record(disk), 'scope': work(base)['assignment'], 'role': 'developer'})
+    if damage in ('wrong_mode', 'special_mode', 'wrong_owner'):
+        from dissect.extfs import ExtFS
+        from native.qemu_guest.verify_images import verify_startup_directory
+        with disk.open('rb') as stream, pytest.raises(ValueError, match='developer_startup_directory_invalid'):
+            verify_startup_directory(ExtFS(stream), 'developer')
+        with pytest.raises(ValueError, match='q2_startup_node_invalid'):
+            inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+    else:
+        result = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
+        assert result['diagnostic_directory'] == ('VALID_EMPTY' if damage == 'empty' else 'ABSENT')
+        assert result['status'] == 'UNKNOWN' and result['retirement_proof'] is False
+        assert 'receipt' not in result
+
+
+def test_reserved_diagnostic_stays_out_of_real_git_add(repository):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, _base = repository
+    provision_startup_directory(root, 'developer')
+    (root / STARTUP_DIRECTORY / 'receipt.json').write_text('untrusted diagnostic fixture\n')
+    (root / 'real-change.txt').write_text('ordinary task change\n')
+    git(root, 'add', '.')
+    assert git(root, 'diff', '--cached', '--name-only').splitlines() == ['real-change.txt']
+
+
+@pytest.mark.platforms('posix')
+def test_candidate_rejects_invalid_empty_diagnostic_directory(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY, provision_startup_directory
+    root, base = repository
+    (root / 'result.txt').write_text('committed fixture\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    provision_startup_directory(root, 'developer')
+    (root / STARTUP_DIRECTORY).chmod(0o755)
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2INVALIDEMPTY')
+    with pytest.raises(ValueError, match='q2_startup_node_invalid'):
+        freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+
+
+@pytest.fixture
+def boot_codec(tmp_path):
+    import ctypes
+    from types import SimpleNamespace
+    from hermes_platform.resolver import locate_command
+    command = locate_command('clang').command
+    if not command:
+        pytest.skip('Host C compiler unavailable')
+    output = tmp_path / 'codec.dylib'
+    source = Path(__file__).resolve().parents[2] / 'native/qemu_guest/boot_init.c'
+    subprocess.run([*command, '-dynamiclib', '-DHERMES_BOOT_CODEC_ONLY', '-O2', '-Wall', '-Wextra',
+                    '-Werror', str(source), '-o', str(output)], check=True, capture_output=True, timeout=30)
+    library = ctypes.CDLL(str(output), use_errno=True)
+
+    class State(ctypes.Structure):
+        _fields_ = [('seq', ctypes.c_uint), ('last_stage', ctypes.c_uint), ('disabled', ctypes.c_int)]
+
+    writer = ctypes.CFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, use_errno=True)
+    waiter = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+    clock = ctypes.CFUNCTYPE(ctypes.c_int64)
+
+    class IO(ctypes.Structure):
+        _fields_ = [('write_bytes', writer), ('writable', waiter), ('now_ms', clock)]
+
+    library.hermes_boot_encode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
+                                          ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_encode.restype = ctypes.c_size_t
+    library.hermes_boot_emit.argtypes = [ctypes.POINTER(State), ctypes.POINTER(IO), ctypes.c_int,
+                                        ctypes.c_char_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_emit.restype = ctypes.c_int
+    library.hermes_boot_descriptor.argtypes = [ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_descriptor.restype = ctypes.c_int
+    return SimpleNamespace(lib=library, State=State, IO=IO, writer=writer, waiter=waiter, clock=clock)
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('seq,stage,error,failed', [(1, 1, 0, 0), (16, 14, 4095, 1), (2, 2, 13, 1)])
+def test_actual_c_boot_encoder_canonical_fixed_vectors(boot_codec, seq, stage, error, failed):
+    import ctypes
+    import struct
+    scope = 'a' * 64
+    buffer = ctypes.create_string_buffer(197)
+    count = boot_codec.lib.hermes_boot_encode(buffer, len(buffer), scope.encode(), seq, stage, error, failed)
+    expected = json.dumps({'boot': 1, 'errno': error, 'failed': failed, 'scope_sha256': scope,
+                           'seq': seq, 'stage': stage}, sort_keys=True, separators=(',', ':')).encode()
+    assert count == len(expected) + 4 and count <= 196
+    assert buffer.raw[:count] == struct.pack('!I', len(expected)) + expected
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('damage', ['scope', 'scope_hex', 'seq', 'stage', 'errno', 'failed', 'progress_errno', 'capacity'])
+def test_actual_c_boot_encoder_bounds(boot_codec, damage):
+    import ctypes
+    values = {'scope': b'a' * 64, 'seq': 1, 'stage': 1, 'error': 0, 'failed': 0, 'capacity': 197}
+    updates = {'scope': {'scope': b'bad'}, 'scope_hex': {'scope': b'x' * 64}, 'seq': {'seq': 17}, 'stage': {'stage': 15},
+               'errno': {'error': 4096, 'failed': 1}, 'failed': {'failed': 2},
+               'progress_errno': {'error': 1}, 'capacity': {'capacity': 4}}
+    values.update(updates[damage])
+    buffer = ctypes.create_string_buffer(197)
+    assert boot_codec.lib.hermes_boot_encode(buffer, values['capacity'], values['scope'], values['seq'],
+                                             values['stage'], values['error'], values['failed']) == 0
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('mode', ['partial_success', 'timeout', 'ordering', 'count', 'failure_final', 'clock_failure',
+                                  'write_zero', 'eintr_then_success', 'eagain_then_success'])
+def test_actual_c_boot_writer_partial_timeout_and_sequence(boot_codec, mode):
+    import ctypes
+    output = bytearray()
+    tick = [0]
+    waits = []
+    writes = []
+
+    def write(_fd, pointer, length):
+        import errno
+        writes.append(length)
+        if mode == 'write_zero':
+            return 0
+        if len(writes) == 1 and mode in ('eintr_then_success', 'eagain_then_success'):
+            ctypes.set_errno(errno.EINTR if mode == 'eintr_then_success' else errno.EAGAIN)
+            return -1
+        count = min(length, 7)
+        output.extend(ctypes.string_at(pointer, count))
+        return count
+
+    def writable(_fd, timeout):
+        waits.append(timeout)
+        assert 0 < timeout <= 10
+        return 1
+
+    def now():
+        if mode == 'clock_failure':
+            return -1
+        if mode == 'timeout':
+            tick[0] += 4
+        return tick[0]
+
+    callbacks = (boot_codec.writer(write), boot_codec.waiter(writable), boot_codec.clock(now))
+    io = boot_codec.IO(*callbacks)
+    state = boot_codec.State()
+    if mode == 'ordering':
+        state.seq = state.last_stage = 3
+    if mode == 'count':
+        state.seq, state.last_stage = 16, 1
+    result = boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), 99, b'a' * 64,
+                                             1 if mode != 'count' else 2, 0, int(mode == 'failure_final'))
+    if mode in ('timeout', 'ordering', 'count', 'clock_failure', 'write_zero'):
+        assert result == 0
+        assert state.seq == (3 if mode == 'ordering' else 16 if mode == 'count' else 0)
+        if mode != 'ordering':
+            assert state.disabled == 1
+    else:
+        assert result == 1 and state.seq == state.last_stage == 1
+        assert len(waits) > 1 and len(output) > 100
+        if mode == 'failure_final':
+            before = bytes(output)
+            assert boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), 99,
+                                                   b'a' * 64, 2, 0, 0) == 0
+            assert bytes(output) == before
+
+
+def test_newc_static_uart_character_node_encoding_needs_no_host_mknod(tmp_path):
+    import gzip
+    import stat
+    from native.qemu_guest.artifact_fs import newc
+    root = tmp_path / 'initramfs'
+    (root / 'dev').mkdir(parents=True)
+    (root / 'init').write_bytes(b'data-only')
+    data = gzip.decompress(newc(root, pl011_node=True))
+    offset = 0
+    found = []
+    while offset + 110 <= len(data):
+        header = data[offset:offset + 110]
+        assert header[:6] == b'070701'
+        fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        offset += 110
+        name = data[offset:offset + fields[11] - 1].decode()
+        offset = (offset + fields[11] + 3) & ~3
+        payload = data[offset:offset + fields[6]]
+        offset = (offset + fields[6] + 3) & ~3
+        if name == 'TRAILER!!!':
+            break
+        if stat.S_ISCHR(fields[1]):
+            found.append(name)
+            assert name == 'dev/ttyAMA0' and stat.S_IMODE(fields[1]) == 0o600
+            assert fields[2] == fields[3] == 0 and fields[9:11] == [204, 64] and payload == b''
+    assert found == ['dev/ttyAMA0'] and not (root / 'dev/ttyAMA0').exists()
+
+
+@pytest.mark.platforms('macos')
+def test_actual_c_partial_timeout_is_stream_unknown_never_silently_resynced_to_rpc(boot_codec):
+    import ctypes
+    from agent.guest_serial import SerialWire
+    from gateway.session_guest_serial import BootSerialWire, boot_scope_sha256
+    scope = {'execution_id': 'disposable', 'epoch': 1}
+    host, peer = socket.socketpair()
+    hints = []
+    receiver = BootSerialWire(host.fileno(), scope, hints.append)
+    sender = SerialWire(peer.fileno(), scope)
+    host.close()
+    tick = [0]
+
+    def write(fd, pointer, length):
+        return os.write(fd, ctypes.string_at(pointer, min(length, 7)))
+
+    def now():
+        tick[0] += 4
+        return tick[0]
+
+    callbacks = (boot_codec.writer(write), boot_codec.waiter(lambda _fd, _ms: 1), boot_codec.clock(now))
+    io = boot_codec.IO(*callbacks)
+    state = boot_codec.State()
+    try:
+        assert boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), peer.fileno(),
+                                               boot_scope_sha256(scope).encode(), 1, 0, 0) == 0
+        assert state.disabled == 1  # bounded best effort returns; it never exits/reboots the caller
+        assert sender.send('context', 'request', {'operation': 'assignment'}) == 1
+        peer.shutdown(socket.SHUT_WR)
+        with pytest.raises((ValueError, EOFError)):
+            receiver.receive()
+        assert receiver.failed and receiver.received == 0 and hints == []
+        with pytest.raises(ValueError, match='serial_failed'):
+            receiver.receive()
+    finally:
+        sender.close(); sender.release_fd(); peer.close()
+        receiver.close(); receiver.release_fd()
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('disabled', [0, 1])
+def test_actual_c_descriptor_handoff_keeps_even_disabled_channel_until_worker_fd_exists(boot_codec, disabled):
+    import fcntl
+    host, peer = socket.socketpair()
+    carried = os.dup(peer.fileno())
+    try:
+        os.set_inheritable(carried, False)
+        state = boot_codec.State(7, 7, disabled)
+        assert boot_codec.lib.hermes_boot_descriptor(carried, 0) == 1
+        assert not fcntl.fcntl(carried, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        assert os.fstat(carried).st_ino == os.fstat(peer.fileno()).st_ino
+        # Once the original protocol descriptor is open, enabling CLOEXEC does
+        # not last-close/flush the shared transport; disabled follows same path.
+        worker = os.dup(peer.fileno())
+        try:
+            assert boot_codec.lib.hermes_boot_descriptor(carried, 1) == 1
+            assert fcntl.fcntl(carried, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+            assert state.disabled == disabled
+            os.write(worker, b'normal-protocol-still-open')
+            assert host.recv(64) == b'normal-protocol-still-open'
+        finally:
+            os.close(worker)
+    finally:
+        os.close(carried); host.close(); peer.close()

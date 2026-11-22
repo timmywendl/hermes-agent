@@ -87,7 +87,18 @@ class GuestImage:
         self.verify()
         if type(serial_fd) is not int or serial_fd < 3:
             raise ValueError('q2_inherited_serial_required')
-        result = ['-nodefaults', '-display', 'none', '-monitor', 'none', '-qmp', 'stdio',
+        result = self._base_args(serial_fd)
+        for name, path, readonly in [('root', self.root, True), ('task', self.task, self.role == 'reviewer'),
+                                     ('assignment', self.assignment, True)]:
+            result.extend(['-drive', f'file={path},format=raw,if=none,id={name},readonly={"on" if readonly else "off"}',
+                           '-device', f'virtio-blk-pci,drive={name}'])
+        return result
+
+    def open_devices(self):
+        return OwnedDevices(self)
+
+    def _base_args(self, serial_fd):
+        return ['-nodefaults', '-display', 'none', '-monitor', 'none', '-qmp', 'stdio',
                   '-chardev', f'socket,id=worker,fd={serial_fd}', '-serial', 'chardev:worker',
                   '-nic', 'none', '-accel', 'hvf', '-machine', 'virt', '-cpu', 'host',
                   '-smp', '2', '-m', '2048', '-no-reboot',
@@ -95,8 +106,130 @@ class GuestImage:
                   # UART is exclusively binary Worker RPC. Kernel/init output must
                   # never interleave with frames (unlike Q1's diagnostic console).
                   '-append', 'console=tty0 root=/dev/vda ro rdinit=/init panic=-1']
-        for name, path, readonly in [('root', self.root, True), ('task', self.task, self.role == 'reviewer'),
-                                     ('assignment', self.assignment, True)]:
-            result.extend(['-drive', f'file={path},format=raw,if=none,id={name},readonly={"on" if readonly else "off"}',
+
+
+class OwnedDevices:
+    """Original Owner's exact preopened device capabilities, never path authority.
+
+    Verification uses pread, preserving file offsets shared with QEMU fdsets. The
+    Owner must verify immediately before Popen and again before release; after a
+    Developer starts writing, a new post-stop inventory is a different receipt.
+    """
+
+    def __init__(self, image):
+        image.verify()
+        self.image = image
+        self.fds = {}
+        self.identities = {}
+        self.closed = False
+        try:
+            for name in ('root', 'task', 'assignment'):
+                path = getattr(image, name)
+                mode = os.O_RDWR if name == 'task' and image.role == 'developer' else os.O_RDONLY
+                fd = os.open(path, mode | os.O_NOFOLLOW | os.O_CLOEXEC)
+                self.fds[name] = fd
+                self.identities[name] = self._identity(os.fstat(fd))
+            if image.role == 'developer':
+                fd = os.open(image.task, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                self.fds['task_ro'] = fd
+                self.identities['task_ro'] = self._identity(os.fstat(fd))
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    @staticmethod
+    def _identity(info):
+        return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns,
+                info.st_ctime_ns, info.st_nlink)
+
+    @property
+    def pass_fds(self):
+        return tuple(self.fds.values())
+
+    def verify(self):
+        import fcntl
+        expected = {'root', 'task', 'assignment'} | ({'task_ro'} if self.image.role == 'developer' else set())
+        if self.closed or set(self.fds) != expected or len(set(self.fds.values())) != len(expected):
+            raise ValueError('q2_device_capability_closed')
+        self.image.verify()
+        identities = set()
+        for name in ('root', 'task', 'assignment'):
+            fd = self.fds[name]
+            info = os.fstat(fd)
+            path = getattr(self.image, name)
+            expected_mode = os.O_RDWR if name == 'task' and self.image.role == 'developer' else os.O_RDONLY
+            mode = fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE
+            identity = self._identity(info)
+            if (mode != expected_mode or identity != self.identities[name]
+                    or identity != self._identity(path.lstat()) or info.st_nlink != 1
+                    or not stat.S_ISREG(info.st_mode) or identity[:2] in identities):
+                raise ValueError('q2_device_capability_changed')
+            identities.add(identity[:2])
+            digest = hashlib.sha256()
+            offset = 0
+            while chunk := os.pread(fd, 1024 * 1024, offset):
+                digest.update(chunk)
+                offset += len(chunk)
+            if (digest.hexdigest() != self.image.sha256[str(path)]
+                    or self._identity(os.fstat(fd)) != identity):
+                raise ValueError('q2_device_capability_changed')
+        if self.image.role == 'developer':
+            self._verify_task_ro()
+        return self.descriptors()
+
+    def _verify_task_ro(self):
+        import fcntl
+        fd = self.fds['task_ro']
+        identity = self._identity(os.fstat(fd))
+        if ((fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+                or identity != self.identities['task_ro'] or identity != self.identities['task']
+                or identity != self._identity(self.image.task.lstat())):
+            raise ValueError('q2_task_readonly_capability_changed')
+
+    def descriptors(self):
+        records = {name: {'fd': self.fds[name], 'st_dev': self.identities[name][0],
+                       'st_ino': self.identities[name][1], 'size': self.identities[name][2],
+                       'readonly': name != 'task' or self.image.role == 'reviewer',
+                       'sha256': self.image.sha256[str(getattr(self.image, name))]}
+                   for name in ('root', 'task', 'assignment')}
+        if self.image.role == 'developer':
+            records['task']['ro_fd'] = self.fds['task_ro']
+        return records
+
+    def device_args(self, serial_fd):
+        self.verify()
+        if (type(serial_fd) is not int or serial_fd < 3 or serial_fd in self.fds.values()
+                or not stat.S_ISSOCK(os.fstat(serial_fd).st_mode)):
+            raise ValueError('q2_inherited_serial_required')
+        result = self.image._base_args(serial_fd)
+        for number, name in enumerate(('root', 'task', 'assignment'), 1):
+            readonly = name != 'task' or self.image.role == 'reviewer'
+            result.extend(['-add-fd', f'fd={self.fds[name]},set={number}'])
+            if name == 'task' and self.image.role == 'developer':
+                result.extend(['-add-fd', f'fd={self.fds["task_ro"]},set=2'])
+            result.extend(['-drive', f'file=/dev/fdset/{number},format=raw,if=none,id={name},readonly={"on" if readonly else "off"}',
                            '-device', f'virtio-blk-pci,drive={name}'])
         return result
+
+    def close(self):
+        errors = []
+        for name, fd in list(self.fds.items()):
+            try:
+                observed = os.fstat(fd)
+                if (observed.st_dev, observed.st_ino) != self.identities[name][:2]:
+                    raise ValueError('q2_device_capability_reused')
+                os.close(fd)
+            except (OSError, ValueError) as error:
+                errors.append(error)
+            else:
+                del self.fds[name]
+        self.closed = not self.fds
+        if errors:
+            raise ValueError('q2_device_capability_close_incomplete') from errors[0]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()

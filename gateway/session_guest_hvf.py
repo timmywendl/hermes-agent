@@ -841,7 +841,8 @@ def inspect_failed_startup(handle, observation, deadline):
         if hashlib.sha256(Path(interpreter['path']).read_bytes()).hexdigest() != interpreter['sha256']:
             return result | {'reason': 'VERIFIER_IDENTITY_CHANGED'}
         args = [interpreter['path'], '-m', 'native.qemu_guest.qualification_artifacts',
-                'inspect-startup', '--manifest', handle.device_record['manifest_path']]
+                'inspect-startup', '--manifest', handle.device_record['manifest_path'],
+                '--expected-manifest-sha256', handle.device_record['manifest_sha256']]
         env = {'PATH': '/usr/bin:/bin', 'HOME': str(handle.batch.profile / 'host-tool-home'),
                'HERMES_HOME': handle.authority.profile_id,
                'PYTHONPATH': str(Path(__file__).resolve().parents[1])}
@@ -855,7 +856,10 @@ def inspect_failed_startup(handle, observation, deadline):
         advisory = json.loads(raw)
         if (not isinstance(advisory, dict) or advisory.get('retirement_proof') is not False or
                 advisory.get('authority') != result['authority'] or
-                advisory.get('scope') != handle.device_record['scope']):
+                advisory.get('scope') != handle.device_record['scope'] or
+                not isinstance(advisory.get('task'), dict) or
+                any(advisory.get('task', {}).get(key) != handle.device_record['task'][key]
+                    for key in ('path', 'st_dev', 'st_ino', 'size'))):
             raise ValueError('diagnostic_scope_changed')
         return advisory
     except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:

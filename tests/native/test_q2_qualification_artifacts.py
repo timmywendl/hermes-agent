@@ -728,7 +728,9 @@ def test_actual_ext4_startup_diagnostic_is_advisory_and_excluded_from_candidate(
     manifest = _write_manifest(tmp_path, 'slot.json', {
         'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
         'scope': work(base)['assignment'], 'role': 'developer'})
-    advisory = inspect_startup(manifest['manifest_path'])
+    with pytest.raises(ValueError, match='q2_startup_manifest_changed'):
+        inspect_startup(manifest['manifest_path'], expected_manifest_sha256='0' * 64)
+    advisory = inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
     assert advisory['status'] == 'OBSERVED_UNTRUSTED' and advisory['retirement_proof'] is False
     assert advisory['receipt']['stage'] == 9
     candidate = freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
@@ -761,7 +763,7 @@ def test_actual_ext4_invalid_startup_receipt_cannot_be_evidence(repository, tmp_
         'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
         'scope': work(base)['assignment'], 'role': 'reviewer' if damage == 'reviewer' else 'developer'})
     with pytest.raises(ValueError, match='q2_'):
-        inspect_startup(manifest['manifest_path'])
+        inspect_startup(manifest['manifest_path'], expected_manifest_sha256=manifest['manifest_sha256'])
 
 
 @pytest.mark.parametrize('module,function,stage', [

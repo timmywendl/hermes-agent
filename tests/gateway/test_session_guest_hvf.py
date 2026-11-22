@@ -1111,3 +1111,38 @@ def test_q2_group_snapshot_exit_window_is_not_descendant_false_positive(monkeypa
     monkeypatch.setattr(process, 'group_members', lambda _pgid: ())
     assert observer.poll(time.monotonic() + 5) is False
     assert observer.observation['last_observed_group_members'] == []
+
+
+@pytest.mark.parametrize('damage', ['none', 'scope', 'inode', 'task_type', 'retirement', 'timeout'])
+def test_stopped_disk_diagnostic_binds_original_manifest_and_booked_device(tmp_path, monkeypatch, damage):
+    tool = tmp_path / 'pinned-tool'
+    tool.write_bytes(b'data-only interpreter identity fixture; never executed')
+    scope = {'task_id': 'fixture', 'run_id': 1}
+    task = {'path': str(tmp_path / 'task.raw'), 'st_dev': 1, 'st_ino': 2, 'size': 64}
+    handle = SimpleNamespace(task_checkpoint_fd=None,
+        device_record={'manifest_path': 'frozen-slot.json', 'manifest_sha256': 'b' * 64,
+                       'scope': scope, 'task': task},
+        authority=SimpleNamespace(profile_id=str(tmp_path / 'profile')),
+        batch=SimpleNamespace(profile=tmp_path / 'profile', body={'artifact_python': {
+            'path': str(tool), 'sha256': hashlib.sha256(tool.read_bytes()).hexdigest()}}))
+    observation = {'wait_result': 'REAPED_BY_ORIGINAL_OWNER', 'identity_status': 'VERIFIED',
+                   'process_group_status': 'EMPTY', 'all_pipes_closed': True}
+    advisory = {'authority': 'UNTRUSTED_GUEST_DIAGNOSTIC_ONLY', 'retirement_proof': False,
+                'status': 'OBSERVED_UNTRUSTED', 'scope': dict(scope), 'task': dict(task)}
+    changes = {'none': lambda: None, 'scope': lambda: advisory['scope'].update(run_id=2),
+               'inode': lambda: advisory['task'].update(st_ino=3),
+               'task_type': lambda: advisory.update(task='invalid'),
+               'retirement': lambda: advisory.update(retirement_proof=True), 'timeout': lambda: None}
+    changes[damage]()
+
+    def inspect(args, **kwargs):
+        assert args[args.index('--expected-manifest-sha256') + 1] == 'b' * 64
+        assert 0 < kwargs['timeout'] <= 10
+        if damage == 'timeout':
+            raise subprocess.TimeoutExpired(args, kwargs['timeout'])
+        return json.dumps(advisory).encode()
+
+    monkeypatch.setattr(q2.subprocess, 'check_output', inspect)
+    result = q2.inspect_failed_startup(handle, observation, time.monotonic() + 5)
+    assert result['retirement_proof'] is False
+    assert result['status'] == ('OBSERVED_UNTRUSTED' if damage == 'none' else 'UNKNOWN')

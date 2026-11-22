@@ -118,10 +118,13 @@ def _startup_node(node, *, directory=False):
         raise ValueError('q2_startup_node_invalid')
 
 
-def inspect_startup(manifest):
+def inspect_startup(manifest, *, expected_manifest_sha256):
     """Data-only post-stop inspection; caller must establish exact wait first."""
     from dissect.extfs import ExtFS
     record = _read_manifest(manifest, 'HERMES_Q2_SLOT_DEVICES_V1')
+    if (record['manifest_sha256'] != expected_manifest_sha256 or
+            record['role'] not in ('developer', 'reviewer')):
+        raise ValueError('q2_startup_manifest_changed')
     disk = record['task']
     before = file_record(disk['path'])
     if any(before[key] != disk[key] for key in ('st_dev', 'st_ino', 'size')):
@@ -462,9 +465,11 @@ def main():
     verify.add_argument('--kind', choices=('candidate', 'slot'), required=True)
     startup = commands.add_parser('inspect-startup')
     startup.add_argument('--manifest', type=Path, required=True)
+    startup.add_argument('--expected-manifest-sha256', required=True)
     args = parser.parse_args()
     operations = {
-        'inspect-startup': lambda: inspect_startup(args.manifest),
+        'inspect-startup': lambda: inspect_startup(args.manifest,
+            expected_manifest_sha256=args.expected_manifest_sha256),
         'freeze': lambda: freeze_candidate(args.task_disk, args.output,
                                            expected_base=args.expected_base,
                                            expected_head=args.expected_head),

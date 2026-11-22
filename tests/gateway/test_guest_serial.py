@@ -1387,7 +1387,7 @@ def test_real_socketpair_boot_prelude_keeps_first_rpc_sequence_one(owner, prelud
 
 @pytest.mark.platforms('posix')
 @pytest.mark.parametrize('damage', ['scope', 'duplicate_key', 'extra_key', 'noncanonical', 'gap',
-                                  'stage_gap', 'stage_zero', 'errno', 'oversized', 'partial', 'late'])
+                                  'stage_gap', 'failed_stage_gap', 'stage_zero', 'errno', 'oversized', 'partial', 'late'])
 def test_real_serial_reader_rejects_bad_boot_prelude_without_rpc_authority(damage):
     import json
     import struct
@@ -1401,7 +1401,8 @@ def test_real_serial_reader_rejects_bad_boot_prelude_without_rpc_authority(damag
     frame = json.loads(raw[4:])
     changes = {'scope': lambda: frame.update(scope_sha256='f' * 64),
                'extra_key': lambda: frame.update(extra=1), 'gap': lambda: frame.update(seq=2),
-               'stage_gap': lambda: frame.update(stage=3), 'stage_zero': lambda: frame.update(stage=0),
+               'stage_gap': lambda: frame.update(stage=3),
+               'failed_stage_gap': lambda: frame.update(stage=14, failed=1, errno=13), 'stage_zero': lambda: frame.update(stage=0),
                'errno': lambda: frame.update(errno=4096),
                'oversized': lambda: frame.update(extra='x' * 200)}
     if damage in changes:

@@ -18,7 +18,9 @@ from agent.runtime_session_guest import validate_guest_work
 from gateway.session_guest_workspace import prepare_workspace
 from native.qemu_guest.artifact_fs import ext4
 from native.qemu_guest.artifact_inventory import file_record, verify_tree
-from native.qemu_guest.build_artifacts import MKE2FS_CONFIG, private_git_snapshot
+from native.qemu_guest.build_artifacts import (
+    MKE2FS_CONFIG, STARTUP_DIRECTORY, STARTUP_STAGES, private_git_snapshot,
+)
 from native.qemu_guest.build_inputs import canonical
 from native.qemu_guest.image_contract import GuestImage
 from native.qemu_guest.verify_images import git_head
@@ -91,6 +93,62 @@ def _read_manifest(path, schema):
     return record | {'manifest_path': str(Path(path).resolve()), 'manifest_sha256': info['sha256']}
 
 
+def startup_receipt(raw):
+    """Untrusted Guest numbers, never Worker completion or retirement evidence."""
+    if not isinstance(raw, bytes) or not 0 < len(raw) < 160:
+        raise ValueError('q2_startup_receipt_bounds')
+    record = json.loads(raw)
+    fields = {'errno', 'exception', 'exit_code', 'signal', 'stage', 'version'}
+    if (not isinstance(record, dict) or set(record) != fields or
+            any(type(value) is not int for value in record.values()) or
+            canonical(record).encode() != raw or record['version'] != 1 or
+            record['stage'] not in STARTUP_STAGES.values() or
+            not 0 <= record['errno'] <= 4095 or not 0 <= record['exception'] <= 8 or
+            not -1 <= record['exit_code'] <= 255 or not 0 <= record['signal'] <= 64 or
+            (record['exit_code'] == -1) != (record['signal'] > 0)):
+        raise ValueError('q2_startup_receipt_invalid')
+    return record
+
+
+def _startup_node(node, *, directory=False):
+    expected = stat.S_IFDIR if directory else stat.S_IFREG
+    if (node.filetype != expected or node.inode.i_uid != 1000 or node.inode.i_gid != 1000 or
+            stat.S_IMODE(node.inode.i_mode) != (0o700 if directory else 0o600) or
+            (not directory and (node.inode.i_links_count != 1 or not 0 < node.size < 160))):
+        raise ValueError('q2_startup_node_invalid')
+
+
+def inspect_startup(manifest):
+    """Data-only post-stop inspection; caller must establish exact wait first."""
+    from dissect.extfs import ExtFS
+    record = _read_manifest(manifest, 'HERMES_Q2_SLOT_DEVICES_V1')
+    disk = record['task']
+    before = file_record(disk['path'])
+    if any(before[key] != disk[key] for key in ('st_dev', 'st_ino', 'size')):
+        raise ValueError('q2_startup_device_changed')
+    result = {'authority': 'UNTRUSTED_GUEST_DIAGNOSTIC_ONLY', 'retirement_proof': False,
+              'status': 'UNKNOWN', 'reason': 'NO_DURABLE_RECEIPT', 'task': before,
+              'scope': record['scope']}
+    with os.fdopen(os.open(disk['path'], os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+        fs = ExtFS(stream)
+        names = {entry.filename for entry in fs.get('/').iterdir()}
+        if STARTUP_DIRECTORY in names:
+            if record['role'] != 'developer':
+                raise ValueError('q2_reviewer_diagnostic_forbidden')
+            directory = fs.get('/' + STARTUP_DIRECTORY)
+            _startup_node(directory, directory=True)
+            if {entry.filename for entry in directory.iterdir() if entry.filename not in ('.', '..')} != {'receipt.json'}:
+                raise ValueError('q2_startup_incomplete_or_extra_files')
+            node = fs.get('/' + STARTUP_DIRECTORY + '/receipt.json')
+            _startup_node(node)
+            with node.open() as source:
+                receipt = startup_receipt(source.read(160))
+            result.update(status='OBSERVED_UNTRUSTED', reason=None, receipt=receipt)
+    if file_record(disk['path']) != before:
+        raise ValueError('q2_startup_device_changed')
+    return result
+
+
 def prepare_slot_devices(work, source, output, *, mke2fs, config=None, parent_candidate=None):
     """Build private ext4 task and assignment devices from original Owner work.
 
@@ -112,7 +170,16 @@ def prepare_slot_devices(work, source, output, *, mke2fs, config=None, parent_ca
     tool, fixed = _tool_config(output, mke2fs, config)
     workspace = prepare_workspace(source, output / 'task-tree',
                                   head=work['base_commit'], role=work['role'])
+    if (workspace.root / STARTUP_DIRECTORY).exists() or any(
+            name == STARTUP_DIRECTORY or name.startswith(STARTUP_DIRECTORY + '/')
+            for name in _tree_files(workspace.root, workspace.head)):
+        raise ValueError('q2_reserved_startup_path')
     private_git_snapshot(workspace.root)
+    if work['role'] == 'developer':
+        exclude = workspace.root / '.git/info/exclude'
+        exclude.parent.mkdir(exist_ok=True)
+        with exclude.open('a') as stream:
+            stream.write('\n/' + STARTUP_DIRECTORY + '/\n')
     verify_tree(workspace.root)
     assignment = output / 'assignment-tree'
     assignment.mkdir()
@@ -192,12 +259,25 @@ def _disk_files(task_disk):
             raise ValueError('q2_candidate_owner_invalid')
         head = git_head(fs)
         total, nodes = 0, 0
+        diagnostic_present = diagnostic_recorded = False
         for name, node in walk(fs.get('/')):
             nodes += 1
             if nodes > MAX_FILES:
                 raise ValueError('q2_candidate_bounds')
             name = name.lstrip('/')
             _safe_name(name)
+            if name == STARTUP_DIRECTORY:
+                _startup_node(node, directory=True)
+                diagnostic_present = True
+                continue
+            if name.startswith(STARTUP_DIRECTORY + '/'):
+                if name != STARTUP_DIRECTORY + '/receipt.json':
+                    raise ValueError('q2_startup_incomplete_or_extra_files')
+                _startup_node(node)
+                with node.open() as source:
+                    startup_receipt(source.read(160))
+                diagnostic_recorded = True
+                continue
             if node.inode.i_uid != 1000 or node.inode.i_gid != 1000 or node.inode.i_mode & 0o6000:
                 raise ValueError('q2_candidate_owner_invalid')
             if node.filetype == stat.S_IFDIR:
@@ -215,6 +295,8 @@ def _disk_files(task_disk):
             records[name] = {'sha256': _digest(data), 'size': len(data),
                              'mode': '100755' if node.inode.i_mode & 0o111 else '100644'}
             contents[name] = data
+    if diagnostic_present != diagnostic_recorded:
+        raise ValueError('q2_startup_incomplete_or_extra_files')
     if file_record(task_disk) != before:
         raise ValueError('q2_candidate_disk_changed')
     return before, head, records, contents
@@ -245,6 +327,8 @@ def _tree_files(snapshot, head):
         mode, kind, identity = header.decode().split()
         name = name.decode()
         _safe_name(name)
+        if name == STARTUP_DIRECTORY or name.startswith(STARTUP_DIRECTORY + '/'):
+            raise ValueError('q2_reserved_startup_path')
         if mode not in ('100644', '100755') or kind != 'blob':
             raise ValueError('q2_candidate_git_file_invalid')
         data = _git(snapshot, 'cat-file', 'blob', identity, binary=True)
@@ -376,8 +460,11 @@ def main():
     verify = commands.add_parser('verify')
     verify.add_argument('--manifest', type=Path, required=True)
     verify.add_argument('--kind', choices=('candidate', 'slot'), required=True)
+    startup = commands.add_parser('inspect-startup')
+    startup.add_argument('--manifest', type=Path, required=True)
     args = parser.parse_args()
     operations = {
+        'inspect-startup': lambda: inspect_startup(args.manifest),
         'freeze': lambda: freeze_candidate(args.task_disk, args.output,
                                            expected_base=args.expected_base,
                                            expected_head=args.expected_head),

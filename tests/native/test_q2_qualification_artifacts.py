@@ -654,3 +654,130 @@ def test_pinned_qemu_fdset_production_matcher_uses_real_modes(tmp_path, pinned_q
     else:
         assert report['ro'] == report['rw'] == -1
         assert report['ro_errno'] == report['rw_errno'] == errno.ENOENT
+
+
+def test_startup_receipt_accepts_only_bounded_numeric_final_status():
+    from native.qemu_guest.qualification_artifacts import startup_receipt
+    record = dict(errno=13, exception=3, exit_code=111, signal=0, stage=9, version=1)
+    assert startup_receipt(canonical(record).encode()) == record
+    for bad in (record | {'secret': 'private'}, record | {'extra': 1}, record | {'errno': True},
+                record | {'errno': 99999}, record | {'stage': 999},
+                record | {'exit_code': -1}, record | {'exit_code': 0, 'signal': 9},
+                record | {'exception': 'password'}, record | {'version': 2}):
+        with pytest.raises(ValueError):
+            startup_receipt(canonical(bad).encode())
+    for raw in (b'x' * 160, b'{}', b'{"errno":1e9999}', canonical(record).encode() + b' '):
+        with pytest.raises(ValueError):
+            startup_receipt(raw)
+
+
+def test_generated_startup_suppresses_exception_text_and_reviewer_writes(tmp_path, monkeypatch):
+    import builtins
+    import io
+    from types import SimpleNamespace
+    from native.qemu_guest.build_artifacts import PYTHON_STARTUP
+    namespace = {'__name__': 'diagnostic_test'}
+    exec(compile(PYTHON_STARTUP, '<generated-startup>', 'exec'), namespace)
+    folder = tmp_path / 'diagnostic'
+    folder.mkdir(mode=0o700)
+    namespace['DIRECTORY'] = str(folder)
+    actual_open = builtins.open
+    role = [b'developer\n']
+
+    def policy_open(path, *args, **kwargs):
+        return io.BytesIO(role[0]) if path == '/assignment/policy' else actual_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, 'open', policy_open)
+
+    def failed():
+        raise PermissionError(13, 'PRIVATE_TOKEN_NEVER_PERSIST')
+
+    with pytest.raises(SystemExit) as stopped:
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert stopped.value.code == 111
+    raw = (folder / 'receipt.json').read_bytes()
+    assert len(raw) < 160 and b'PRIVATE' not in raw and b'Traceback' not in raw
+    assert json.loads(raw)['errno'] == 13 and json.loads(raw)['exception'] == 3
+    (folder / 'receipt.json').unlink()
+    role[0] = b'reviewer\n'
+    with pytest.raises(SystemExit):
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert list(folder.iterdir()) == []
+    role[0] = b'developer\n'
+    (folder / '.pending').write_text('existing state')
+    with pytest.raises(SystemExit) as unavailable:
+        namespace['run_entry'](lambda: SimpleNamespace(main=failed))
+    assert unavailable.value.code == 112
+    assert (folder / '.pending').read_text() == 'existing state'
+
+
+@pytest.mark.platforms('posix')
+def test_actual_ext4_startup_diagnostic_is_advisory_and_excluded_from_candidate(repository, tmp_path, ext4_tools):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    (root / 'result.txt').write_text('actual candidate\n')
+    git(root, 'add', '.')
+    git(root, 'commit', '-qm', 'candidate')
+    folder = root / STARTUP_DIRECTORY
+    folder.mkdir(mode=0o700)
+    receipt = folder / 'receipt.json'
+    receipt.write_text(canonical(dict(errno=13, exception=3, exit_code=111, signal=0, stage=9, version=1)))
+    receipt.chmod(0o600)
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2DIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
+        'scope': work(base)['assignment'], 'role': 'developer'})
+    advisory = inspect_startup(manifest['manifest_path'])
+    assert advisory['status'] == 'OBSERVED_UNTRUSTED' and advisory['retirement_proof'] is False
+    assert advisory['receipt']['stage'] == 9
+    candidate = freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+    assert STARTUP_DIRECTORY not in candidate['content']
+    assert not (Path(candidate['snapshot_path']) / STARTUP_DIRECTORY).exists()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['symlink', 'hardlink', 'mode', 'size', 'pending', 'reviewer'])
+def test_actual_ext4_invalid_startup_receipt_cannot_be_evidence(repository, tmp_path, ext4_tools, damage):
+    from native.qemu_guest.build_artifacts import STARTUP_DIRECTORY
+    from native.qemu_guest.qualification_artifacts import inspect_startup, _write_manifest
+    root, base = repository
+    folder = root / STARTUP_DIRECTORY
+    folder.mkdir(mode=0o700)
+    receipt = folder / 'receipt.json'
+    receipt.write_text(canonical(dict(errno=0, exception=0, exit_code=111, signal=0, stage=9, version=1)))
+    receipt.chmod(0o600)
+    actions = {
+        'symlink': lambda: (receipt.unlink(), receipt.symlink_to('../base.txt')),
+        'hardlink': lambda: os.link(receipt, folder / 'alias'),
+        'mode': lambda: receipt.chmod(0o644),
+        'size': lambda: receipt.write_text('x' * 160),
+        'pending': lambda: (folder / '.pending').write_text('incomplete'),
+        'reviewer': lambda: None,
+    }
+    actions[damage]()
+    disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2BADDIAG')
+    manifest = _write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'task': file_record(disk),
+        'scope': work(base)['assignment'], 'role': 'reviewer' if damage == 'reviewer' else 'developer'})
+    with pytest.raises(ValueError, match='q2_'):
+        inspect_startup(manifest['manifest_path'])
+
+
+@pytest.mark.parametrize('module,function,stage', [
+    ('native.qemu_guest.guest_entry', 'validate_mount', 'PRE_READY_VALIDATION'),
+    ('agent.runtime_session_guest', 'validate_guest_work', 'PRE_READY_VALIDATION'),
+    ('agent.guest_serial', 'receive', 'SERIAL_OPERATION'),
+    ('agent.managed_worker', 'adopt', 'WORKER_RUNTIME'),
+    ('unrecognized', 'arbitrary', 'ENTRY_MAIN'),
+])
+def test_startup_stage_classifier_uses_bounded_names_without_guessing_first_frame(module, function, stage):
+    from native.qemu_guest.build_artifacts import PYTHON_STARTUP, STARTUP_STAGES
+    namespace = {'__name__': 'diagnostic_test'}
+    exec(compile(PYTHON_STARTUP, '<generated-startup>', 'exec'), namespace)
+    fixture = {'__name__': module}
+    exec(compile(f'def {function}():\n    raise ValueError("PRIVATE_TEXT")\n', '<stub-failure>', 'exec'), fixture)
+    try:
+        fixture[function]()
+    except ValueError as failure:
+        assert namespace['classify'](failure, STARTUP_STAGES['ENTRY_MAIN']) == STARTUP_STAGES[stage]

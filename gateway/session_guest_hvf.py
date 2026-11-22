@@ -480,6 +480,10 @@ def _error(handle):
 
 def _serve_until(handle, observer, predicate, deadline):
     while not predicate():
+        exited = observer.observation.get('exact_child_exit')
+        if exited is not None:
+            reason = 'q2_child_exited' if handle.channel.ready.is_set() else 'q2_exit_before_ready'
+            raise RuntimeStoreError(reason, detail=canonical(exited))
         _error(handle)
         if time.monotonic() >= deadline:
             raise RuntimeStoreError('q2_execution_timeout')
@@ -527,6 +531,7 @@ def acquire_child(handle, image, inference, bootstrap_path):
                             cwd=batch.profile.parent, env={'PATH': '/usr/bin:/bin', 'HOME': str(batch.profile / 'host-home')},
                             bufsize=0)
                         handle.identity = child_identity(handle.process, argv[0], handle.observed_identity)
+                        handle.process._q2_verified_identity = dict(handle.identity)
                         _persist(board, handle, {**handle.record, 'phase': 'CHILD_BOOKED', 'native_spawned': True,
                                                  'identity': handle.identity})
                     _booked_readback(handle)
@@ -818,6 +823,45 @@ def _device_exit_facts(handle, image):
     return facts
 
 
+def inspect_failed_startup(handle, observation, deadline):
+    """Advisory stopped-disk facts cannot retire or resume a failed attempt."""
+    result = {'status': 'UNKNOWN', 'retirement_proof': False,
+              'authority': 'UNTRUSTED_GUEST_DIAGNOSTIC_ONLY'}
+    if (observation.get('wait_result') != 'REAPED_BY_ORIGINAL_OWNER' or
+            observation.get('identity_status') != 'VERIFIED' or
+            observation.get('process_group_status') != 'EMPTY' or
+            observation.get('all_pipes_closed') is not True or
+            handle.task_checkpoint_fd is not None or not handle.device_record):
+        return result | {'reason': 'STOPPED_TASK_NOT_PROVEN_SAFE_TO_READ'}
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return result | {'reason': 'DIAGNOSTIC_DEADLINE_EXHAUSTED'}
+    try:
+        interpreter = handle.batch.body['artifact_python']
+        if hashlib.sha256(Path(interpreter['path']).read_bytes()).hexdigest() != interpreter['sha256']:
+            return result | {'reason': 'VERIFIER_IDENTITY_CHANGED'}
+        args = [interpreter['path'], '-m', 'native.qemu_guest.qualification_artifacts',
+                'inspect-startup', '--manifest', handle.device_record['manifest_path']]
+        env = {'PATH': '/usr/bin:/bin', 'HOME': str(handle.batch.profile / 'host-tool-home'),
+               'HERMES_HOME': handle.authority.profile_id,
+               'PYTHONPATH': str(Path(__file__).resolve().parents[1])}
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return result | {'reason': 'DIAGNOSTIC_DEADLINE_EXHAUSTED'}
+        raw = subprocess.check_output(args, env=env, cwd=Path(__file__).resolve().parents[1],
+                                      stderr=subprocess.PIPE, timeout=min(10, remaining))
+        if len(raw) > 8192:
+            raise ValueError('diagnostic_output_bounds')
+        advisory = json.loads(raw)
+        if (not isinstance(advisory, dict) or advisory.get('retirement_proof') is not False or
+                advisory.get('authority') != result['authority'] or
+                advisory.get('scope') != handle.device_record['scope']):
+            raise ValueError('diagnostic_scope_changed')
+        return advisory
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        return result | {'reason': 'DIAGNOSTIC_UNAVAILABLE', 'error_class': type(error).__name__}
+
+
 def execute_attempt(handle, image, fake, loop):
     from gateway.session_hvf_process import Q2ProcessObserver, contain_child, exit_observation
     from gateway.session_guest_inference import OwnerResponses, ResponsesPolicy
@@ -896,6 +940,7 @@ def execute_attempt(handle, image, fake, loop):
         observation['owner_serial'] = handle.channel.physical_observation() if handle.channel is not None else None
         observation['service_done'] = handle.service_done.is_set()
         try:
+            observation['startup_diagnostic'] = inspect_failed_startup(handle, observation, stop_deadline)
             write_receipt(handle.batch.output / (handle.record['attempt'] + '-exit-failure.json'), observation)
         finally:
             mark_uncertain(handle, error)

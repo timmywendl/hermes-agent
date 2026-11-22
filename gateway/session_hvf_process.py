@@ -434,22 +434,51 @@ class Q2ProcessObserver:
         self.pipes.eof.pop('serial')
         self.actual = None
 
+    def _exited(self, identity, code):
+        self.observation['exact_child_exit'] = {
+            'identity': dict(identity), 'returncode': code,
+            'exit_code': code if code >= 0 else None,
+            'terminating_signal': -code if code < 0 else None,
+            'identity_source': 'PREVIOUSLY_VERIFIED_ORIGINAL_CHILD',
+        }
+        return False
+
+    def check_child(self):
+        """Natural exit is distinct from live identity ambiguity; neither retires."""
+        historical = getattr(self.process, '_q2_verified_identity', None)
+        try:
+            actual = child_identity(self.process, self.identity['executable'])
+        except (ProcessLookupError, psutil.NoSuchProcess) as error:
+            code = self.process.poll()
+            if historical != self.identity or code is None:
+                raise RuntimeStoreError('q2_child_identity_unavailable') from error
+            return self._exited(historical, code)
+        if actual != self.identity:
+            raise RuntimeStoreError('q2_child_identity_changed')
+        self.process._q2_verified_identity = dict(actual)
+        code = self.process.poll()
+        return True if code is None else self._exited(actual, code)
+
     def start(self, deadline):
+        if not self.check_child():
+            raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
         self.pipes.until(lambda: self.pipes.greeting is not None, deadline)
         self.pipes.request('qmp_capabilities', deadline=deadline)
         self.actual = q2_inventory(self.pipes, deadline, self.expected_devices)
-        verify_child(self.process, self.identity)
+        if not self.check_child():
+            raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
         if group_members(self.identity['pgid']) != (self.process.pid,):
+            if not self.check_child():
+                raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
             raise RuntimeStoreError('q2_unapproved_descendant')
         return self.actual
 
     def poll(self, deadline):
-        if self.process.poll() is None:
-            verify_child(self.process, self.identity)
+        if self.check_child():
             members = group_members(self.identity['pgid'])
-            if members != (self.process.pid,):
+            if members != (self.process.pid,) and self.check_child():
                 raise RuntimeStoreError('q2_unapproved_descendant')
-            self.observation['last_live_group_members'] = list(members)
+            self.observation['last_observed_group_members'] = list(members)
         return self.pipes.pump(deadline)
 
     def finish(self, deadline, serial_observation):

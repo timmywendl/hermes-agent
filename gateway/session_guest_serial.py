@@ -116,6 +116,9 @@ class OwnerSerialSession:
             self.wire.send(frame['channel'], 'reply', payload, reply_to=frame['seq'])
             return True
         except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError) as failure:
+            if isinstance(failure, EOFError) and str(failure) == 'serial_eof':
+                self.peer_eof_at = self.peer_eof_at or time.monotonic()
+                self.peer_eof.set()
             if (isinstance(failure, EOFError) and str(failure) == 'serial_eof'
                     and self.stop_sent.is_set() and self.unknown_persisted.is_set() and self.endpoint.revoked):
                 with self.endpoint.authority.db._read_ctx() as conn:
@@ -356,6 +359,9 @@ class OwnerSerialSession:
         result = {'scope': dict(self.endpoint.scope), 'serial_observer': 'ORIGINAL_OWNER_SERIALWIRE',
                   'peer_eof': self.peer_eof.is_set(), 'descriptor_closed': self.wire.fd == -1,
                   'receive_pump_joined': pump is not None and not pump.is_alive(),
+                  'receive_pump_started': pump is not None,
+                  'frames_received': self.wire.received,
+                  'frames_sent': self.wire.sent,
                   'writer_joined': writer and self.wire.closed.is_set(),
                   'service_joined': service and self.service_observed and self.service_future is not None
                                     and self.service_future.done(),

@@ -1018,3 +1018,96 @@ def test_device_cleanup_crossing_stop_deadline_keeps_original_owner_unknown(owne
     assert authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
     with pytest.raises(RuntimeStoreError):
         q2.reserve_attempt(authority, batch, 2, source=source, head=head)
+
+
+@pytest.mark.platforms('posix')
+def test_q2_observer_exact_already_exited_inert_child_is_not_identity_failure(tmp_path):
+    import sys
+    from gateway.session_hvf_process import Q2ProcessObserver, child_identity
+    child = subprocess.Popen([sys.executable, '-c', 'import sys; sys.stdin.buffer.read(1)'],
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    observer = None
+    try:
+        identity = child_identity(child, sys.executable)
+        child._q2_verified_identity = dict(identity)
+        observer = Q2ProcessObserver(child, identity, output=tmp_path,
+                                    expected_devices={'root': True, 'task': False, 'assignment': True})
+        child.stdin.write(b'x')
+        child.stdin.flush()
+        assert child.wait(timeout=5) == 0
+        assert observer.check_child() is False
+        assert observer.observation['exact_child_exit']['identity'] == identity
+        assert observer.observation['exact_child_exit']['exit_code'] == 0
+        assert 'RETIRED' not in observer.observation.values()
+    finally:
+        if child.poll() is None:
+            child.stdin.close()
+            child.wait(timeout=5)
+        if observer is not None:
+            observer.close()
+        else:
+            for stream in (child.stdin, child.stdout, child.stderr):
+                stream.close()
+
+
+@pytest.mark.parametrize('window', ['lookup_gone', 'exit_after_identity', 'live', 'reused', 'unverified_gone'])
+def test_q2_observer_natural_exit_windows_and_pid_reuse_guard(monkeypatch, window):
+    from gateway import session_hvf_process as process
+    identity = {'pid': 123, 'executable': '/fixture', 'created': 10}
+    child = SimpleNamespace(pid=123, poll=lambda: None if window == 'live' else -15)
+    if window != 'unverified_gone':
+        child._q2_verified_identity = dict(identity)
+    observer = object.__new__(process.Q2ProcessObserver)
+    observer.process, observer.identity, observer.observation = child, identity, {}
+
+    def lookup(*_args):
+        if window in ('lookup_gone', 'unverified_gone'):
+            raise ProcessLookupError()
+        return identity | ({'created': 11} if window == 'reused' else {})
+
+    monkeypatch.setattr(process, 'child_identity', lookup)
+    if window in ('reused', 'unverified_gone'):
+        with pytest.raises(RuntimeStoreError, match='q2_child_identity_'):
+            observer.check_child()
+        assert observer.observation == {}
+    elif window == 'live':
+        assert observer.check_child() is True
+        assert observer.observation == {}
+    else:
+        assert observer.check_child() is False
+        assert observer.observation['exact_child_exit']['terminating_signal'] == 15
+        assert observer.observation['exact_child_exit']['exit_code'] is None
+
+
+def test_owner_classifies_exit_before_ready_without_retiring():
+    handle = SimpleNamespace(channel=SimpleNamespace(ready=threading.Event()), errors=[])
+    observer = SimpleNamespace(observation={'exact_child_exit': {'returncode': 0}})
+    with pytest.raises(RuntimeStoreError, match='q2_exit_before_ready'):
+        q2._serve_until(handle, observer, lambda: False, time.monotonic() + 5)
+    assert not handle.channel.ready.is_set()
+
+
+def test_optional_diagnostic_verifier_failure_remains_unknown(tmp_path):
+    handle = SimpleNamespace(task_checkpoint_fd=None, device_record={'manifest_path': 'fixture'},
+        batch=SimpleNamespace(body={'artifact_python': {'path': str(tmp_path / 'missing'), 'sha256': 'a' * 64}}))
+    observation = {'wait_result': 'REAPED_BY_ORIGINAL_OWNER', 'identity_status': 'VERIFIED',
+                   'process_group_status': 'EMPTY', 'all_pipes_closed': True}
+    result = q2.inspect_failed_startup(handle, observation, time.monotonic() + 5)
+    assert result['status'] == 'UNKNOWN' and result['retirement_proof'] is False
+    assert result['reason'] == 'DIAGNOSTIC_UNAVAILABLE'
+    assert result['error_class'] == 'FileNotFoundError'
+
+
+def test_q2_group_snapshot_exit_window_is_not_descendant_false_positive(monkeypatch):
+    from gateway import session_hvf_process as process
+    observer = object.__new__(process.Q2ProcessObserver)
+    observer.process = SimpleNamespace(pid=123)
+    observer.identity = {'pgid': 123}
+    observer.observation = {}
+    checks = iter((True, False))
+    observer.check_child = lambda: next(checks)
+    observer.pipes = SimpleNamespace(pump=lambda _deadline: False)
+    monkeypatch.setattr(process, 'group_members', lambda _pgid: ())
+    assert observer.poll(time.monotonic() + 5) is False
+    assert observer.observation['last_observed_group_members'] == []

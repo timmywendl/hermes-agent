@@ -1319,3 +1319,26 @@ def test_real_owner_responses_cancel_unwinds_before_held_http_returns(owner):
             server.close_transport()
             host.close()
             guest.close()
+
+
+@pytest.mark.platforms('posix')
+def test_deferred_pre_ready_peer_eof_is_fact_without_fabricated_pump_or_retirement(owner):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True)
+    host.close()
+    peer.close()
+    try:
+        with pytest.raises(EOFError, match='serial_eof'):
+            server.serve_one()
+        facts = server.physical_observation()
+        assert facts['peer_eof'] is True
+        assert facts['peer_eof_at'] is not None
+        assert facts['receive_pump_started'] is False
+        assert facts['receive_pump_joined'] is False
+        assert facts['frames_received'] == 0 and facts['frames_sent'] == 0
+        assert facts['complete'] is False and not server.ready.is_set()
+    finally:
+        server.close_transport(deadline=time.monotonic() + 5)

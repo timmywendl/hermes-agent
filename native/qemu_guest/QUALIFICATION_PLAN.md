@@ -759,3 +759,63 @@ This is PASS_EXACT_HELPER_SANDBOX_PREFLIGHT, not a new Native qualification.
 A completely fresh three-slot grant request is prepared in the new evidence
 root; Main Control review and a new Human grant remain required before Slot1.
 The failed campaign's serial cleanup remains UNKNOWN and is not retired.
+
+## Pre-READY failure RCA (Main Control 7081042775)
+
+The second failed batch reached HVF creation, QMP running, Guest-requested
+shutdown, successful `hv_vm_destroy`, and original-child reap with exit0. It did
+not produce canonical Worker READY, a Worker receipt, inference, or a candidate.
+The post-exit `getpgid` error is an independent Host observation race. Neither
+failed campaign is retired, reset, resumable, or reusable.
+
+Read-only examination of independent copies found matching kernel/module ABI,
+resolvable required ARM64 ELF loaders/libraries, readable entry sources, and an
+actual task Git HEAD matching its assignment. These are static facts, not proof
+that any Guest syscall or Python import succeeded. No concrete internal Guest
+startup cause is established. Missing optional Tkinter libraries are not an
+established cause. Reader limitations resolving `/sbin` symlinks are not image
+faults.
+
+| Stage | Preserved evidence | Remaining boundary |
+| --- | --- | --- |
+| PID1 / root transition | Static executable, kernel/module identities verified | Actual calls unobservable |
+| Private mounts / task mount | Device order, roles, actual disks verified statically | Actual mounts unobservable |
+| UART / limits / UID / cwd | Init policy and access paths inspected | Actual operations unobservable |
+| Python / Guest entry | Required ELF closure and source readability verified | Imports and entry execution unobservable |
+| Pre-READY validation / serial | Assignment and task HEAD agree | No canonical first frame or READY observed |
+| Guest shutdown / Host exit | QMP shutdown, destroy success, exact reap exit0 | Does not establish Worker execution or retirement |
+
+Response B adds one bounded numeric failure receipt on the existing Developer
+private task disk. The builder supplies a small diagnostic wrapper around the
+unchanged accepted PR16 Guest entry; it is not another Worker. PID1 records the
+child's exit/signal before poweroff. The receipt has six exact integer fields,
+less than160 bytes, no exception text/traceback/prompt/path/token, atomic rename
+and fsync. Read-only stopped-disk inspection checks exact device identity,
+UID/GID, modes, links, size and canonical schema. Diagnostics are excluded from
+candidate Git trees/snapshots and reserved against incoming source content.
+Reviewer receives no diagnostic write capability.
+
+These are **untrusted Guest diagnostic hints**, never completion, provenance of
+code execution, or retirement authority. A Guest may lie about stage/errno.
+SERIAL_OPERATION deliberately does not claim the first serial operation failed;
+traceback classification cannot distinguish all operations. ENTRY_MAIN also
+covers unclassified assignment/Git/TTY failures. Before the Developer task mount
+(and for Reviewer), no durable record is available. Failed writes, pending files,
+malformed data or expired inspection budget remain UNKNOWN. The tmpfs log still
+disappears; no raw log is copied into the task or Worker UART.
+
+Host natural exit now preserves the previously verified exact child identity
+and terminal status across lookup/poll/group-snapshot races. Live ambiguity and
+PID reuse still reject. Direct pre-READY serial EOF is recorded separately;
+no receive pump means no pump-join proof. Optional diagnostic failure cannot
+skip durable STOP_UNCERTAIN. Stop/wait, group, pipes, serial, threads and original
+Owner accounting remain independent requirements.
+
+New root/initramfs require a separately named immutable seven-artifact package,
+SBOM/provenance and refreshed signed Helper preflight. Original artifacts and
+both failed batches remain unchanged. Evidence and independent stage matrix:
+`/Users/timmywen/Documents/AI_Colleague/evidence/q2-guest-pre-ready-rca-20261122`.
+No normal QEMU, VM, Guest or Worker execution is authorized by this RCA. Any next
+three-slot batch needs a fresh reviewed source/artifact/Helper binding, new
+profile/reservations, Main Control review and a new Human grant. Old grants may
+not be replayed. FIRST_WORKER_OWNED_DELIVERY remains NOT_ACHIEVED.

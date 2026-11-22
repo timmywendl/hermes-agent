@@ -19,6 +19,91 @@ from native.qemu_guest.build_inputs import SOURCE_HEAD, canonical, digest
 HERE = Path(__file__).resolve().parent
 RUNTIME_DIRS = frozenset({'agent', 'tools', 'hermes_cli', 'gateway', 'hermes_platform',
                          'pm', 'cron', 'plugins', 'tui_gateway'})
+STARTUP_DIRECTORY = '.hermes-q2-startup-v1'
+STARTUP_STAGES = {name: index for index, name in enumerate((
+    'ROOT_TRANSITION', 'MOUNTS', 'TASK_MOUNTED', 'UART', 'LIMITS', 'IDENTITY',
+    'TASK_CWD', 'PYTHON_EXEC', 'PYTHON_ENTRY_IMPORT', 'ENTRY_MAIN',
+    'PRE_READY_VALIDATION', 'SERIAL_OPERATION', 'WORKER_RUNTIME', 'CHILD_EXIT',
+    'INVALID_DIAGNOSTIC',
+), 1)}
+# A small failure recorder around the accepted entry, not another Worker.
+# Only fixed stage/error numbers survive; never exception text or tracebacks.
+PYTHON_STARTUP = r'''import errno
+import json
+import os
+import stat
+
+DIRECTORY = "/task/.hermes-q2-startup-v1"
+STAGES = __STAGES__
+EXCEPTIONS = {"ModuleNotFoundError": 1, "ImportError": 2, "PermissionError": 3,
+              "FileNotFoundError": 4, "ValueError": 5, "OSError": 6,
+              "SystemExit": 7}
+
+def encode_receipt(stage, error=0, exception=0, exit_code=-1, signal=0):
+    return (json.dumps(dict(version=1, stage=stage, errno=error, exception=exception,
+                            exit_code=exit_code, signal=signal),
+                       sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+def write_failure(stage, failure):
+    # Reviewer must never acquire a writable task capability, even for diagnosis.
+    with open("/assignment/policy", "rb") as policy:
+        if policy.read(32) != b"developer\n":
+            return
+    error = getattr(failure, "errno", 0)
+    error = error if type(error) is int and 0 <= error <= 4095 else 0
+    raw = encode_receipt(stage, error, EXCEPTIONS.get(type(failure).__name__, 8))
+    directory = os.open(DIRECTORY, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+            raise OSError(errno.EPERM, "diagnostic_directory")
+        fd = os.open(".pending", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=directory)
+        try:
+            if os.write(fd, raw) != len(raw):
+                raise OSError(errno.EIO, "diagnostic_write")
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.rename(".pending", "receipt.json", src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+def classify(failure, stage):
+    trace = failure.__traceback__
+    for _ in range(64):
+        if trace is None:
+            break
+        module = trace.tb_frame.f_globals.get("__name__")
+        function = trace.tb_frame.f_code.co_name
+        if ((module == "native.qemu_guest.guest_entry" and function == "validate_mount")
+                or (module == "agent.runtime_session_guest" and function == "validate_guest_work")):
+            return STAGES["PRE_READY_VALIDATION"]
+        if module == "agent.guest_serial":
+            stage = STAGES["SERIAL_OPERATION"]
+        if module == "agent.managed_worker":
+            return STAGES["WORKER_RUNTIME"]
+        trace = trace.tb_next
+    return stage
+
+def run_entry(load_entry):
+    stage = STAGES["PYTHON_ENTRY_IMPORT"]
+    try:
+        entry = load_entry()
+        stage = STAGES["ENTRY_MAIN"]
+        entry.main()
+    except BaseException as failure:
+        try:
+            write_failure(classify(failure, stage), failure)
+        except OSError:
+            raise SystemExit(112) from None  # Diagnostic persistence unavailable.
+        raise SystemExit(111) from None
+
+if __name__ == "__main__":
+    import importlib
+    run_entry(lambda: importlib.import_module("native.qemu_guest.guest_entry"))
+'''.replace('__STAGES__', repr(STARTUP_STAGES))
 MKE2FS_CONFIG = """[defaults]
 base_features = sparse_super,large_file,filetype,resize_inode,dir_index,ext_attr
 blocksize = 4096
@@ -87,7 +172,8 @@ def root_tree(args, lock, output):
 
 def boot_files(args, output, root, lock):
     binary = output / 'q2-init'
-    (output / 'q2_policy.h').write_text(policy_header())
+    stages = ''.join(f'#define Q2_STAGE_{name} {value}\n' for name, value in STARTUP_STAGES.items())
+    (output / 'q2_policy.h').write_text(policy_header() + stages)
     command = [args.zig, 'cc', '-target', 'aarch64-linux-musl', '-static', '-O2',
                '-Wall', '-Wextra', '-Werror', '-fno-ident', '-s', '-Wl,--build-id=none',
                '-I', output, HERE / 'boot_init.c', '-o', binary]
@@ -96,6 +182,8 @@ def boot_files(args, output, root, lock):
                       'ZIG_GLOBAL_CACHE_DIR': str(output / 'compiler-global-cache')})
     shutil.copyfile(binary, root / 'sbin/q2-init')
     (root / 'sbin/q2-init').chmod(0o755)
+    (root / 'sbin/q2-startup.py').write_text(PYTHON_STARTUP)
+    (root / 'sbin/q2-startup.py').chmod(0o444)
     init = output / 'initramfs-tree'
     for name in ('dev', 'proc', 'sys', 'newroot', 'modules'):
         (init / name).mkdir(parents=True, exist_ok=True)

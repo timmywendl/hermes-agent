@@ -944,3 +944,44 @@ unrestricted calibrations) may run after independent safety review. QEMU normal
 initialization/VM/Guest/Worker remain NOT_RUN. No new execution profile or Native
 grant candidate is created. Three old failed grants stay STOP_UNCERTAIN and
 nonresumable; old missing evidence and Guest root causes remain UNKNOWN.
+
+## Fourth failure bounded offline review (Main Control 7085033964)
+
+Guest root cause remains UNKNOWN. Preserved stages1/2/3 are untrusted progress
+hints, not proof of a failed devtmpfs mount. Exact pinned config/source/newc and
+argv support that mount path; stage4 can be missing after mount failure, UART
+hint loss, or later unreported progress. No Guest source defect is established;
+no Guest artifact or Helper rebuild, new grant/candidate or target run is part
+of this offline package. All four historical STOP_UNCERTAIN records are immutable.
+
+The original Host process observer may reconcile an already-verified child's
+lookup-disappearance/poll-null window by calling wait on that same Popen only.
+The wait is capped at250ms and the remaining caller deadline. Historical birth
+identity and Popen PID must match; no signals, argv inference or replacement PID
+are used. Timeout/unavailable wait remains UNKNOWN. The contemporaneous poll-null
+and lookup classification remain preserved alongside the separate exact-wait
+result. Actual exit is not retirement: all pipe, process-group, VM destroy,
+Guest readiness, Owner accounting and existing final-proof gates still apply.
+
+Serial observation distinguishes NOT_STARTED, STARTED_NOT_JOINED and
+STARTED_AND_JOINED. A never-started pump retains receive_pump_joined=false.
+Only a completed and observed original service Future, free synchronous I/O
+lock, closed wire/descriptor and actual peer EOF can establish complete serial
+transport quiescence without a pump. A local close cannot create peer EOF; a
+pending/unbound service cannot create reader completion. A local-shutdown latch
+excludes read-zero/EOF caused by our own SHUT_RDWR from peer-EOF evidence.
+Started pumps retain
+their joined-thread requirement. Existing joined-pump proofs remain compatible;
+old missing-pump records gain no inferred facts or migration.
+
+Transport quiescence does not authorize healthy Worker retirement: _valid_proof
+still requires an actually joined pump, Guest READY, all original physical proof
+and Owner accounting. Pre-READY EOF therefore retains logical UNKNOWN, even if
+all transport resources are demonstrably quiescent. The fourth run did not
+observe peer EOF, so its historical serial proof remains incomplete.
+
+The bounded recommendation is to stop at these offline findings, not request a
+fifth Native run merely to obtain another missing hint. Main Control must assess
+whether a finite, evidence-supported product decision can close the remaining
+Guest-readiness gap. Real D2/model/engineering delivery needs separate permission;
+FIRST_WORKER_OWNED_DELIVERY remains NOT_ACHIEVED.

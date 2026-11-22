@@ -595,6 +595,7 @@ def _valid_identity(record):
 
 
 def _valid_proof(record, *, accounted=True):
+    from gateway.session_guest_serial import serial_reader_quiescent
     if not isinstance(record, dict):
         return False
     proof = record.get('proof')
@@ -607,6 +608,8 @@ def _valid_proof(record, *, accounted=True):
                 'guest_orderly_shutdown', 'explicit_vm_destroy', 'destroy_success',
                 'owner_work_completed')
     serial = proof.get('serial_observation', {}) if isinstance(proof, dict) else {}
+    # A pre-READY never-started reader can be quiescent, but cannot provide
+    # healthy Worker retirement: real READY traffic must have started its pump.
     serial_fields = ('peer_eof', 'descriptor_closed', 'receive_pump_joined', 'writer_joined',
                      'service_joined', 'http_joined', 'transport_joined', 'complete')
     return (isinstance(proof, dict) and isinstance(record.get('identity'), dict)
@@ -620,6 +623,7 @@ def _valid_proof(record, *, accounted=True):
             and proof.get('task_checkpoint_closed') is True and proof.get('device_exit_verified') is True
             and proof.get('parent_device_capabilities', {}).get('closed') is True
             and isinstance(serial, dict) and all(serial.get(key) is True for key in serial_fields)
+            and serial_reader_quiescent(serial)
             and all(key in record for key in SCOPE_KEYS)
             and serial.get('scope') == {key: record[key] for key in SCOPE_KEYS}
             and serial.get('serial_observer') == 'ORIGINAL_OWNER_SERIALWIRE' and serial.get('cleanup_errors') == []

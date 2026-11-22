@@ -1110,7 +1110,7 @@ def test_q2_group_snapshot_exit_window_is_not_descendant_false_positive(monkeypa
     observer.identity = {'pgid': 123}
     observer.observation = {}
     checks = iter((True, False))
-    observer.check_child = lambda: next(checks)
+    observer.check_child = lambda **_kwargs: next(checks)
     observer.pipes = SimpleNamespace(pump=lambda _deadline: False)
     monkeypatch.setattr(process, 'group_members', lambda _pgid: ())
     assert observer.poll(time.monotonic() + 5) is False
@@ -1170,7 +1170,11 @@ def test_lookup_disappearance_records_the_contemporaneous_poll_branch(monkeypatc
         polls.append(returncode)
         return returncode
 
-    child = SimpleNamespace(pid=123, poll=poll, _q2_verified_identity=history)
+    def timeout_wait(*, timeout):
+        assert 0 < timeout <= 0.25
+        raise subprocess.TimeoutExpired('owned-child', timeout)
+
+    child = SimpleNamespace(pid=123, poll=poll, wait=timeout_wait, _q2_verified_identity=history)
     observer = object.__new__(process.Q2ProcessObserver)
     observer.process, observer.identity, observer.observation = child, identity, {}
 
@@ -1267,3 +1271,125 @@ def test_real_owner_service_persists_failed_boot_then_existing_unknown_policy(ow
     finally:
         peer.close()
         handle.channel.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('macos')
+def test_disappeared_lookup_with_null_poll_waits_only_the_real_owned_child(monkeypatch):
+    from gateway import session_hvf_process as process
+    child = subprocess.Popen(['/bin/cat'], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, start_new_session=True)
+    real_wait = child.wait
+    waits = []
+    try:
+        identity = process.child_identity(child, '/bin/cat')
+        child._q2_verified_identity = dict(identity)
+        observer = object.__new__(process.Q2ProcessObserver)
+        observer.process, observer.identity, observer.observation = child, identity, {}
+        child.stdin.close()  # actual inert child exits, with an exact wait still due
+
+        def gone(*_args):
+            raise ProcessLookupError()
+
+        def owned_wait(*, timeout):
+            waits.append((child.pid, timeout))
+            return real_wait(timeout=timeout)
+
+        monkeypatch.setattr(process, 'child_identity', gone)
+        monkeypatch.setattr(child, 'poll', lambda: None)  # deterministic real-batch observation window
+        monkeypatch.setattr(child, 'wait', owned_wait)
+        assert observer.check_child() is False
+        lookup = observer.observation['identity_lookup_failure']
+        assert lookup['poll_returncode'] is None and lookup['classification'] == 'EXIT_NOT_YET_OBSERVED'
+        assert lookup['bounded_exact_child_wait']['result'] == 'REAPED_BY_ORIGINAL_OWNER'
+        assert lookup['bounded_exact_child_wait']['returncode'] == 0
+        assert waits == [(identity['pid'], 0.25)]
+        assert observer.observation['exact_child_exit']['identity'] == identity
+        assert observer.observation['exact_child_exit']['returncode'] == 0
+        assert not any(value == 'RETIRED' for value in observer.observation.values())
+    finally:
+        if not child.stdin.closed:
+            child.stdin.close()
+        real_wait(timeout=5)
+        child.stdout.close(); child.stderr.close()
+
+
+@pytest.mark.parametrize('case', ['timeout', 'echild', 'expired', 'history_mismatch', 'pid_mismatch'])
+def test_disappeared_child_bounded_wait_failure_retains_unknown(monkeypatch, case):
+    from gateway import session_hvf_process as process
+    identity = {'pid': 123, 'executable': '/fixture', 'created': 10}
+    waits = []
+
+    def wait(*, timeout):
+        waits.append(timeout)
+        if case == 'echild':
+            raise ChildProcessError('not an owned child')
+        raise subprocess.TimeoutExpired('owned-child', timeout)
+
+    history = identity | ({'created': 11} if case == 'history_mismatch' else {})
+    child = SimpleNamespace(pid=124 if case == 'pid_mismatch' else 123, poll=lambda: None,
+                            wait=wait, _q2_verified_identity=history)
+    observer = object.__new__(process.Q2ProcessObserver)
+    observer.process, observer.identity, observer.observation = child, identity, {}
+
+    def gone(*_args):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(process, 'child_identity', gone)
+    deadline = time.monotonic() + (-1 if case == 'expired' else 5)
+    with pytest.raises(RuntimeStoreError, match='q2_child_identity_unavailable'):
+        observer.check_child(deadline=deadline)
+    assert waits == ([0.25] if case in ('timeout', 'echild') else [])
+    assert 'exact_child_exit' not in observer.observation
+    assert observer.observation['identity_lookup_failure']['poll_returncode'] is None
+    assert child._q2_verified_identity == history
+
+
+def test_never_started_transport_quiescence_does_not_authorize_worker_retirement():
+    record = synthetic_retirement_record()
+    serial = record['proof']['serial_observation']
+    serial.update(receive_pump_joined=False, receive_pump_started=False, receive_pump_state='NOT_STARTED',
+                  synchronous_reader_quiescent=True)
+    from gateway.session_guest_serial import serial_reader_quiescent
+    assert serial_reader_quiescent(serial)  # closed transport is separate from a healthy Worker
+    assert not q2._valid_proof(record)
+    record['proof']['guest_ready'] = False
+    assert not q2._valid_proof(record)
+
+
+@pytest.mark.parametrize('returncode', [0, 7, -15])
+def test_exact_child_wait_respects_the_remaining_caller_deadline(monkeypatch, returncode):
+    from gateway import session_hvf_process as process
+    identity = {'pid': 123, 'executable': '/fixture', 'created': 10}
+    waits = []
+
+    def wait(*, timeout):
+        waits.append(timeout)
+        return returncode
+
+    child = SimpleNamespace(pid=123, poll=lambda: None, wait=wait, _q2_verified_identity=dict(identity))
+    observer = object.__new__(process.Q2ProcessObserver)
+    observer.process, observer.identity, observer.observation = child, identity, {}
+
+    def gone(*_args):
+        raise ProcessLookupError()
+
+    monkeypatch.setattr(process, 'child_identity', gone)
+    assert observer.check_child(deadline=time.monotonic() + 0.05) is False
+    assert len(waits) == 1 and 0 < waits[0] <= 0.05
+    exit_fact = observer.observation['exact_child_exit']
+    assert exit_fact['returncode'] == returncode
+    assert exit_fact['terminating_signal'] == (15 if returncode < 0 else None)
+
+
+@pytest.mark.parametrize('state,started,joined,accepted', [
+    ('STARTED_AND_JOINED', True, True, True),
+    ('STARTED_NOT_JOINED', True, False, False),
+    ('STARTED_NOT_JOINED', True, True, False),
+    ('NOT_STARTED', False, True, False),
+    ('STARTED_AND_JOINED', False, True, False),
+])
+def test_started_reader_retirement_requires_consistent_joined_pump_proof(state, started, joined, accepted):
+    record = synthetic_retirement_record()
+    record['proof']['serial_observation'].update(receive_pump_state=state, receive_pump_started=started,
+                                                receive_pump_joined=joined)
+    assert q2._valid_proof(record) is accepted

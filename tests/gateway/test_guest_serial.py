@@ -1514,3 +1514,128 @@ def test_first_v2_heartbeat_after_boot_is_still_sequence_one(owner):
     finally:
         guest.close(); guest.release_fd(); peer.close()
         server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('bound', [False, True])
+def test_pre_ready_eof_never_started_reader_has_explicit_quiescent_evidence(owner, bound):
+    import time
+    from hermes_state_runtime import RuntimeStoreError
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            if bound:
+                server.bind_service(future)
+            peer.close()
+            with pytest.raises((EOFError, RuntimeStoreError)):
+                future.result(timeout=5)
+            unobserved = server.physical_observation()
+            assert not unobserved['service_joined'] and not unobserved['synchronous_reader_quiescent']
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+        assert facts['complete'] is bound
+        assert facts['receive_pump_state'] == 'NOT_STARTED'
+        assert facts['receive_pump_started'] is False and facts['receive_pump_joined'] is False
+        assert facts['service_joined'] is bound and facts['synchronous_reader_quiescent'] is bound
+        assert facts['peer_eof'] and facts['descriptor_closed'] and facts['complete'] is bound
+        assert not facts['ready'] and not facts['logical_finished']
+        assert _authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+    finally:
+        peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_pre_ready_owner_close_does_not_invent_peer_eof_or_reader_join(owner, monkeypatch):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    entered, release = threading.Event(), threading.Event()
+    receive = server._receive
+
+    def held_receive():
+        entered.set()
+        assert release.wait(5)
+        return receive()
+
+    monkeypatch.setattr(server, '_receive', held_receive)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            server.bind_service(future)
+            assert entered.wait(5)
+            pending = server.physical_observation()
+            assert pending['receive_pump_state'] == 'NOT_STARTED'
+            assert not pending['synchronous_reader_quiescent'] and not pending['service_joined']
+            assert not pending['complete']
+            server.wire.close()  # local cancellation is not a peer EOF observation
+            release.set()
+            with pytest.raises(EOFError, match='serial_closed'):
+                future.result(timeout=5)
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+        assert facts['receive_pump_joined'] is False and facts['synchronous_reader_quiescent']
+        assert facts['service_joined'] and facts['descriptor_closed']
+        assert facts['peer_eof'] is False and facts['complete'] is False
+    finally:
+        release.set(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.parametrize('damage', ['state', 'started', 'joined', 'synchronous', 'service', 'fd'])
+def test_never_started_reader_requires_every_original_owner_quiescence_fact(damage):
+    from gateway.session_guest_serial import serial_reader_quiescent
+    facts = dict(receive_pump_joined=False, receive_pump_started=False, receive_pump_state='NOT_STARTED',
+                 synchronous_reader_quiescent=True, service_joined=True, descriptor_closed=True)
+    assert serial_reader_quiescent(facts)
+    changes = {'state': ('receive_pump_state', 'STARTED_NOT_JOINED'),
+               'started': ('receive_pump_started', True), 'joined': ('receive_pump_joined', True),
+               'synchronous': ('synchronous_reader_quiescent', False),
+               'service': ('service_joined', False), 'fd': ('descriptor_closed', False)}
+    key, value = changes[damage]
+    facts[key] = value
+    assert not serial_reader_quiescent(facts)
+
+
+@pytest.mark.platforms('posix')
+def test_local_shutdown_racing_a_read_zero_cannot_become_peer_eof_proof(owner, monkeypatch):
+    import time
+    _authority, _row, _scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work, defer_heartbeat=True)
+    host.close()
+    entered, shutdown_done = threading.Event(), threading.Event()
+    close_io = server._close_io
+
+    def read_after_local_shutdown():
+        entered.set()
+        assert shutdown_done.wait(5)
+        # An in-flight read may return zero after our own SHUT_RDWR. That
+        # exception is not independent evidence of the peer closing its end.
+        raise EOFError('serial_eof')
+
+    def shutdown_and_release_read():
+        close_io()  # actual socket shutdown and original descriptor close
+        shutdown_done.set()
+
+    monkeypatch.setattr(server, '_receive', read_after_local_shutdown)
+    monkeypatch.setattr(server, '_close_io', shutdown_and_release_read)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            server.bind_service(future)
+            assert entered.wait(5)
+            facts = server.close_transport(deadline=time.monotonic() + 5)
+            with pytest.raises(EOFError, match='serial_eof'):
+                future.result(timeout=5)
+        assert facts['synchronous_reader_quiescent'] and facts['service_joined']
+        assert facts['receive_pump_state'] == 'NOT_STARTED' and not facts['receive_pump_joined']
+        assert facts['descriptor_closed'] and not facts['peer_eof'] and not facts['complete']
+    finally:
+        shutdown_done.set(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)

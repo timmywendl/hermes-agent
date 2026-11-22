@@ -29,6 +29,20 @@ def boot_scope_sha256(scope):
     return hashlib.sha256(raw).hexdigest()
 
 
+def serial_reader_quiescent(facts):
+    """Accept prior joined-pump proof or explicit, fully closed sole-reader proof."""
+    if not isinstance(facts, dict):
+        return False
+    if facts.get('receive_pump_joined') is True:
+        return (facts.get('receive_pump_state', 'STARTED_AND_JOINED') == 'STARTED_AND_JOINED'
+                and facts.get('receive_pump_started', True) is True)
+    return (facts.get('receive_pump_state') == 'NOT_STARTED'
+            and facts.get('receive_pump_started') is False
+            and facts.get('receive_pump_joined') is False
+            and facts.get('synchronous_reader_quiescent') is True
+            and facts.get('service_joined') is True and facts.get('descriptor_closed') is True)
+
+
 class BootSerialWire(SerialWire):
     """The existing sole reader, specialized for an optional bounded prelude."""
 
@@ -114,6 +128,7 @@ class OwnerSerialSession:
         self.persisted_finish = threading.Event()
         self.finished = threading.Event()
         self.peer_eof = threading.Event()
+        self.local_shutdown_started = threading.Event()
         self.transport_joined = threading.Event()
         self.ready_at = self.result_at = self.finished_at = self.peer_eof_at = None
         self.cleanup_errors = []
@@ -200,10 +215,12 @@ class OwnerSerialSession:
             self.wire.send(frame['channel'], 'reply', payload, reply_to=frame['seq'])
             return True
         except (ValueError, TypeError, KeyError, RecursionError, OSError, EOFError) as failure:
-            if isinstance(failure, EOFError) and str(failure) == 'serial_eof':
+            real_eof = (isinstance(failure, EOFError) and str(failure) == 'serial_eof'
+                        and (self.peer_eof.is_set() or not self.local_shutdown_started.is_set()))
+            if real_eof:
                 self.peer_eof_at = self.peer_eof_at or time.monotonic()
                 self.peer_eof.set()
-            if (isinstance(failure, EOFError) and str(failure) == 'serial_eof'
+            if (real_eof
                     and self.stop_sent.is_set() and self.unknown_persisted.is_set() and self.endpoint.revoked):
                 with self.endpoint.authority.db._read_ctx() as conn:
                     worker, admission = self.endpoint._verify(conn, allow_unknown=True)
@@ -212,7 +229,7 @@ class OwnerSerialSession:
                 self.peer_eof.set()
                 self._close_io()
                 return False
-            if isinstance(failure, EOFError) and str(failure) == 'serial_eof' and self.finished.is_set():
+            if real_eof and self.finished.is_set():
                 try:
                     self._verify_finished()
                 except (ValueError, OSError, sqlite3.Error) as verification_failure:
@@ -233,7 +250,8 @@ class OwnerSerialSession:
         # EOF can race the final queued frame. Only a committed logical finish
         # permits the service reader to drain it; all other loss revokes now.
         failure = self.wire.failure
-        if isinstance(failure, EOFError) and str(failure) == 'serial_eof':
+        if (isinstance(failure, EOFError) and str(failure) == 'serial_eof'
+                and not self.local_shutdown_started.is_set()):
             self.peer_eof_at = time.monotonic()
             self.peer_eof.set()
             if self.result_ready.is_set() and self.persisted_finish.is_set():
@@ -278,6 +296,7 @@ class OwnerSerialSession:
         import os
         import socket
         import errno
+        self.local_shutdown_started.set()
         try:
             if self.wire.fd >= 0:
                 with socket.socket(fileno=os.dup(self.wire.fd)) as connection:
@@ -370,6 +389,7 @@ class OwnerSerialSession:
 
     def _cleanup_transport(self, *, deadline, revoke):
         self.stop.set()
+        self.local_shutdown_started.set()
         self.wire.close()
         failures = []
         if revoke:
@@ -436,29 +456,36 @@ class OwnerSerialSession:
         service = self.io_lock.acquire(blocking=False)
         if service:
             self.io_lock.release()
+        service_joined = (service and self.service_observed and self.service_future is not None
+                          and self.service_future.done())
+        pump_joined = pump is not None and not pump.is_alive()
         inference = self.inference
         http_complete = (not isinstance(inference, OwnerResponses) or
                          (inference.closed and (inference.pending is None or inference.pending.done())
                           and all(not thread.is_alive() for thread in inference.executor._threads)))
         result = {'scope': dict(self.endpoint.scope), 'serial_observer': 'ORIGINAL_OWNER_SERIALWIRE',
                   'peer_eof': self.peer_eof.is_set(), 'descriptor_closed': self.wire.fd == -1,
-                  'receive_pump_joined': pump is not None and not pump.is_alive(),
+                  'receive_pump_joined': pump_joined,
                   'receive_pump_started': pump is not None,
+                  'receive_pump_state': ('NOT_STARTED' if pump is None else
+                                         'STARTED_AND_JOINED' if pump_joined else 'STARTED_NOT_JOINED'),
+                  'synchronous_reader_quiescent': (pump is None and service_joined
+                                                 and self.wire.closed.is_set() and self.wire.fd == -1),
                   'frames_received': self.wire.received,
                   'frames_sent': self.wire.sent,
                   'boot_hints_untrusted': list(getattr(self.wire, 'boot_hints', [])),
                   'writer_joined': writer and self.wire.closed.is_set(),
-                  'service_joined': service and self.service_observed and self.service_future is not None
-                                    and self.service_future.done(),
+                  'service_joined': service_joined,
                   'http_joined': http_complete, 'transport_joined': self.transport_joined.is_set(),
                   'logical_finished': self.finished.is_set() and self.persisted_finish.is_set(),
                   'ready': self.ready.is_set(), 'ready_at': self.ready_at, 'result_at': self.result_at,
                   'finished_at': self.finished_at, 'peer_eof_at': self.peer_eof_at,
                   'service_failure': self.service_failure,
                   'cleanup_errors': list(self.cleanup_errors)}
-        fields = ('peer_eof', 'descriptor_closed', 'receive_pump_joined', 'writer_joined',
+        fields = ('peer_eof', 'descriptor_closed', 'writer_joined',
                   'service_joined', 'http_joined', 'transport_joined')
-        result['complete'] = all(result[field] is True for field in fields) and not self.cleanup_errors
+        result['complete'] = (all(result[field] is True for field in fields)
+                              and serial_reader_quiescent(result) and not self.cleanup_errors)
         return result
 
     def cancel(self, *, send=True):

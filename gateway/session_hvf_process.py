@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 import selectors
 import signal
+import subprocess
 import time
 
 import psutil
@@ -443,14 +444,14 @@ class Q2ProcessObserver:
         }
         return False
 
-    def check_child(self):
+    def check_child(self, *, deadline=None):
         """Natural exit is distinct from live identity ambiguity; neither retires."""
         historical = getattr(self.process, '_q2_verified_identity', None)
         try:
             actual = child_identity(self.process, self.identity['executable'])
         except (ProcessLookupError, psutil.NoSuchProcess) as error:
             code = self.process.poll()
-            matches = historical == self.identity
+            matches = historical == self.identity and self.process.pid == self.identity['pid']
             classification = ('UNVERIFIED_HISTORY' if not matches else
                               'EXIT_NOT_YET_OBSERVED' if code is None else 'EXACT_CHILD_EXIT')
             lookup = {'historical_identity': dict(historical) if isinstance(historical, dict) else None,
@@ -458,6 +459,23 @@ class Q2ProcessObserver:
                       'poll_returncode': code, 'lookup_exception': type(error).__name__,
                       'observed_monotonic': time.monotonic(), 'classification': classification}
             self.observation['identity_lookup_failure'] = lookup
+            if matches and code is None:
+                # The kernel may remove the process before Popen's nonblocking
+                # poll observes exit. Wait only on this already-owned child;
+                # never signal, look up another PID or replace the birth identity.
+                remaining = 0.25 if deadline is None else min(0.25, max(0, deadline - time.monotonic()))
+                wait = {'timeout_seconds': remaining, 'started_monotonic': time.monotonic()}
+                lookup['bounded_exact_child_wait'] = wait
+                try:
+                    if remaining <= 0:
+                        raise subprocess.TimeoutExpired('owned-child', remaining)
+                    code = self.process.wait(timeout=remaining)
+                except (subprocess.TimeoutExpired, ChildProcessError, OSError) as failure:
+                    wait.update(result='UNKNOWN', exception=type(failure).__name__,
+                                finished_monotonic=time.monotonic())
+                else:
+                    wait.update(result='REAPED_BY_ORIGINAL_OWNER', returncode=code,
+                                finished_monotonic=time.monotonic())
             if not matches or code is None:
                 raise RuntimeStoreError('q2_child_identity_unavailable', detail=json.dumps(lookup)) from error
             return self._exited(historical, code)
@@ -468,23 +486,23 @@ class Q2ProcessObserver:
         return True if code is None else self._exited(actual, code)
 
     def start(self, deadline):
-        if not self.check_child():
+        if not self.check_child(deadline=deadline):
             raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
         self.pipes.until(lambda: self.pipes.greeting is not None, deadline)
         self.pipes.request('qmp_capabilities', deadline=deadline)
         self.actual = q2_inventory(self.pipes, deadline, self.expected_devices)
-        if not self.check_child():
+        if not self.check_child(deadline=deadline):
             raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
         if group_members(self.identity['pgid']) != (self.process.pid,):
-            if not self.check_child():
+            if not self.check_child(deadline=deadline):
                 raise RuntimeStoreError('q2_exit_before_inventory', detail=json.dumps(self.observation['exact_child_exit']))
             raise RuntimeStoreError('q2_unapproved_descendant')
         return self.actual
 
     def poll(self, deadline):
-        if self.check_child():
+        if self.check_child(deadline=deadline):
             members = group_members(self.identity['pgid'])
-            if members != (self.process.pid,) and self.check_child():
+            if members != (self.process.pid,) and self.check_child(deadline=deadline):
                 raise RuntimeStoreError('q2_unapproved_descendant')
             self.observation['last_observed_group_members'] = list(members)
         return self.pipes.pump(deadline)
@@ -496,10 +514,11 @@ class Q2ProcessObserver:
             raise RuntimeStoreError('q2_exit_or_shutdown_unverified')
         backend = q2_markers(self.pipes.buffers['stderr'], self.process.pid)
         serial = serial_observation() if callable(serial_observation) else serial_observation
-        fields = ('peer_eof', 'descriptor_closed', 'receive_pump_joined', 'writer_joined',
+        from gateway.session_guest_serial import serial_reader_quiescent
+        fields = ('peer_eof', 'descriptor_closed', 'writer_joined',
                   'service_joined', 'http_joined', 'transport_joined', 'complete')
         if (not isinstance(serial, dict) or serial.get('serial_observer') != 'ORIGINAL_OWNER_SERIALWIRE'
-                or any(serial.get(field) is not True for field in fields)
+                or any(serial.get(field) is not True for field in fields) or not serial_reader_quiescent(serial)
                 or serial.get('cleanup_errors') != []):
             raise RuntimeStoreError('q2_owner_serial_unretired')
         pipes = {name: {'closed': getattr(self.process, name).closed} for name in ('stdin', 'stdout', 'stderr')}

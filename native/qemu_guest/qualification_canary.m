@@ -91,7 +91,16 @@ static NSString *hex(NSData *value) {
     return result;
 }
 
-static NSDictionary *code_identity(void) {
+static NSString *file_sha256(NSString *path) {
+    if (!path) return @"";
+    NSData *bytes = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:NULL];
+    if (!bytes || bytes.length > UINT32_MAX) return @"";
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(bytes.bytes, (CC_LONG)bytes.length, hash);
+    return hex([NSData dataWithBytes:hash length:sizeof(hash)]);
+}
+
+static NSDictionary *code_identity(bool diagnostic) {
     SecCodeRef code = NULL;
     CFDictionaryRef info = NULL;
     if (SecCodeCopySelf(kSecCSDefaultFlags, &code) != errSecSuccess ||
@@ -102,7 +111,31 @@ static NSDictionary *code_identity(void) {
     NSDictionary *data = (__bridge NSDictionary *)info;
     NSString *identifier = data[(__bridge NSString *)kSecCodeInfoIdentifier];
     NSData *cdhash = data[(__bridge NSString *)kSecCodeInfoUnique];
-    NSDictionary *result = @{@"identifier": identifier ?: @"", @"cdhash": cdhash ? hex(cdhash) : @""};
+    NSMutableDictionary *result = [@{@"identifier": identifier ?: @"",
+                                     @"cdhash": cdhash ? hex(cdhash) : @""} mutableCopy];
+    if (diagnostic) {
+        NSURL *executable = data[(__bridge NSString *)kSecCodeInfoMainExecutable];
+        NSString *app = [NSBundle mainBundle].bundlePath;
+        NSMutableDictionary *inventory = [NSMutableDictionary dictionary];
+        NSDirectoryEnumerator *paths = [NSFileManager.defaultManager enumeratorAtPath:app];
+        for (NSString *relative in paths) {
+            NSString *path = [app stringByAppendingPathComponent:relative];
+            struct stat record;
+            if (lstat(path.fileSystemRepresentation, &record) || S_ISLNK(record.st_mode)) {
+                CFRelease(info); CFRelease(code); return @{};
+            }
+            if (S_ISREG(record.st_mode)) {
+                if (record.st_nlink != 1) {
+                    CFRelease(info); CFRelease(code); return @{};
+                }
+                inventory[path] = file_sha256(path);
+            }
+        }
+        result[@"executable"] = executable.path ?: @"";
+        result[@"executable_sha256"] = file_sha256(executable.path);
+        result[@"entitlements"] = data[(__bridge NSString *)kSecCodeInfoEntitlementsDict] ?: @{};
+        result[@"package_inventory"] = inventory;
+    }
     CFRelease(info); CFRelease(code);
     return result;
 }
@@ -212,8 +245,12 @@ static NSDictionary *device_control(NSDictionary *plan, bool canary) {
         errno = 0;
         ssize_t write = canary ? pwrite(fd, &value, 1, 0) : -1; int write_error = errno;
         int access = fcntl(fd, F_GETFL) & O_ACCMODE;
+        struct stat info = {0};
+        bool observed = fstat(fd, &info) == 0;
         result[name] = @{@"read": @((bool)(read == 1)), @"read_errno": @(read_error),
-                         @"write": @((bool)(write == 1)), @"write_errno": @(write_error), @"access": @(access)};
+                         @"write": @((bool)(write == 1)), @"write_errno": @(write_error), @"access": @(access),
+                         @"observed": @(observed), @"fd": @(fd), @"st_dev": @(info.st_dev),
+                         @"st_ino": @(info.st_ino), @"size": @(info.st_size)};
     }
     /* No nonce/data is injected into a real Worker UART. Identity only. */
     result[@"serial_identity"] = @((bool)hermes_q2_serial_identity([plan[@"serial_fd"] intValue]));
@@ -301,8 +338,9 @@ static int preflight(const char *path, int argc, char **argv, bool canary) {
             @"sandbox": @(sandbox), @"hypervisor": @(hv), @"network_entitlements_absent": @(no_network),
             @"approved_reads": @(approved), @"negative": negative, @"negative_writes": negative_writes,
             @"bundle_write": bundle_write, @"devices": devices,
-            @"network": network, @"legacy_keychain": legacy, @"identity": code_identity(),
-            @"vm_created": @NO, @"descriptor_identity": @YES, @"pid": @(getpid()), @"canary": @(canary)};
+            @"network": network, @"legacy_keychain": legacy, @"identity": code_identity(canary),
+            @"vm_created": @NO, @"descriptor_identity": @YES, @"pid": @(getpid()), @"canary": @(canary),
+            @"role": plan[@"role"], @"serial_fd": plan[@"serial_fd"]};
         NSData *json = [NSJSONSerialization dataWithJSONObject:report options:NSJSONWritingSortedKeys error:NULL];
         fputs("HERMES_Q2_SANDBOX_RESULT_V1 ", stderr);
         fwrite(json.bytes, 1, json.length, stderr); fputc('\n', stderr); fflush(stderr);

@@ -696,3 +696,31 @@ Owner 保留精确 task FD 至退出后 fsync，核验只读设备字节与 inod
 静态检查、回归、Mutation、独立 exact-HEAD Review 及三 Slot 请求均由该目录的最终索引绑定。
 所有旧失败日志保留；离线 synthetic physical facts 不记作 Native PASS。
 FIRST_WORKER_OWNED_DELIVERY 仍为 NOT_ACHIEVED；未恢复真实 Worker 派工。
+
+## 15. Exact-Helper 无 VM 前置验证更新
+
+第 14 节的 Canary 状态及历史证据保持原样。Main Control 在 comment 7076531521
+拒绝等价性豁免，并授权本次实际 Helper 无 VM 诊断；没有签发三 Slot grant。
+`qualification-main.patch` 增加独立 `--hermes-q2-sandbox-preflight` 分支，
+直接返回已有 `hermes_q2_canary()`，发生在正常 Q2 guard、admission gate 和
+`qemu_init` 之前。正常 `--hermes-hvf-q2` 路径保持不变。
+
+新 Helper 已重新构建和签名，Developer 与 Reviewer 各执行一次实际主二进制诊断。
+两次均为 **PASS_EXACT_HELPER_SANDBOX_PREFLIGHT**；Helper 自己报告的 SHA256、
+SecCodeCopySelf CDHash/identifier、entitlements、完整 App 清单及 role/FD 事实
+均与独立 Host 核验一致。原七制品的字节与 inode 在前后保持不变。
+独立 Calibration → 实际 Helper Sandbox → Calibration recheck 顺序完整，
+受限文件、UNIX endpoint、网络连接与监听的负向结果均为 EPERM。
+Developer 仅 task FD 可写；Reviewer 的三个设备 FD 全部只读。
+
+HELPER_PREFLIGHT_INVOCATIONS = 2；QEMU_RUNTIME_ENTRIES = 0；
+QEMU_VM_CREATES = 0；GUEST_STARTS = 0；WORKER_EXECUTIONS = 0。
+这里的 runtime entry 指正常运行初始化；上游 pre-main QMP 表注册和 RCU 支撑线程
+会执行，但不创建 VM、不启动 QMP 服务或 Guest。独立实际二进制反汇编、对象重建、
+入口 trap 测试和精确 child wait 一起支撑无 VM 结论，不单独依赖 vm_created=false。
+
+新证据根：
+`/Users/timmywen/Documents/AI_Colleague/evidence/q2-exact-helper-preflight-20261122`。
+新 source/helper/manifest/SBOM/provenance 与三 Slot 请求重新冻结；旧 Helper、Canary、
+失败日志、历史 grant、STOP_UNCERTAIN 及误发对话修改的保全副本均保留。
+本次结果仍不授权 Slot1–3、真实模型、生产凭据、真实项目写入或 Board 派工。

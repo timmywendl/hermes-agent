@@ -37,26 +37,44 @@ before release. The fixed budget is three starts, one concurrent VM, 2 vCPU,
 2 GiB RAM, at most 8 GiB disks, 60 seconds startup, 30 seconds stop/cleanup,
 300 seconds per slot and 900 seconds total, with no retry, resume or reboot.
 
-A separate Q2 Helper has been built and signed; its offline receipt contains
-its complete App inventory, source bindings, entitlements, SBOM and provenance.
-Actual OS positive/negative controls have run in a separate primary Canary App
-with the same App identifier and entitlements and the exact linked preflight
-object. Their status is `PASS_POLICY_EQUIVALENT_CANARY_ONLY`: the Canary has a
-different Mach-O CDHash and resource prefix. This is **not** evidence that the
-actual QEMU Helper executable has run under its Sandbox. The initial secondary
-executable's pre-main `secinit` failure and all failed build/control records are
-retained. Exact-Helper preflight remains `NOT_RUN`; accepting the documented
-equivalence or authorizing that preflight is a remaining Main Control decision.
+The original separately signed Canary evidence remains historical
+`PASS_POLICY_EQUIVALENT_CANARY_ONLY`. Main Control rejected an equivalence waiver
+and authorized exact-Helper no-VM diagnostics in Issue #139 comment 7076531521.
+The old Helper, Canary reports, failed `secinit` records and original seven
+Guest artifacts are unchanged.
+
+The rebuilt, signed actual Helper now returns directly through
+`--hermes-q2-sandbox-preflight` into the existing `hermes_q2_canary()` before
+either gate or normal QEMU initialization. Developer and Reviewer diagnostics
+both passed under its own Sandbox and CDHash
+`8d24ac08f1d56cbd09d1502bc7dc84573d3a3fc9`.
+Executable SHA256:
+`678ca15da28d8bd691fa4b00e7daf0c42d060bf46c31b1079b704c7b19e99e14`.
+The Helper itself reports its signing identity, entitlements, executable digest,
+complete App inventory, role and observed inherited FD identities/access modes.
+Unrestricted Calibration runs before and after each role; all denied resources
+and network controls returned EPERM, not ENOENT.
+
+The result is `PASS_EXACT_HELPER_SANDBOX_PREFLIGHT`: two actual diagnostic
+invocations, zero normal QEMU runtime entries, VM creations, Guest starts or
+Worker executions. Independent source/object/disassembly review proves the
+early return; precise child wait and closed pipes are retained. Upstream
+pre-main constructors register QMP command tables and start an RCU support
+thread; they do not enter operational QMP, Hypervisor or Guest execution.
+Exact process exit ends these process-owned support threads.
+The full new Helper inventory, SBOM/provenance, raw self-reports and wait facts
+are preserved under
+`/Users/timmywen/Documents/AI_Colleague/evidence/q2-exact-helper-preflight-20261122`.
 
 The prepared Native payload is a request, never authority. It freezes the final
 combined source HEAD, original seven device identities, Helper identity,
 Sandbox evidence, exact disposable paths, deterministic derivation recipe and
 resource budget. A separate protected original-Owner operator action must record
-an explicit subsequent Human grant. **QEMU/HVF, Guest Worker, real models,
+an explicit subsequent Human grant. **Normal QEMU/HVF, Guest Worker, real models,
 credentials, Runtime Apply, real project writes and Board dispatch remain
 NOT_RUN / NOT_AUTHORIZED in this offline package.** The sections below preserve
 the accepted PR16/17/18 contracts; historical source-only phase statements do
-not negate the separately recorded offline construction and Canary evidence.
+not negate the separately recorded construction and no-VM diagnostic evidence.
 
 ## Wire and dependencies
 

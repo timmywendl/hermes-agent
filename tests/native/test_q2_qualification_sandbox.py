@@ -1,4 +1,4 @@
-"""Q2 packaging/control contracts; no QEMU, Guest, Worker or model is executed."""
+"""Q2 exact diagnostic contracts using compiled inert fixtures, never a QEMU VM."""
 from copy import deepcopy
 import json
 import os
@@ -55,10 +55,14 @@ def test_developer_is_the_only_writable_fdset():
 
 def control(role, sandboxed):
     writable = role == 'developer'
+    bindings = device_records()
+    devices = {name: dict({key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size')},
+                          read=True, write=name == 'task' and writable, observed=True,
+                          access=os.O_RDWR if name == 'task' and writable else os.O_RDONLY)
+               for name, row in bindings.items()}
     return {'vm_created': False, 'descriptor_identity': True, 'approved_reads': True,
-            'devices': {'root': {'read': True, 'write': False},
-                        'task': {'read': True, 'write': writable},
-                        'assignment': {'read': True, 'write': False}, 'serial_identity': True},
+            'devices': dict(devices, serial_identity=True), 'role': role, 'serial_fd': 20,
+            'pid': 123, 'canary': True,
             'pass': sandboxed, 'sandbox': sandboxed, 'hypervisor': sandboxed,
             'network_entitlements_absent': True,
             'negative': {key: {'allowed': not sandboxed, 'errno': 1 if sandboxed else 0}
@@ -68,70 +72,171 @@ def control(role, sandboxed):
             'bundle_write': {'allowed': not sandboxed, 'errno': 1 if sandboxed else 0},
             'network': {key: {'allowed': not sandboxed, 'errno': 1 if sandboxed else 0}
                         for key in ('tcp4', 'udp4', 'tcp6', 'udp6', 'listen4', 'listen6')},
-            'legacy_keychain': {'public_dummy_matches': not sandboxed},
-            'identity': {'identifier': 'fixed', 'cdhash': 'canary'}}
+            'legacy_keychain': {'public_dummy_matches': not sandboxed}, 'identity': {}}
 
 
 def package_report():
-    package = {'identity': {'identifier': 'fixed', 'cdhash': 'helper'},
-               'canary_identity': {'identifier': 'fixed', 'cdhash': 'canary'},
-               'helper': 'helper', 'canary': 'canary', 'inventory': {},
-               'static_policy_sha256': 'a' * 64, 'canary_static_policy_sha256': 'c' * 64, 'canary_inventory': {}, 'objects': {'object_sha256': {'preflight': 'b' * 64}}}
-    rows = [{'role': role, 'mode': mode, 'returncode': 0 if mode == 'sandboxed' else 2,
-             'report': control(role, mode == 'sandboxed')}
-            for role in ('developer', 'reviewer') for mode in ('unrestricted', 'sandboxed', 'positive-recheck')]
-    report = {'schema': 'HERMES_Q2_SANDBOX_CONTROLS_V1', 'status': 'PASS_POLICY_EQUIVALENT_CANARY_ONLY',
-              'helper_execution': 'NOT_RUN', 'helper_identity': package['identity'],
-              'canary_identity': package['canary_identity'], 'package_inventory': {},
+    from native.qemu_guest.qualification_package import ENTITLEMENTS, PREFLIGHT_FLAG
+    package = {'identity': {'identifier': 'fixed', 'cdhash': 'helper', 'entitlements': ENTITLEMENTS},
+               'helper': '/public/HermesQ2HVF.app/Contents/MacOS/qemu-system-aarch64', 'inventory': {},
+               'helper_sha256': 'd' * 64, 'static_policy_sha256': 'a' * 64,
+               'objects': {'object_sha256': {'preflight': 'b' * 64}}}
+    rows = []
+    for role in ('developer', 'reviewer'):
+        for mode in ('unrestricted', 'sandboxed', 'positive-recheck'):
+            record = control(role, mode == 'sandboxed')
+            record['identity'] = dict(package['identity'], executable=package['helper'],
+                executable_sha256=package['helper_sha256'], package_inventory=package['inventory'])
+            rows.append({'role': role, 'mode': mode, 'returncode': 0 if mode == 'sandboxed' else 2,
+                         'report': record, 'argv': [package['helper'], PREFLIGHT_FLAG], 'child_pid': 123,
+                         'devices': {name: {key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size')}
+                                     for name, row in device_records().items()}, 'serial_fd': 20})
+    report = {'schema': 'HERMES_Q2_SANDBOX_CONTROLS_V2', 'status': 'PASS_EXACT_HELPER_SANDBOX_PREFLIGHT',
+              'helper_execution': 'NO_VM_PREFLIGHT_ONLY', 'helper_identity': package['identity'],
+              'helper_sha256': package['helper_sha256'], 'package_inventory': {},
               'preflight_object_sha256': 'b' * 64, 'static_policy_sha256': 'a' * 64,
-              'qemu_executions': 0, 'same_cdhash_canary_execution': False, 'results': rows,
-              'canary_static_policy_sha256': 'c' * 64, 'canary_inventory': {}}
+              'same_cdhash_helper_execution': True, 'results': rows,
+              'execution_counts': {'helper_preflight_invocations': 2, 'qemu_runtime_entries': 0,
+                  'qemu_vm_creates': 0, 'guest_starts': 0, 'worker_executions': 0}}
     return package, report
 
 
 @pytest.mark.parametrize('damage', ['missing-role', 'uncalibrated', 'allowed-home', 'allowed-network',
-                                    'reviewer-write', 'helper-identity', 'canary-identity', 'native-claim',
-                                    'same-cdhash', 'policy', 'bad-errno', 'missing-denials', 'allowed-write', 'bundle-write'])
+                                    'reviewer-write', 'helper-identity', 'cdhash', 'native-claim',
+                                    'same-cdhash', 'policy', 'bad-errno', 'missing-denials', 'allowed-write',
+                                    'bundle-write', 'entitlement', 'executable-sha', 'inventory', 'wrong-role',
+                                    'fd-identity', 'fd-access', 'serial-fd', 'old-canary', 'wrong-entry',
+                                    'runtime-entry', 'vm-create', 'extra-invocation', 'child-pid'])
 def test_stored_control_cannot_hide_missing_or_failed_os_evidence(monkeypatch, damage):
     import native.qemu_guest.qualification_package as module
     package, report = package_report()
     monkeypatch.setattr(module, 'verify_package_files', lambda _package: None)
-    monkeypatch.setattr(module, 'code_identity', lambda name: deepcopy(package[name + '_identity']
-                        if name == 'canary' else package['identity']))
+    monkeypatch.setattr(module, 'code_identity', lambda _name: deepcopy(package['identity']))
+    observed = report['results'][1]['report']
     operations = {
         'missing-role': lambda: report['results'].pop(),
         'uncalibrated': lambda: report['results'][0]['report']['network']['tcp4'].update(allowed=False),
-        'allowed-home': lambda: report['results'][1]['report']['negative']['home'].update(allowed=True),
-        'allowed-network': lambda: report['results'][1]['report']['network']['tcp4'].update(allowed=True),
+        'allowed-home': lambda: observed['negative']['home'].update(allowed=True),
+        'allowed-network': lambda: observed['network']['tcp4'].update(allowed=True),
         'reviewer-write': lambda: report['results'][4]['report']['devices']['task'].update(write=True),
         'helper-identity': lambda: report.update(helper_identity={'identifier': 'foreign'}),
-        'canary-identity': lambda: report['results'][1]['report']['identity'].update(cdhash='foreign'),
+        'cdhash': lambda: observed['identity'].update(cdhash='foreign'),
         'native-claim': lambda: report.update(helper_execution='PASS'),
-        'same-cdhash': lambda: report.update(same_cdhash_canary_execution=True),
+        'same-cdhash': lambda: report.update(same_cdhash_helper_execution=False),
         'policy': lambda: report.update(static_policy_sha256='foreign'),
-        'bad-errno': lambda: report['results'][1]['report']['negative']['home'].update(errno=2),
-        'missing-denials': lambda: report['results'][1]['report']['negative'].clear(),
-        'allowed-write': lambda: report['results'][1]['report']['negative_writes']['project'].update(allowed=True),
-        'bundle-write': lambda: report['results'][1]['report']['bundle_write'].update(allowed=True),
+        'bad-errno': lambda: observed['negative']['home'].update(errno=2),
+        'missing-denials': lambda: observed['negative'].clear(),
+        'allowed-write': lambda: observed['negative_writes']['project'].update(allowed=True),
+        'bundle-write': lambda: observed['bundle_write'].update(allowed=True),
+        'entitlement': lambda: observed['identity'].update(entitlements={'com.apple.security.hypervisor': True}),
+        'executable-sha': lambda: observed['identity'].update(executable_sha256='foreign'),
+        'inventory': lambda: observed['identity'].update(package_inventory={'foreign': 'd' * 64}),
+        'wrong-role': lambda: observed.update(role='reviewer'),
+        'fd-identity': lambda: observed['devices']['root'].update(st_ino=999),
+        'fd-access': lambda: observed['devices']['root'].update(access=os.O_RDWR),
+        'serial-fd': lambda: observed.update(serial_fd=99),
+        'old-canary': lambda: report.update(status='PASS_POLICY_EQUIVALENT_CANARY_ONLY'),
+        'wrong-entry': lambda: report['results'][1].update(argv=['foreign-canary']),
+        'runtime-entry': lambda: report['execution_counts'].update(qemu_runtime_entries=1),
+        'vm-create': lambda: report['execution_counts'].update(qemu_vm_creates=1),
+        'extra-invocation': lambda: report['execution_counts'].update(helper_preflight_invocations=3),
+        'child-pid': lambda: observed.update(pid=456),
     }
     operations[damage]()
     with pytest.raises(ValueError):
         verify_sandbox_controls(report, package)
 
 
-def test_complete_controls_keep_exact_helper_execution_unqualified(monkeypatch):
+def test_complete_exact_controls_bind_same_helper_and_never_authorize_a_vm(monkeypatch):
     import native.qemu_guest.qualification_package as module
     package, report = package_report()
     monkeypatch.setattr(module, 'verify_package_files', lambda _package: None)
-    monkeypatch.setattr(module, 'code_identity', lambda name: package['canary_identity']
-                        if name == 'canary' else package['identity'])
+    monkeypatch.setattr(module, 'code_identity', lambda _name: package['identity'])
     assert verify_sandbox_controls(report, package) is True
-    assert report['helper_execution'] == 'NOT_RUN'
-    assert report['same_cdhash_canary_execution'] is False
+    assert report['helper_execution'] == 'NO_VM_PREFLIGHT_ONLY'
+    assert report['same_cdhash_helper_execution'] is True
+
+
+def test_legacy_canary_cannot_be_promoted_by_relabeling_its_summary(monkeypatch):
+    import native.qemu_guest.qualification_package as module
+    package, report = package_report()
+    monkeypatch.setattr(module, 'verify_package_files', lambda _package: None)
+    monkeypatch.setattr(module, 'code_identity', lambda _name: package['identity'])
+    report['results'][1]['report']['identity'] = {'identifier': 'fixed', 'cdhash': 'different-canary'}
+    with pytest.raises(ValueError, match='q2_exact_helper_code_identity_changed'):
+        verify_sandbox_controls(report, package)
+
+
+def test_relink_cannot_claim_a_changed_main_without_compiling_it(tmp_path, monkeypatch):
+    import native.qemu_guest.qualification_package as module
+    commands = []
+    monkeypatch.setattr(module, 'run', lambda *args, **kwargs: commands.append(args))
+    with pytest.raises(ValueError, match='q2_changed_main_requires_fresh_build'):
+        module.relink_helper({'q2_patch_sha256': '0' * 64}, tmp_path / 'refused')
+    assert not (tmp_path / 'refused').exists()
+    assert commands == []
+
+
+def compile_patched_main(output, objects=None):
+    """Apply the production patch to an inert main with observable trap entries."""
+    from native.qemu_guest.qualification_package import HERE
+    output.mkdir()
+    system = output / 'system'
+    system.mkdir()
+    source = system / 'main.c'
+    source.write_text(
+        '#include <stdio.h>\n#include <string.h>\n'
+        'static void qemu_init(int c,char**v){(void)c;(void)v;fputs("QEMU_RUNTIME_ENTRY\\n",stderr);}\n'
+        'static int os_darwin_cfrunloop_main(void){fputs("QEMU_MAIN_ENTRY\\n",stderr);return 91;}\n'
+        '#if 1\nint (*qemu_main)(void) = os_darwin_cfrunloop_main;\n#endif\n\n'
+        'extern int hermes_hvf_admission_gate(void);\n'
+        'extern int hermes_hvf_preflight(const char *plan_path);\n\n'
+        'int main(int argc, char **argv)\n{\n'
+        '    if (argc < 3 || strcmp(argv[1], "--hermes-hvf-q1") != 0) {\n'
+        '        return 2;\n    }\n'
+        '    if (hermes_hvf_admission_gate() != 0 || hermes_hvf_preflight(argv[2]) != 0) {\n'
+        '        return 2;\n    }\n'
+        '    char *executable = argv[0];\n'
+        '    argc -= 2;\n    argv += 2;\n    argv[0] = executable;\n'
+        '    qemu_init(argc, argv);\n    return qemu_main();\n}\n')
+    subprocess.run(['patch', '--fuzz=0', '-p1', '-i', HERE / 'qualification-main.patch'],
+                   cwd=output, capture_output=True, check=True, timeout=10)
+    if objects is None:
+        stub = output / 'diagnostic-stub.c'
+        stub.write_text(
+            '#include <stdio.h>\n'
+            'int hermes_q2_gate(const char*p,int c,char**v){(void)p;(void)c;(void)v;'
+            'fputs("GATE_ENTRY\\n",stderr);return 0;}\n'
+            'int hermes_q2_canary(const char*p,int c,char**v){(void)p;(void)c;(void)v;'
+            'fputs("DIAGNOSTIC_ENTRY\\n",stderr);return 67;}\n')
+        inputs, frameworks = [stub], []
+    else:
+        inputs = list(objects['objects'].values())
+        frameworks = ['-framework', 'Foundation', '-framework', 'Security', '-framework', 'LocalAuthentication']
+    binary = output / 'inert-main'
+    subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', source, *inputs,
+                    *frameworks, '-o', binary], capture_output=True, check=True, timeout=30)
+    return binary
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize(('argv', 'code', 'markers'), [
+    (['--hermes-q2-sandbox-preflight', '/dev/fd/4'], 67, ['DIAGNOSTIC_ENTRY']),
+    (['--hermes-q2-sandbox-preflight'], 2, []),
+    (['--hermes-q2-sandbox-preflight-foreign', '/dev/fd/4'], 2, []),
+    ([], 2, []),
+    (['--hermes-hvf-q2', 'manifest'], 91, ['GATE_ENTRY', 'QEMU_RUNTIME_ENTRY', 'QEMU_MAIN_ENTRY']),
+])
+def test_actual_main_patch_returns_before_all_normal_runtime_entries(tmp_path, argv, code, markers):
+    binary = compile_patched_main(tmp_path / 'patched')
+    result = subprocess.run([binary, *argv], capture_output=True, check=False, text=True, timeout=5)
+    assert result.returncode == code
+    assert result.stderr.splitlines() == markers
+    assert result.stdout == ''
 
 
 @pytest.fixture
-def signed_canary_package(tmp_path):
+def signed_inert_helper_package(tmp_path):
     fixture = Path('/Users/timmywen/Documents/AI_Colleague/evidence/'
                    'pr15-qemu-hvf-feasibility-20261121/apple-public-test.keychain')
     if not fixture.is_file():
@@ -140,25 +245,59 @@ def signed_canary_package(tmp_path):
     kernel, initramfs = tmp_path / 'kernel.fixture', tmp_path / 'initramfs.fixture'
     kernel.write_bytes(b'PUBLIC_CANARY_READ_ONLY_KERNEL_BYTES')
     initramfs.write_bytes(b'PUBLIC_CANARY_READ_ONLY_INITRAMFS_BYTES')
-    return package_candidate(binary=objects['canary'], objects=objects, kernel=kernel,
+    return package_candidate(binary=compile_patched_main(tmp_path / 'patched', objects), objects=objects, kernel=kernel,
         initramfs=initramfs, output=tmp_path / 'package', fixture=fixture,
         source_bindings={'guest': '9a270a78b421565a64901182062b18a0d3b2e673'})
 
 
 @pytest.mark.platforms('macos')
-def test_real_signed_no_hvf_canary_controls(tmp_path, signed_canary_package):
-    package = signed_canary_package
+def test_signed_inert_main_fixture_uses_exact_primary_diagnostic(tmp_path, signed_inert_helper_package):
+    package = signed_inert_helper_package
     report = run_sandbox_controls(package, tmp_path / 'controls')
     assert verify_sandbox_controls(report, package)
-    assert len(report['results']) == 6 and report['qemu_executions'] == 0
+    assert len(report['results']) == 6 and report['execution_counts']['qemu_runtime_entries'] == 0
     assert package['helper_execution'] == 'NOT_RUN'
-    assert report['canary_identity']['identifier'] == report['helper_identity']['identifier']
+    assert report['same_cdhash_helper_execution'] is True
     assert json.loads((tmp_path / 'controls/sandbox-controls.json').read_text()) == report
 
 
 @pytest.mark.platforms('macos')
+@pytest.mark.parametrize('marker', ['HERMES_HVF_VM_CREATE_V1', 'HERMES_HVF_VM_DESTROY_V1', 'QEMU_RUNTIME_ENTRY'])
+def test_exact_diagnostic_rejects_any_normal_runtime_marker(tmp_path, signed_inert_helper_package, monkeypatch, marker):
+    import native.qemu_guest.qualification_package as module
+    original = module._invoke_control
+    def observed(*args):
+        result, pid = original(*args)
+        if args[0][0] == signed_inert_helper_package['helper']:
+            result.stderr += '\n' + marker + '\n'
+        return result, pid
+    monkeypatch.setattr(module, '_invoke_control', observed)
+    with pytest.raises(RuntimeError, match='q2_preflight_entered_qemu_runtime'):
+        run_sandbox_controls(signed_inert_helper_package, tmp_path / 'controls')
+    assert not (tmp_path / 'controls/reviewer-unrestricted').exists()
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('entitlements', [
+    {'com.apple.security.app-sandbox': True},
+    {'com.apple.security.hypervisor': True},
+    {'com.apple.security.app-sandbox': True, 'com.apple.security.hypervisor': True,
+     'com.apple.security.network.client': True},
+])
+def test_signed_helper_wrong_entitlement_is_rejected_without_execution(tmp_path, signed_inert_helper_package, entitlements):
+    import plistlib
+    from native.qemu_guest.qualification_package import code_identity
+    manifest = tmp_path / 'wrong.entitlements'
+    manifest.write_bytes(plistlib.dumps(entitlements))
+    subprocess.run(['codesign', '--force', '--sign', '-', '--entitlements', manifest,
+                    signed_inert_helper_package['app']], check=True, capture_output=True, timeout=10)
+    with pytest.raises(ValueError, match='q2_exact_signed_sandbox_identity_required'):
+        code_identity(signed_inert_helper_package['helper'])
+
+
+@pytest.mark.platforms('macos')
 @pytest.mark.parametrize('damage', ['extra-argument', 'wrong-role', 'wrong-inode', 'writable-root', 'hardlink-root', 'duplicate-key'])
-def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, signed_canary_package, monkeypatch, damage):
+def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, signed_inert_helper_package, monkeypatch, damage):
     import native.qemu_guest.qualification_package as module
     original = module.make_bootstrap
     if damage == 'duplicate-key':
@@ -178,8 +317,8 @@ def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, sig
         operations[damage]()
         return record
     monkeypatch.setattr(module, 'make_bootstrap', changed)
-    with pytest.raises(RuntimeError, match='q2_canary_report_missing:rc=2:'):
-        module._one_control(signed_canary_package, 'developer', 'unrestricted', tmp_path / 'refused')
+    with pytest.raises(RuntimeError, match='q2_preflight_report_missing:rc=2:'):
+        module._one_control(signed_inert_helper_package, 'developer', 'unrestricted', tmp_path / 'refused')
     assert 'HERMES_Q2_PREFLIGHT_REFUSED' in (tmp_path / 'refused/stderr.log').read_text()
 
 
@@ -191,16 +330,16 @@ def test_calibration_rejects_unobserved_required_fact(field):
 
 
 
-@pytest.mark.parametrize('name', ['qemu-system-aarch64', 'arbitrary-helper'])
+@pytest.mark.parametrize('name', ['sandbox-canary', 'arbitrary-helper'])
 def test_control_selector_refuses_helper_before_any_program_probe(monkeypatch, name):
     import native.qemu_guest.qualification_package as module
-    package = {'canary': '/approved/Canary.app/Contents/MacOS/' + name,
+    package = {'helper': '/approved/HermesQ2HVF.app/Contents/MacOS/' + name,
                'positive': '/approved/Calibration.app/Contents/MacOS/sandbox-canary',
-               'helper': '/approved/Helper.app/Contents/MacOS/qemu-system-aarch64'}
+               'identity': {}}
     calls = []
     monkeypatch.setattr(module, 'run', lambda *args, **kwargs: calls.append(args))
-    with pytest.raises(ValueError, match='q2_no_hvf_canary_required'):
-        module.verify_canary_programs(package)
+    with pytest.raises(ValueError, match='q2_exact_helper_preflight_required'):
+        module.verify_preflight_programs(package)
     assert calls == []
 
 
@@ -230,18 +369,17 @@ def test_q2_composes_one_existing_pre_qmp_release_reader(tmp_path, plan, release
 @pytest.mark.parametrize('role', ['developer', 'reviewer'])
 @pytest.mark.parametrize('append_newline', [False, True])
 def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
-        tmp_path, signed_canary_package, role, append_newline):
+        tmp_path, signed_inert_helper_package, role, append_newline):
     """Exercise Owner-produced bytes, never Helper/QEMU or a Native VM."""
     from contextlib import ExitStack
     from types import SimpleNamespace
     import hashlib
     import socket
     from gateway.session_guest_hvf import _bootstrap
-    from native.qemu_guest.qualification_package import PREFIX, _control_socket, verify_canary_programs
+    from native.qemu_guest.qualification_package import PREFLIGHT_FLAG, PREFIX, _control_socket, verify_preflight_programs
 
-    package = dict(signed_canary_package, resources=signed_canary_package['canary_resources'],
-                   static_policy_sha256=signed_canary_package['canary_static_policy_sha256'])
-    verify_canary_programs(package)
+    package = signed_inert_helper_package
+    verify_preflight_programs(package)
     record = {'task_id': 'PUBLIC_OWNER_WRITER_FIXTURE', 'run_id': 1, 'epoch': 1,
               'vm_id': 'NO_VM', 'attempt': 'owner-native-parser-' + role,
               'instance': 'NO_OWNER_CANARY', 'slot': 2 if role == 'reviewer' else 1}
@@ -270,7 +408,7 @@ def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
                 stream.write(b'\n')
         fd = os.open(manifest, os.O_RDONLY)
         stack.callback(os.close, fd)
-        result = subprocess.run([package['canary'], '/dev/fd/' + str(fd), *plan['qemu_argv']],
+        result = subprocess.run([package['helper'], PREFLIGHT_FLAG, '/dev/fd/' + str(fd), *plan['qemu_argv']],
             pass_fds=tuple(row['fd'] for row in descriptors.values()) + (child.fileno(), fd),
             capture_output=True, text=True, check=False, timeout=20,
             env={'PATH': '/usr/bin:/bin', 'HOME': str(tmp_path / 'unrelated-host-home')})

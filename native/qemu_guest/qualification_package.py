@@ -1,8 +1,7 @@
-"""Q2 fixed-source Helper and real no-HVF Sandbox controls.
+"""Q2 fixed-source Helper and exact-identity no-VM Sandbox diagnostics.
 
-Nothing in this module executes QEMU. The signed standalone canary links the
-same preflight object and has the same App identifier/entitlements. Its CDHash
-is explicitly distinct; execution of the final Helper remains NOT_RUN.
+The actual Helper executes only its early diagnostic return. Normal QEMU
+initialization, Hypervisor operations and Guest execution are not authorized.
 """
 from __future__ import annotations
 
@@ -28,6 +27,7 @@ QEMU_SHA256 = '5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22'
 FIXTURE_SHA256 = '87a34479ff2f4f9fd8c6c982a9e461f637a7bd9b88e82b03f3e765a58bf77582'
 ENTITLEMENTS = {'com.apple.security.app-sandbox': True, 'com.apple.security.hypervisor': True}
 PREFIX = 'HERMES_Q2_SANDBOX_RESULT_V1 '
+PREFLIGHT_FLAG = '--hermes-q2-sandbox-preflight'
 
 
 def canonical(value):
@@ -145,6 +145,9 @@ def build_helper(*, archive, dtc_source, output, python, ninja, pkgconf, pkgconf
 
 def relink_helper(previous, output):
     """Reuse immutable compiled fixed-QEMU objects, link changed Q2 preflight only."""
+    if (previous.get('q2_patch_sha256') != digest(HERE / 'qualification-main.patch')
+            or previous.get('q1_patch_sha256') != digest(Q1 / 'qemu-candidate.patch')):
+        raise ValueError('q2_changed_main_requires_fresh_build')
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     objects = build_objects(output / 'objects')
@@ -251,22 +254,6 @@ def package_candidate(*, binary, objects, kernel, initramfs, output, fixture, so
     policy_path.write_text(canonical(policy))
     run(['codesign', '--force', '--sign', '-', '--entitlements', Q1 / 'helper.entitlements', app])
     identity = code_identity(helper)
-    canary_app = root / 'Canary.app'
-    canary_macos = canary_app / 'Contents/MacOS'
-    canary_resources = canary_app / 'Contents/Resources'
-    canary_macos.mkdir(parents=True)
-    canary_resources.mkdir()
-    canary = canary_macos / 'sandbox-canary'
-    shutil.copyfile(objects['canary'], canary)
-    canary.chmod(0o755)
-    (canary_app / 'Contents/Info.plist').write_bytes(plistlib.dumps(dict(info, CFBundleExecutable=canary.name)))
-    for name in ('kernel.Image', 'initramfs.cpio.gz'):
-        shutil.copyfile(resources / name, canary_resources / name)
-    canary_policy = dict(policy, approved=[str(canary_resources / name)
-                         for name in ('kernel.Image', 'initramfs.cpio.gz')])
-    (canary_resources / 'static-policy.json').write_text(canonical(canary_policy))
-    run(['codesign', '--force', '--sign', '-', '--entitlements', Q1 / 'helper.entitlements', canary_app])
-    canary_identity = code_identity(canary)
     positive_app = root / 'Calibration.app'
     positive_macos = positive_app / 'Contents/MacOS'
     positive_resources = positive_app / 'Contents/Resources'
@@ -281,15 +268,13 @@ def package_candidate(*, binary, objects, kernel, initramfs, output, fixture, so
     run(['codesign', '--force', '--sign', '-', positive_app])
     inventory = {str(path): digest(path) for path in app.rglob('*') if path.is_file()}
     receipt = {'schema': 'HERMES_Q2_HELPER_PACKAGE_V1', 'app': str(app), 'helper': str(helper),
-               'resources': str(resources), 'canary': str(canary), 'canary_identity': canary_identity,
-               'canary_app': str(canary_app), 'canary_resources': str(canary_resources),
-               'canary_static_policy_sha256': digest(canary_resources / 'static-policy.json'),
-               'canary_inventory': {str(path): digest(path) for path in canary_app.rglob('*') if path.is_file()},
+               'resources': str(resources), 'helper_sha256': digest(helper),
                'positive': str(positive), 'positive_resources': str(positive_resources),
+               'positive_inventory': {str(path): digest(path) for path in positive_app.rglob('*') if path.is_file()},
                'static_policy': str(policy_path), 'static_policy_sha256': digest(policy_path),
                'identity': identity, 'inventory': inventory, 'libraries': libraries, 'objects': objects,
                'source_bindings': source_bindings, 'qemu_executions': 0,
-               'helper_execution': 'NOT_RUN', 'same_cdhash_canary_execution': False}
+               'helper_execution': 'NOT_RUN'}
     receipt['metadata_sha256'] = emit_metadata(root, receipt)
     (root / 'package-receipt.json').write_text(canonical(receipt))
     return receipt
@@ -375,61 +360,78 @@ def make_bootstrap(package, devices, serial_fd, role, owner):
 
 
 def verify_sandbox_controls(report, package):
-    """A stored report cannot authorize Helper/VM spawn; compare exact identities."""
-    if (report.get('schema') != 'HERMES_Q2_SANDBOX_CONTROLS_V1'
-            or report.get('status') != 'PASS_POLICY_EQUIVALENT_CANARY_ONLY'
-            or report.get('helper_execution') != 'NOT_RUN'
+    """Exact diagnostics are evidence, never authority to initialize a VM."""
+    if (report.get('schema') != 'HERMES_Q2_SANDBOX_CONTROLS_V2'
+            or report.get('status') != 'PASS_EXACT_HELPER_SANDBOX_PREFLIGHT'
+            or report.get('helper_execution') != 'NO_VM_PREFLIGHT_ONLY'
             or report.get('helper_identity') != package['identity']
             or report.get('package_inventory') != package['inventory']
+            or report.get('helper_sha256') != package['helper_sha256']
             or report.get('preflight_object_sha256') != package['objects']['object_sha256']['preflight']
-            or report.get('qemu_executions') != 0):
+            or report.get('execution_counts') != {
+                'helper_preflight_invocations': 2, 'qemu_runtime_entries': 0,
+                'qemu_vm_creates': 0, 'guest_starts': 0, 'worker_executions': 0}):
         raise ValueError('q2_sandbox_controls_unavailable')
     expected_order = [(role, mode) for role in ('developer', 'reviewer')
                       for mode in ('unrestricted', 'sandboxed', 'positive-recheck')]
     try:
         if ([(row['role'], row['mode']) for row in report['results']] != expected_order
                 or report['static_policy_sha256'] != package['static_policy_sha256']
-                or report['canary_identity'] != package['canary_identity']
-                or report['canary_static_policy_sha256'] != package['canary_static_policy_sha256']
-                or report['canary_inventory'] != package['canary_inventory']
-                or report.get('same_cdhash_canary_execution') is not False):
+                or report.get('same_cdhash_helper_execution') is not True):
             raise ValueError('q2_sandbox_control_identity_mismatch')
         for row in report['results']:
-            sandboxed = row['mode'] == 'sandboxed'
-            if not _calibration_ok(row['report'], sandboxed, row['role']):
-                raise ValueError('q2_sandbox_control_unsettled')
-            if sandboxed and (row['returncode'] != 0 or row['report']['identity'] != {
-                    key: package['canary_identity'][key] for key in ('identifier', 'cdhash')}):
-                raise ValueError('q2_canary_code_identity_changed')
+            verify_control_record(row, package)
     except (KeyError, TypeError, AttributeError) as failure:
         raise ValueError('q2_sandbox_control_unavailable') from failure
-    expected_identity = code_identity(package['helper'])
-    if (expected_identity != package['identity'] or code_identity(package['canary']) != package['canary_identity']
-            or package['identity']['identifier'] != package['canary_identity']['identifier']):
+    if code_identity(package['helper']) != package['identity']:
         raise ValueError('q2_helper_identity_changed')
     verify_package_files(package)
     return True
 
 
+def verify_control_record(row, package):
+    """Bind the Helper's own report to the program, role and inherited FDs."""
+    report, role = row['report'], row['role']
+    sandboxed = row['mode'] == 'sandboxed'
+    if (not _calibration_ok(report, sandboxed, role)
+            or row['returncode'] != (0 if sandboxed else 2)
+            or report.get('role') != role or report.get('canary') is not True
+            or not isinstance(report.get('pid'), int) or report['pid'] < 1
+            or report['pid'] != row['child_pid']):
+        raise ValueError('q2_sandbox_control_unsettled')
+    for name in ('root', 'task', 'assignment'):
+        observed, expected = report['devices'][name], row['devices'][name]
+        if (observed.get('observed') is not True
+                or {key: observed.get(key) for key in ('fd', 'st_dev', 'st_ino', 'size')} != expected
+                or observed.get('access') != (os.O_RDWR if role == 'developer' and name == 'task' else os.O_RDONLY)):
+            raise ValueError('q2_sandbox_descriptor_identity_changed')
+    if report.get('serial_fd') != row['serial_fd']:
+        raise ValueError('q2_sandbox_serial_identity_changed')
+    if sandboxed:
+        identity = dict(package['identity'], executable=package['helper'],
+                        executable_sha256=package['helper_sha256'], package_inventory=package['inventory'])
+        if (row.get('argv', [])[:2] != [package['helper'], PREFLIGHT_FLAG]
+                or report['identity'] != identity):
+            raise ValueError('q2_exact_helper_code_identity_changed')
 
-def verify_canary_programs(package):
-    canary, positive = Path(package['canary']), Path(package['positive'])
-    if (canary.name != 'sandbox-canary' or positive.name != 'sandbox-canary'
-            or canary.parents[2].name != 'Canary.app'
-            or positive.parents[2].name != 'Calibration.app'
-            or canary.resolve() == Path(package['helper']).resolve()):
-        raise ValueError('q2_no_hvf_canary_required')
-    for binary in (canary, positive):
-        dependencies = run(['otool', '-L', binary]).stdout
-        symbols = run(['nm', '-u', binary]).stdout
-        if 'Hypervisor.framework' in dependencies or '_hv_vm_create' in symbols or '_hv_vm_destroy' in symbols:
-            raise ValueError('q2_hypervisor_binary_forbidden_in_canary_controls')
-    if code_identity(canary) != package['canary_identity']:
-        raise ValueError('q2_canary_code_identity_changed')
+
+def verify_preflight_programs(package):
+    helper, positive = Path(package['helper']), Path(package['positive'])
+    if (helper.name != 'qemu-system-aarch64' or helper.parents[2].name != 'HermesQ2HVF.app'
+            or positive.name != 'sandbox-canary' or positive.parents[2].name != 'Calibration.app'
+            or helper.resolve() == positive.resolve()):
+        raise ValueError('q2_exact_helper_preflight_required')
+    dependencies = run(['otool', '-L', positive]).stdout
+    symbols = run(['nm', '-u', positive]).stdout
+    if 'Hypervisor.framework' in dependencies or '_hv_vm_create' in symbols or '_hv_vm_destroy' in symbols:
+        raise ValueError('q2_hypervisor_binary_forbidden_in_calibration')
+    if code_identity(helper) != package['identity'] or digest(helper) != package['helper_sha256']:
+        raise ValueError('q2_helper_identity_changed')
 
 
 def verify_package_files(package):
-    for app, key in ((Path(package['app']), 'inventory'), (Path(package['canary_app']), 'canary_inventory')):
+    for app, key in ((Path(package['app']), 'inventory'),
+                     (Path(package['positive']).parents[2], 'positive_inventory')):
         paths = list(app.rglob('*'))
         if (any(path.is_symlink() for path in paths)
                 or {str(path) for path in paths if path.is_file()} != set(package[key])):
@@ -438,12 +440,9 @@ def verify_package_files(package):
         for name, expected in package[key].items():
             if Path(name).stat().st_nlink != 1 or digest(name) != expected:
                 raise ValueError('q2_package_changed')
-    policy = json.loads(Path(package['static_policy']).read_text())
-    canary_policy = json.loads((Path(package['canary_resources']) / 'static-policy.json').read_text())
-    expected = dict(policy, approved=[str(Path(package['canary_resources']) / name)
-                                     for name in ('kernel.Image', 'initramfs.cpio.gz')])
-    if canary_policy != expected:
-        raise ValueError('q2_canary_policy_not_equivalent')
+    if (digest(package['helper']) != package['helper_sha256']
+            or digest(package['static_policy']) != package['static_policy_sha256']):
+        raise ValueError('q2_package_changed')
 
 
 def _calibration_ok(report, sandboxed, role):
@@ -475,6 +474,30 @@ def _calibration_ok(report, sandboxed, role):
             and report['legacy_keychain']['public_dummy_matches'] is True)
 
 
+def _invoke_control(argv, fds, output):
+    """Wait for this exact diagnostic child and persist timeout evidence too."""
+    with subprocess.Popen(argv, pass_fds=tuple(fds), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          text=True, encoding='utf-8',
+                          env={'PATH': '/usr/bin:/bin', 'HOME': str(output / 'unrelated-host-home')}) as child:
+        timed_out = False
+        try:
+            stdout, stderr = child.communicate(timeout=20)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            child.kill()
+            stdout, stderr = child.communicate(timeout=5)
+        (output / 'stdout.log').write_text(stdout)
+        (output / 'stderr.log').write_text(stderr)
+        (output / 'exact-wait.json').write_text(canonical({
+            'pid': child.pid, 'returncode': child.returncode, 'timed_out': timed_out,
+            'termination_signal': -child.returncode if child.returncode < 0 else None,
+            'wait_reaped': child.poll() is not None,
+            'stdout_closed': child.stdout.closed, 'stderr_closed': child.stderr.closed}))
+        if timed_out:
+            raise RuntimeError('q2_preflight_timeout_exact_child_reaped')
+        return subprocess.CompletedProcess(argv, child.returncode, stdout, stderr), child.pid
+
+
 def _one_control(package, role, mode, output):
     output.mkdir()
     fds = []
@@ -493,10 +516,7 @@ def _one_control(package, role, mode, output):
         stack.callback(child.close)
         fds.append(child.fileno())
         current = dict(package)
-        if mode == 'sandboxed':
-            current['resources'] = package['canary_resources']
-            current['static_policy_sha256'] = package['canary_static_policy_sha256']
-        else:
+        if mode != 'sandboxed':
             current['resources'] = package['positive_resources']
         owner = {'task_id': 'PUBLIC_CANARY', 'run_id': 1, 'epoch': 1,
                  'vm_id': 'NO_VM', 'attempt': role + '-' + mode, 'instance': 'NO_OWNER_CANARY'}
@@ -506,32 +526,35 @@ def _one_control(package, role, mode, output):
         fd = os.open(manifest, os.O_RDONLY)
         stack.callback(os.close, fd)
         fds.append(fd)
-        binary = package['canary'] if mode == 'sandboxed' else package['positive']
-        result = subprocess.run([binary, '/dev/fd/' + str(fd), *bootstrap['qemu_argv']],
-                                pass_fds=tuple(fds), capture_output=True, text=True,
-                                env={'PATH': '/usr/bin:/bin', 'HOME': str(output / 'unrelated-host-home')},
-                                timeout=20, check=False)
-        (output / 'stderr.log').write_text(result.stderr)
-        (output / 'stdout.log').write_text(result.stdout)
+        binary = package['helper'] if mode == 'sandboxed' else package['positive']
+        argv = [binary, *([PREFLIGHT_FLAG] if mode == 'sandboxed' else []),
+                '/dev/fd/' + str(fd), *bootstrap['qemu_argv']]
+        (output / 'invocation.json').write_text(canonical({
+            'argv': argv, 'devices': devices, 'serial_fd': child.fileno(), 'mode': mode, 'role': role}))
+        result, child_pid = _invoke_control(argv, fds, output)
         rows = [line[len(PREFIX):] for line in result.stderr.splitlines() if line.startswith(PREFIX)]
         if len(rows) != 1:
-            raise RuntimeError('q2_canary_report_missing:rc=' + str(result.returncode) + ':' + result.stderr[-1000:])
+            raise RuntimeError('q2_preflight_report_missing:rc=' + str(result.returncode) + ':' + result.stderr[-1000:])
         report = json.loads(rows[0])
-        if not _calibration_ok(report, mode == 'sandboxed', role):
-            raise RuntimeError('q2_canary_control_failed:' + canonical(report))
-        if mode == 'sandboxed' and (result.returncode != 0 or report['identity'] != {
-                key: package['canary_identity'][key] for key in ('identifier', 'cdhash')}):
-            raise RuntimeError('q2_canary_code_identity_changed')
-        return {'role': role, 'mode': mode, 'returncode': result.returncode,
-                'report': report, 'bootstrap_sha256': digest(manifest),
-                'stderr_sha256': digest(output / 'stderr.log')}
+        row = {'role': role, 'mode': mode, 'returncode': result.returncode,
+               'report': report, 'argv': argv, 'devices': devices, 'serial_fd': child.fileno(), 'child_pid': child_pid,
+               'bootstrap_sha256': digest(manifest), 'stderr_sha256': digest(output / 'stderr.log')}
+        try:
+            verify_control_record(row, package)
+        except ValueError as error:
+            raise RuntimeError('q2_preflight_control_failed:' + str(error)) from error
+        if result.stdout or any(marker in result.stderr for marker in (
+                'HERMES_HVF_CORE_LIMIT_V1', 'HERMES_HVF_VM_CREATE_V1', 'HERMES_HVF_VM_DESTROY_V1',
+                'QEMU_RUNTIME_ENTRY', 'HERMES_Q2_QEMU_INIT_FORBIDDEN')):
+            raise RuntimeError('q2_preflight_entered_qemu_runtime')
+        return row
 
 
 def run_sandbox_controls(package, output):
-    """Real OS controls; only the standalone linked canary executes, never QEMU."""
+    """Two exact Helper diagnostic invocations; zero normal QEMU/VM entries."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    verify_canary_programs(package)
+    verify_preflight_programs(package)
     verify_package_files(package)
     policy = json.loads(Path(package['static_policy']).read_text())
     results = []
@@ -545,17 +568,17 @@ def run_sandbox_controls(package, output):
         for role in ('developer', 'reviewer'):
             for mode in ('unrestricted', 'sandboxed', 'positive-recheck'):
                 results.append(_one_control(package, role, mode, output / (role + '-' + mode)))
-    report = {'schema': 'HERMES_Q2_SANDBOX_CONTROLS_V1',
-              'status': 'PASS_POLICY_EQUIVALENT_CANARY_ONLY', 'results': results,
-              'helper_identity': package['identity'], 'canary_identity': package['canary_identity'],
+    report = {'schema': 'HERMES_Q2_SANDBOX_CONTROLS_V2',
+              'status': 'PASS_EXACT_HELPER_SANDBOX_PREFLIGHT', 'results': results,
+              'helper_identity': package['identity'], 'helper_sha256': package['helper_sha256'],
               'package_inventory': package['inventory'],
               'preflight_object_sha256': package['objects']['object_sha256']['preflight'],
               'static_policy_sha256': package['static_policy_sha256'],
-              'canary_static_policy_sha256': package['canary_static_policy_sha256'],
-              'canary_inventory': package['canary_inventory'],
-              'qemu_executions': 0, 'vm_operations': 'NOT_RUN', 'helper_execution': 'NOT_RUN',
-              'same_cdhash_canary_execution': False,
-              'limit': 'Same signed App identifier/entitlements and exact linked preflight object; separate primary App/resource prefix and different Mach-O CDHash. Actual Helper execution is NOT_RUN.'}
+              'execution_counts': {'helper_preflight_invocations': 2, 'qemu_runtime_entries': 0,
+                  'qemu_vm_creates': 0, 'guest_starts': 0, 'worker_executions': 0},
+              'vm_operations': 'NOT_RUN', 'helper_execution': 'NO_VM_PREFLIGHT_ONLY',
+              'same_cdhash_helper_execution': True,
+              'limit': 'Early diagnostic main return only. Upstream pre-main RCU support initialization is not VM initialization; exact process wait terminates its support thread. Native three-slot grant remains NOT_ISSUED.'}
     verify_sandbox_controls(report, package)
     (output / 'sandbox-controls.json').write_text(canonical(report))
     return report
@@ -569,7 +592,7 @@ def main():
     package = json.loads(args.verify_package.read_text())
     if args.controls_output:
         report = run_sandbox_controls(package, args.controls_output)
-        print(canonical({'status': report['status'], 'qemu_executions': 0}))
+        print(canonical({'status': report['status'], 'execution_counts': report['execution_counts']}))
     else:
         for name, expected in package['inventory'].items():
             if digest(name) != expected:

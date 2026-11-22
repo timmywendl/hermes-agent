@@ -129,6 +129,10 @@ class OwnedDevices:
                 fd = os.open(path, mode | os.O_NOFOLLOW | os.O_CLOEXEC)
                 self.fds[name] = fd
                 self.identities[name] = self._identity(os.fstat(fd))
+            if image.role == 'developer':
+                fd = os.open(image.task, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                self.fds['task_ro'] = fd
+                self.identities['task_ro'] = self._identity(os.fstat(fd))
             self.verify()
         except BaseException:
             self.close()
@@ -145,11 +149,13 @@ class OwnedDevices:
 
     def verify(self):
         import fcntl
-        if self.closed or set(self.fds) != {'root', 'task', 'assignment'}:
+        expected = {'root', 'task', 'assignment'} | ({'task_ro'} if self.image.role == 'developer' else set())
+        if self.closed or set(self.fds) != expected or len(set(self.fds.values())) != len(expected):
             raise ValueError('q2_device_capability_closed')
         self.image.verify()
         identities = set()
-        for name, fd in self.fds.items():
+        for name in ('root', 'task', 'assignment'):
+            fd = self.fds[name]
             info = os.fstat(fd)
             path = getattr(self.image, name)
             expected_mode = os.O_RDWR if name == 'task' and self.image.role == 'developer' else os.O_RDONLY
@@ -168,14 +174,28 @@ class OwnedDevices:
             if (digest.hexdigest() != self.image.sha256[str(path)]
                     or self._identity(os.fstat(fd)) != identity):
                 raise ValueError('q2_device_capability_changed')
+        if self.image.role == 'developer':
+            self._verify_task_ro()
         return self.descriptors()
 
+    def _verify_task_ro(self):
+        import fcntl
+        fd = self.fds['task_ro']
+        identity = self._identity(os.fstat(fd))
+        if ((fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) != os.O_RDONLY
+                or identity != self.identities['task_ro'] or identity != self.identities['task']
+                or identity != self._identity(self.image.task.lstat())):
+            raise ValueError('q2_task_readonly_capability_changed')
+
     def descriptors(self):
-        return {name: {'fd': fd, 'st_dev': self.identities[name][0],
+        records = {name: {'fd': self.fds[name], 'st_dev': self.identities[name][0],
                        'st_ino': self.identities[name][1], 'size': self.identities[name][2],
                        'readonly': name != 'task' or self.image.role == 'reviewer',
                        'sha256': self.image.sha256[str(getattr(self.image, name))]}
-                for name, fd in self.fds.items()}
+                   for name in ('root', 'task', 'assignment')}
+        if self.image.role == 'developer':
+            records['task']['ro_fd'] = self.fds['task_ro']
+        return records
 
     def device_args(self, serial_fd):
         self.verify()
@@ -185,8 +205,10 @@ class OwnedDevices:
         result = self.image._base_args(serial_fd)
         for number, name in enumerate(('root', 'task', 'assignment'), 1):
             readonly = name != 'task' or self.image.role == 'reviewer'
-            result.extend(['-add-fd', f'fd={self.fds[name]},set={number}',
-                           '-drive', f'file=/dev/fdset/{number},format=raw,if=none,id={name},readonly={"on" if readonly else "off"}',
+            result.extend(['-add-fd', f'fd={self.fds[name]},set={number}'])
+            if name == 'task' and self.image.role == 'developer':
+                result.extend(['-add-fd', f'fd={self.fds["task_ro"]},set=2'])
+            result.extend(['-drive', f'file=/dev/fdset/{number},format=raw,if=none,id={name},readonly={"on" if readonly else "off"}',
                            '-device', f'virtio-blk-pci,drive={name}'])
         return result
 

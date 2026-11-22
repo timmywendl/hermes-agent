@@ -13,14 +13,17 @@ from native.qemu_guest.qualification_package import (
 )
 
 
-def device_records():
-    return {name: {'fd': index, 'st_dev': 1, 'st_ino': index, 'size': 4096,
+def device_records(role='developer'):
+    records = {name: {'fd': index, 'st_dev': 1, 'st_ino': index, 'size': 4096,
                    'sha256': 'a' * 64, 'readonly': name != 'task'}
             for index, name in enumerate(('root', 'task', 'assignment'), 10)}
+    if role == 'developer':
+        records['task']['ro_fd'] = 13
+    return records
 
 
 def test_bootstrap_projects_capabilities_without_guest_path_authority():
-    devices = device_records()
+    devices = device_records('reviewer')
     owner = {'task_id': 'task', 'run_id': 1, 'epoch': 1, 'vm_id': 'vm',
              'attempt': 'one', 'instance': 'owner'}
     package = {'static_policy_sha256': 'b' * 64, 'resources': '/approved/Resources'}
@@ -51,15 +54,34 @@ def test_developer_is_the_only_writable_fdset():
     assert args[args.index('-smp') + 1] == '2'
     assert args[args.index('-m') + 1] == '2048'
     assert '-no-reboot' in args
+    assert args.count('-add-fd') == 4
+    assert [args[i + 1] for i, value in enumerate(args) if value == '-add-fd' and 'set=2' in args[i + 1]] == [
+        'fd=11,set=2', 'fd=13,set=2']
+    assert not any('auto-read-only' in value for value in args)
+
+
+@pytest.mark.parametrize('damage', ['missing', 'alias', 'serial', 'reviewer'])
+def test_bootstrap_rejects_unbound_task_readonly_handle(damage):
+    role = 'reviewer' if damage == 'reviewer' else 'developer'
+    records = device_records(role)
+    operations = {'missing': lambda: records['task'].pop('ro_fd'),
+                  'alias': lambda: records['task'].update(ro_fd=records['task']['fd']),
+                  'serial': lambda: records['task'].update(ro_fd=20),
+                  'reviewer': lambda: records['task'].update(ro_fd=13)}
+    operations[damage]()
+    with pytest.raises(ValueError):
+        make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'}, records, 20, role, {})
 
 
 def control(role, sandboxed):
     writable = role == 'developer'
-    bindings = device_records()
+    bindings = device_records(role)
     devices = {name: dict({key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size')},
                           read=True, write=name == 'task' and writable, observed=True,
                           access=os.O_RDWR if name == 'task' and writable else os.O_RDONLY)
                for name, row in bindings.items()}
+    if role == 'developer':
+        devices['task']['ro'] = dict(devices['task'], fd=bindings['task']['ro_fd'], write=False, write_errno=9, access=os.O_RDONLY)
     return {'vm_created': False, 'descriptor_identity': True, 'approved_reads': True,
             'devices': dict(devices, serial_identity=True), 'role': role, 'serial_fd': 20,
             'pid': 123, 'canary': True,
@@ -89,8 +111,8 @@ def package_report():
                 executable_sha256=package['helper_sha256'], package_inventory=package['inventory'])
             rows.append({'role': role, 'mode': mode, 'returncode': 0 if mode == 'sandboxed' else 2,
                          'report': record, 'argv': [package['helper'], PREFLIGHT_FLAG], 'child_pid': 123,
-                         'devices': {name: {key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size')}
-                                     for name, row in device_records().items()}, 'serial_fd': 20})
+                         'devices': {name: {key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size') + (('ro_fd',) if role == 'developer' and name == 'task' else ())}
+                                     for name, row in device_records(role).items()}, 'serial_fd': 20})
     report = {'schema': 'HERMES_Q2_SANDBOX_CONTROLS_V2', 'status': 'PASS_EXACT_HELPER_SANDBOX_PREFLIGHT',
               'helper_execution': 'NO_VM_PREFLIGHT_ONLY', 'helper_identity': package['identity'],
               'helper_sha256': package['helper_sha256'], 'package_inventory': {},
@@ -106,7 +128,8 @@ def package_report():
                                     'same-cdhash', 'policy', 'bad-errno', 'missing-denials', 'allowed-write',
                                     'bundle-write', 'entitlement', 'executable-sha', 'inventory', 'wrong-role',
                                     'fd-identity', 'fd-access', 'serial-fd', 'old-canary', 'wrong-entry',
-                                    'runtime-entry', 'vm-create', 'extra-invocation', 'child-pid'])
+                                    'runtime-entry', 'vm-create', 'extra-invocation', 'child-pid',
+                                    'ro-missing', 'ro-write', 'ro-mode', 'ro-inode', 'ro-fd'])
 def test_stored_control_cannot_hide_missing_or_failed_os_evidence(monkeypatch, damage):
     import native.qemu_guest.qualification_package as module
     package, report = package_report()
@@ -141,6 +164,11 @@ def test_stored_control_cannot_hide_missing_or_failed_os_evidence(monkeypatch, d
         'vm-create': lambda: report['execution_counts'].update(qemu_vm_creates=1),
         'extra-invocation': lambda: report['execution_counts'].update(helper_preflight_invocations=3),
         'child-pid': lambda: observed.update(pid=456),
+        'ro-missing': lambda: observed['devices']['task'].pop('ro'),
+        'ro-write': lambda: observed['devices']['task']['ro'].update(write=True),
+        'ro-mode': lambda: observed['devices']['task']['ro'].update(access=os.O_RDWR),
+        'ro-inode': lambda: observed['devices']['task']['ro'].update(st_ino=999),
+        'ro-fd': lambda: observed['devices']['task']['ro'].update(fd=observed['devices']['task']['fd']),
     }
     operations[damage]()
     with pytest.raises(ValueError):
@@ -296,6 +324,47 @@ def test_signed_helper_wrong_entitlement_is_rejected_without_execution(tmp_path,
 
 
 @pytest.mark.platforms('macos')
+@pytest.mark.parametrize('damage', ['missing', 'writable', 'inode', 'size', 'alias', 'serial', 'malformed', 'reviewer'])
+def test_native_dual_handle_rejects_tampering_before_any_runtime(tmp_path, signed_inert_helper_package, monkeypatch, damage):
+    import native.qemu_guest.qualification_package as module
+    original_make, original_invoke = module.make_bootstrap, module._invoke_control
+    replaced = {}
+    role = 'reviewer' if damage == 'reviewer' else 'developer'
+    def changed(package, devices, serial, selected_role, owner):
+        plan = original_make(package, devices, serial, selected_role, owner)
+        if damage in {'writable', 'inode', 'size'}:
+            path = tmp_path / 'refused/task.public' if damage == 'writable' else tmp_path / 'foreign.public'
+            if damage != 'writable':
+                path.write_bytes(b'x' if damage == 'size' else (tmp_path / 'refused/task.public').read_bytes())
+            fd = os.open(path, os.O_RDWR if damage == 'writable' else os.O_RDONLY)
+            replaced.update(old=devices['task']['ro_fd'], new=fd)
+            plan['devices']['task']['ro_fd'] = fd
+        else:
+            operations = {'missing': lambda: plan['devices']['task'].pop('ro_fd'),
+                          'alias': lambda: plan['devices']['task'].update(ro_fd=devices['task']['fd']),
+                          'serial': lambda: plan['devices']['task'].update(ro_fd=serial),
+                          'malformed': lambda: plan['devices']['task'].update(ro_fd='not-an-fd'),
+                          'reviewer': lambda: plan['devices']['task'].update(ro_fd=devices['task']['fd'])}
+            operations[damage]()
+        if damage not in {'missing', 'malformed'}:
+            plan['qemu_argv'] = module.qemu_argv(package['resources'], plan['devices'], serial, selected_role)
+        return plan
+    def invoked(argv, fds, output):
+        if replaced:
+            fds = [fd for fd in fds if fd != replaced['old']] + [replaced['new']]
+        return original_invoke(argv, fds, output)
+    monkeypatch.setattr(module, 'make_bootstrap', changed)
+    monkeypatch.setattr(module, '_invoke_control', invoked)
+    try:
+        with pytest.raises(RuntimeError, match='q2_preflight_report_missing:rc=2:'):
+            module._one_control(signed_inert_helper_package, role, 'unrestricted', tmp_path / 'refused')
+    finally:
+        if replaced:
+            os.close(replaced['new'])
+    assert 'HERMES_Q2_PREFLIGHT_REFUSED' in (tmp_path / 'refused/stderr.log').read_text()
+
+
+@pytest.mark.platforms('macos')
 @pytest.mark.parametrize('damage', ['extra-argument', 'wrong-role', 'wrong-inode', 'writable-root', 'hardlink-root', 'duplicate-key'])
 def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, signed_inert_helper_package, monkeypatch, damage):
     import native.qemu_guest.qualification_package as module
@@ -397,6 +466,10 @@ def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
             stack.callback(os.close, fd)
             stat = os.fstat(fd)
             descriptors[name] = {'fd': fd, 'st_dev': stat.st_dev, 'st_ino': stat.st_ino, 'size': stat.st_size}
+        if role == 'developer':
+            ro_fd = os.open(tmp_path / 'task.owner-writer-public', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, ro_fd)
+            descriptors['task']['ro_fd'] = ro_fd
         parent, child = socket.socketpair()
         stack.callback(parent.close)
         stack.callback(child.close)
@@ -409,7 +482,7 @@ def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
         fd = os.open(manifest, os.O_RDONLY)
         stack.callback(os.close, fd)
         result = subprocess.run([package['helper'], PREFLIGHT_FLAG, '/dev/fd/' + str(fd), *plan['qemu_argv']],
-            pass_fds=tuple(row['fd'] for row in descriptors.values()) + (child.fileno(), fd),
+            pass_fds=tuple(row['fd'] for row in descriptors.values()) + ((descriptors['task']['ro_fd'],) if role == 'developer' else ()) + (child.fileno(), fd),
             capture_output=True, text=True, check=False, timeout=20,
             env={'PATH': '/usr/bin:/bin', 'HOME': str(tmp_path / 'unrelated-host-home')})
     if append_newline:

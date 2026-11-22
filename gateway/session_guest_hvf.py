@@ -488,8 +488,7 @@ def _serve_until(handle, observer, predicate, deadline):
 
 def _bootstrap(handle, devices, child_fd, path):
     from native.qemu_guest.qualification_package import make_bootstrap
-    descriptors = {name: {key: row[key] for key in ('fd', 'st_dev', 'st_ino', 'size')}
-                   for name, row in devices.descriptors().items()}
+    descriptors = devices.descriptors()
     owner = {key: handle.record[key] for key in ('task_id', 'run_id', 'epoch', 'vm_id', 'attempt', 'instance')}
     plan = make_bootstrap(handle.batch.body['helper_package'], descriptors, child_fd,
                           'reviewer' if handle.record['slot'] == 2 else 'developer', owner)

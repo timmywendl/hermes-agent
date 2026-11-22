@@ -343,8 +343,10 @@ def qemu_argv(resources, devices, serial_fd, role):
             '-append', 'console=tty0 root=/dev/vda ro rdinit=/init panic=-1']
     for index, name in enumerate(('root', 'task', 'assignment'), 1):
         writable = role == 'developer' and name == 'task'
-        args += ['-add-fd', f'fd={devices[name]["fd"]},set={index}',
-                 '-drive', f'file=/dev/fdset/{index},format=raw,if=none,id={name},readonly={"off" if writable else "on"}',
+        args += ['-add-fd', f'fd={devices[name]["fd"]},set={index}']
+        if writable:
+            args += ['-add-fd', f'fd={devices[name]["ro_fd"]},set=2']
+        args += ['-drive', f'file=/dev/fdset/{index},format=raw,if=none,id={name},readonly={"off" if writable else "on"}',
                  '-device', 'virtio-blk-pci,drive=' + name]
     return args
 
@@ -352,11 +354,23 @@ def qemu_argv(resources, devices, serial_fd, role):
 def make_bootstrap(package, devices, serial_fd, role, owner):
     if role not in ('developer', 'reviewer') or set(devices) != {'root', 'task', 'assignment'}:
         raise ValueError('q2_exact_role_devices_required')
+    projected = {}
+    for name, record in devices.items():
+        extra = ('ro_fd',) if name == 'task' and role == 'developer' else ()
+        if extra and 'ro_fd' not in record:
+            raise ValueError('q2_task_readonly_handle_required')
+        if not extra and 'ro_fd' in record:
+            raise ValueError('q2_unapproved_readonly_handle')
+        projected[name] = {key: record[key] for key in ('fd', 'st_dev', 'st_ino', 'size') + extra}
+    if role == 'developer':
+        ro_fd = projected['task']['ro_fd']
+        if (type(ro_fd) is not int or ro_fd < 3 or ro_fd == serial_fd
+                or ro_fd in {row['fd'] for row in projected.values()}):
+            raise ValueError('q2_distinct_task_readonly_handle_required')
     return {'schema': 'HERMES_Q2_SANDBOX_PLAN_V1', 'role': role,
             'policy_sha256': package['static_policy_sha256'],
-            'devices': {name: {key: record[key] for key in ('fd', 'st_dev', 'st_ino', 'size')}
-                        for name, record in devices.items()},
-            'serial_fd': serial_fd, 'qemu_argv': qemu_argv(package['resources'], devices, serial_fd, role), 'owner': owner}
+            'devices': projected,
+            'serial_fd': serial_fd, 'qemu_argv': qemu_argv(package['resources'], projected, serial_fd, role), 'owner': owner}
 
 
 def verify_sandbox_controls(report, package):
@@ -402,9 +416,16 @@ def verify_control_record(row, package):
     for name in ('root', 'task', 'assignment'):
         observed, expected = report['devices'][name], row['devices'][name]
         if (observed.get('observed') is not True
-                or {key: observed.get(key) for key in ('fd', 'st_dev', 'st_ino', 'size')} != expected
+                or {key: observed.get(key) for key in ('fd', 'st_dev', 'st_ino', 'size')} != {
+                    key: expected[key] for key in ('fd', 'st_dev', 'st_ino', 'size')}
                 or observed.get('access') != (os.O_RDWR if role == 'developer' and name == 'task' else os.O_RDONLY)):
             raise ValueError('q2_sandbox_descriptor_identity_changed')
+    if role == 'developer':
+        expected_ro = {key: row['devices']['task'][key] for key in ('st_dev', 'st_ino', 'size')}
+        expected_ro['fd'] = row['devices']['task']['ro_fd']
+        observed_ro = report['devices']['task']['ro']
+        if {key: observed_ro.get(key) for key in expected_ro} != expected_ro or observed_ro.get('observed') is not True:
+            raise ValueError('q2_task_readonly_identity_changed')
     if report.get('serial_fd') != row['serial_fd']:
         raise ValueError('q2_sandbox_serial_identity_changed')
     if sandboxed:
@@ -453,6 +474,7 @@ def _calibration_ok(report, sandboxed, role):
             or set(report['devices']) != {'root', 'task', 'assignment', 'serial_identity'}):
         return False
     if (report.get('vm_created') is not False or report.get('descriptor_identity') is not True
+            or not _task_ro_control_ok(report['devices']['task'], role)
             or report.get('approved_reads') is not True or not report['devices']['serial_identity']):
         return False
     if not all(row['read'] and row['write'] == (role == 'developer' and name == 'task')
@@ -472,6 +494,14 @@ def _calibration_ok(report, sandboxed, role):
             and report['bundle_write']['allowed'] is True
             and all(row['allowed'] for row in report['network'].values())
             and report['legacy_keychain']['public_dummy_matches'] is True)
+
+
+def _task_ro_control_ok(task, role):
+    if role != 'developer':
+        return 'ro' not in task
+    ro = task.get('ro')
+    return (isinstance(ro, dict) and ro.get('read') is True and ro.get('write') is False
+            and ro.get('write_errno') == 9 and ro.get('access') == os.O_RDONLY)
 
 
 def _invoke_control(argv, fds, output):
@@ -511,6 +541,11 @@ def _one_control(package, role, mode, output):
             fds.append(fd)
             stat = os.fstat(fd)
             devices[name] = {'fd': fd, 'st_dev': stat.st_dev, 'st_ino': stat.st_ino, 'size': stat.st_size}
+        if role == 'developer':
+            ro_fd = os.open(output / 'task.public', os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            stack.callback(os.close, ro_fd)
+            fds.append(ro_fd)
+            devices['task']['ro_fd'] = ro_fd
         parent, child = socket.socketpair()
         stack.callback(parent.close)
         stack.callback(child.close)

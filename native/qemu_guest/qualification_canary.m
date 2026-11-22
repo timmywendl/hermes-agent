@@ -140,6 +140,18 @@ static NSDictionary *code_identity(bool diagnostic) {
     return result;
 }
 
+static bool task_readonly_descriptor(NSDictionary *record, NSMutableSet *fds) {
+    NSNumber *number = record[@"ro_fd"];
+    if (![number isKindOfClass:NSNumber.class]) return false;
+    int fd = number.intValue;
+    if (fd < 3 || ![number isEqualToNumber:@(fd)] || [fds containsObject:number] ||
+        !hermes_q2_fd_identity(fd, [record[@"st_dev"] unsignedLongLongValue],
+            [record[@"st_ino"] unsignedLongLongValue], [record[@"size"] unsignedLongLongValue], false))
+        return false;
+    [fds addObject:number];
+    return true;
+}
+
 static bool descriptors(NSDictionary *plan, int manifest_fd) {
     NSDictionary *devices = plan[@"devices"];
     if (![devices isKindOfClass:NSDictionary.class] ||
@@ -151,11 +163,13 @@ static bool descriptors(NSDictionary *plan, int manifest_fd) {
     NSMutableSet *fds = [NSMutableSet setWithArray:@[@0, @1, @2, @(manifest_fd)]];
     for (NSString *name in @[@"root", @"task", @"assignment"]) {
         NSDictionary *record = devices[name];
+        bool writable = [name isEqual:@"task"] && [role isEqual:@"developer"];
+        NSMutableArray *keys = [NSMutableArray arrayWithArray:@[@"fd", @"st_dev", @"st_ino", @"size"]];
+        if (writable) [keys addObject:@"ro_fd"];
         if (![record isKindOfClass:NSDictionary.class] ||
             ![[NSSet setWithArray:record.allKeys] isEqualToSet:
-              [NSSet setWithArray:@[@"fd", @"st_dev", @"st_ino", @"size"]]]) return false;
+              [NSSet setWithArray:keys]]) return false;
         int fd = [record[@"fd"] intValue];
-        bool writable = [name isEqual:@"task"] && [role isEqual:@"developer"];
         if ([record[@"size"] unsignedLongLongValue] > 8ULL * 1024 * 1024 * 1024 ||
             !hermes_q2_fd_identity(fd, [record[@"st_dev"] unsignedLongLongValue],
                 [record[@"st_ino"] unsignedLongLongValue], [record[@"size"] unsignedLongLongValue], writable))
@@ -163,6 +177,7 @@ static bool descriptors(NSDictionary *plan, int manifest_fd) {
         NSString *identity = [NSString stringWithFormat:@"%@:%@", record[@"st_dev"], record[@"st_ino"]];
         if ([identities containsObject:identity] || [fds containsObject:@(fd)]) return false;
         [identities addObject:identity]; [fds addObject:@(fd)];
+        if (writable && !task_readonly_descriptor(record, fds)) return false;
     }
     int serial = [plan[@"serial_fd"] intValue];
     if (!hermes_q2_serial_identity(serial) || [fds containsObject:@(serial)]) return false;
@@ -191,8 +206,10 @@ static NSArray *qemu_arguments(NSDictionary *plan, NSString *resources) {
     for (NSString *name in @[@"root", @"task", @"assignment"]) {
         int fd = [plan[@"devices"][name][@"fd"] intValue];
         bool writable = [name isEqual:@"task"] && [plan[@"role"] isEqual:@"developer"];
-        [args addObjectsFromArray:@[@"-add-fd", [NSString stringWithFormat:@"fd=%d,set=%d", fd, index],
-            @"-drive", [NSString stringWithFormat:@"file=/dev/fdset/%d,format=raw,if=none,id=%@,readonly=%@",
+        [args addObjectsFromArray:@[@"-add-fd", [NSString stringWithFormat:@"fd=%d,set=%d", fd, index]]];
+        if (writable) [args addObjectsFromArray:@[@"-add-fd", [NSString stringWithFormat:@"fd=%d,set=2",
+            [plan[@"devices"][@"task"][@"ro_fd"] intValue]]]];
+        [args addObjectsFromArray:@[@"-drive", [NSString stringWithFormat:@"file=/dev/fdset/%d,format=raw,if=none,id=%@,readonly=%@",
                        index, name, writable ? @"off" : @"on"],
             @"-device", [@"virtio-blk-pci,drive=" stringByAppendingString:name]]];
         index++;
@@ -235,22 +252,28 @@ static NSDictionary *manifest(const char *path, int *manifest_fd) {
     return value;
 }
 
+static NSDictionary *descriptor_control(int fd, bool canary) {
+    char value = 0;
+    errno = 0;
+    ssize_t read = pread(fd, &value, 1, 0); int read_error = errno;
+    errno = 0;
+    ssize_t write = canary ? pwrite(fd, &value, 1, 0) : -1; int write_error = errno;
+    int access = fcntl(fd, F_GETFL) & O_ACCMODE;
+    struct stat info = {0};
+    bool observed = fstat(fd, &info) == 0;
+    return @{@"read": @((bool)(read == 1)), @"read_errno": @(read_error),
+                     @"write": @((bool)(write == 1)), @"write_errno": @(write_error), @"access": @(access),
+                     @"observed": @(observed), @"fd": @(fd), @"st_dev": @(info.st_dev),
+                     @"st_ino": @(info.st_ino), @"size": @(info.st_size)};
+}
+
 static NSDictionary *device_control(NSDictionary *plan, bool canary) {
     NSMutableDictionary *result = [NSMutableDictionary dictionary];
     for (NSString *name in @[@"root", @"task", @"assignment"]) {
-        int fd = [plan[@"devices"][name][@"fd"] intValue];
-        char value = 0;
-        errno = 0;
-        ssize_t read = pread(fd, &value, 1, 0); int read_error = errno;
-        errno = 0;
-        ssize_t write = canary ? pwrite(fd, &value, 1, 0) : -1; int write_error = errno;
-        int access = fcntl(fd, F_GETFL) & O_ACCMODE;
-        struct stat info = {0};
-        bool observed = fstat(fd, &info) == 0;
-        result[name] = @{@"read": @((bool)(read == 1)), @"read_errno": @(read_error),
-                         @"write": @((bool)(write == 1)), @"write_errno": @(write_error), @"access": @(access),
-                         @"observed": @(observed), @"fd": @(fd), @"st_dev": @(info.st_dev),
-                         @"st_ino": @(info.st_ino), @"size": @(info.st_size)};
+        NSMutableDictionary *record = [descriptor_control([plan[@"devices"][name][@"fd"] intValue], canary) mutableCopy];
+        if ([name isEqual:@"task"] && [plan[@"role"] isEqual:@"developer"])
+            record[@"ro"] = descriptor_control([plan[@"devices"][@"task"][@"ro_fd"] intValue], canary);
+        result[name] = record;
     }
     /* No nonce/data is injected into a real Worker UART. Identity only. */
     result[@"serial_identity"] = @((bool)hermes_q2_serial_identity([plan[@"serial_fd"] intValue]));
@@ -311,6 +334,11 @@ static int preflight(const char *path, int argc, char **argv, bool canary) {
             devices_ok &= [devices[name][@"read"] boolValue] &&
                           (canary ? ([devices[name][@"write"] boolValue] == writable) :
                            [devices[name][@"access"] intValue] == (writable ? O_RDWR : O_RDONLY));
+        }
+        if ([plan[@"role"] isEqual:@"developer"]) {
+            NSDictionary *ro = devices[@"task"][@"ro"];
+            devices_ok &= [ro[@"read"] boolValue] && [ro[@"access"] intValue] == O_RDONLY &&
+                (!canary || (![ro[@"write"] boolValue] && [ro[@"write_errno"] intValue] == EBADF));
         }
         NSDictionary *legacy = hermes_hvf_legacy_probe([policy[@"legacy_fixture"] fileSystemRepresentation]);
         NSMutableDictionary *network = [NSMutableDictionary dictionary];

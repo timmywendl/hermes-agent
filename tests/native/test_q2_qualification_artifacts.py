@@ -112,17 +112,23 @@ def test_preopened_devices_use_fdsets_and_exact_access_modes(tmp_path):
     with image.open_devices() as devices, serial, peer:
         descriptors = devices.descriptors()
         assert set(descriptors) == {'root', 'task', 'assignment'}
+        assert set(devices.fds) == {'root', 'task', 'assignment', 'task_ro'}
+        assert descriptors['task']['ro_fd'] == devices.fds['task_ro']
         for name, fd in devices.fds.items():
             assert (fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE) == (os.O_RDWR if name == 'task' else os.O_RDONLY)
         os.lseek(devices.fds['task'], 3, os.SEEK_SET)
         args = devices.device_args(serial.fileno())
         assert os.lseek(devices.fds['task'], 0, os.SEEK_CUR) == 3
-        assert args.count('-add-fd') == 3
+        assert args.count('-add-fd') == 4
         assert 'file=/dev/fdset/2,format=raw,if=none,id=task,readonly=off' in args
         assert str(image.task) not in args
         assert 'file=/dev/fdset/1,format=raw,if=none,id=root,readonly=on' in args
         assert 'file=/dev/fdset/3,format=raw,if=none,id=assignment,readonly=on' in args
         assert args[args.index('-nic') + 1] == 'none'
+        from native.qemu_guest.qualification_package import qemu_argv
+        projected = qemu_argv(image.kernel.parent, descriptors, serial.fileno(), image.role)
+        assert args[args.index('-add-fd'):] == projected[projected.index('-add-fd'):]
+        assert f'fd={devices.fds["task_ro"]},set=2' in args
         before = devices.pass_fds
     assert devices.closed
     for fd in before:
@@ -137,11 +143,72 @@ def test_reviewer_task_capability_is_kernel_readonly(tmp_path):
         with pytest.raises(OSError):
             os.pwrite(devices.fds['task'], b'bad', 0)
         assert devices.descriptors()['task']['readonly'] is True
+        assert set(devices.fds) == {'root', 'task', 'assignment'}
+        assert 'ro_fd' not in devices.descriptors()['task']
         devices.verify()
         serial, peer = socket.socketpair()
         with serial, peer:
             args = devices.device_args(serial.fileno())
         assert 'file=/dev/fdset/2,format=raw,if=none,id=task,readonly=on' in args
+        assert args.count('-add-fd') == 3
+
+
+@pytest.mark.platforms('posix')
+def test_developer_task_two_independent_handles_have_real_kernel_permissions(tmp_path):
+    import errno
+    import fcntl
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        assert 'task_ro' in devices.fds
+        rw, ro = devices.fds['task'], devices.fds['task_ro']
+        assert rw != ro
+        assert (os.fstat(rw).st_dev, os.fstat(rw).st_ino, os.fstat(rw).st_size) == (
+            os.fstat(ro).st_dev, os.fstat(ro).st_ino, os.fstat(ro).st_size)
+        assert fcntl.fcntl(ro, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY
+        assert not os.get_inheritable(ro) and not os.get_inheritable(rw)
+        os.lseek(rw, 3, os.SEEK_SET)
+        assert os.lseek(ro, 0, os.SEEK_CUR) == 0
+        devices.verify()
+        assert os.lseek(rw, 0, os.SEEK_CUR) == 3
+        with pytest.raises(OSError) as refused:
+            os.pwrite(ro, b'x', 0)
+        assert refused.value.errno == errno.EBADF
+        assert os.pwrite(rw, os.pread(rw, 1, 0), 0) == 1
+        inherited = devices.pass_fds
+        assert len(inherited) == 4 and ro in inherited and rw in inherited
+    for fd in inherited:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['missing', 'alias', 'writable', 'inode', 'size'])
+def test_developer_readonly_handle_rejects_changed_capability(tmp_path, damage):
+    image = inert_image(tmp_path)
+    with image.open_devices() as devices:
+        original = devices.fds['task_ro']
+        saved_identity = devices.identities['task_ro']
+        foreign = tmp_path / 'foreign'
+        foreign.write_bytes(image.task.read_bytes())
+        replacement = os.open(image.task if damage == 'writable' else foreign,
+                              os.O_RDWR if damage == 'writable' else os.O_RDONLY)
+        try:
+            identity = list(saved_identity)
+            identity[2] += 1
+            operations = {
+                'missing': lambda: devices.fds.pop('task_ro'),
+                'alias': lambda: devices.fds.update(task_ro=devices.fds['task']),
+                'size': lambda: devices.identities.update(task_ro=tuple(identity)),
+                'writable': lambda: devices.fds.update(task_ro=replacement),
+                'inode': lambda: devices.fds.update(task_ro=replacement),
+            }
+            operations[damage]()
+            with pytest.raises(ValueError):
+                devices.verify()
+        finally:
+            devices.fds['task_ro'] = original
+            devices.identities['task_ro'] = saved_identity
+            os.close(replacement)
 
 
 @pytest.mark.platforms('posix')
@@ -469,3 +536,121 @@ def test_candidate_does_not_replace_wrong_actual_contents_with_expected_fixture(
     with pytest.raises(ValueError, match='required_content_missing'):
         freeze_candidate(disk, tmp_path / 'frozen', expected_base=base,
                          required_files={'qualification/result.txt': b'different required actual result\n'})
+
+
+def qemu_unit_function(source, signature):
+    """Compile the pinned upstream function unchanged, not a rewritten matcher."""
+    start = source.index(signature)
+    opening = source.index('{', start)
+    depth = 1
+    end = opening + 1
+    while depth:
+        depth += (source[end] == '{') - (source[end] == '}')
+        end += 1
+    return source[start:end]
+
+
+@pytest.fixture
+def pinned_qemu_fdset_unit(tmp_path):
+    import tarfile
+    from native.qemu_guest.qualification_package import QEMU_SHA256
+    archive = Path('/Users/timmywen/Documents/AI_Colleague/evidence/'
+                   'pr15-qemu-hvf-feasibility-20261121/downloads/qemu-11.1.3.tar.xz')
+    if not archive.is_file():
+        pytest.skip('Fixed upstream QEMU source archive unavailable for inert FD-set unit')
+    with archive.open('rb') as stream:
+        assert hashlib.file_digest(stream, 'sha256').hexdigest() == QEMU_SHA256
+    with tarfile.open(archive) as bundle:
+        sources = {name: bundle.extractfile('qemu-11.1.3/' + name).read().decode()
+                   for name in ('monitor/fds.c', 'util/osdep.c', 'include/qemu/queue.h')}
+    monitor, queue = sources['monitor/fds.c'], sources['include/qemu/queue.h']
+    license_text = monitor[:monitor.index('#include')]
+    lists = queue[queue.index('#define QLIST_HEAD('):queue.index('/*\n * Singly-linked List definitions.')]
+    types = monitor[monitor.index('/* file descriptor associated'):monitor.index('static bool monitor_add_fd(')]
+    shims = '''
+#include <stdbool.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/stat.h>
+typedef int QemuMutex;
+typedef void Error;
+typedef struct {int64_t fdset_id; int fd;} AddfdInfo;
+#define QEMU_LOCK_GUARD(pointer) ((void)(pointer))
+#define QERR_INVALID_PARAMETER_VALUE "%s %s"
+#define g_malloc0(size) calloc(1,size)
+#define qemu_dup(fd) dup(fd)
+static char *g_strdup(const char *value){return value?strdup(value):NULL;}
+static void error_setg(Error **error,const char *format,...){(void)error;(void)format;}
+'''
+    functions = '\n'.join([
+        qemu_unit_function(sources['util/osdep.c'], 'int qemu_dup_flags('),
+        qemu_unit_function(monitor, 'AddfdInfo *monitor_fdset_add_fd('),
+        qemu_unit_function(monitor, 'int monitor_fdset_dup_fd_add(')])
+    driver = r'''
+int main(int argc,char **argv) {
+    if(argc!=4)return 71;
+    int first=atoi(argv[1]), second=atoi(argv[2]);
+    const char *mode=argv[3]; Error *error=NULL;
+    int set=strcmp(mode,"wrong-set")==0?3:2;
+    if(strcmp(mode,"dual-reverse")==0) {
+        if(!monitor_fdset_add_fd(second,true,set,NULL,&error))return 72;
+        if(!monitor_fdset_add_fd(first,true,set,NULL,&error))return 73;
+    } else {
+        if(!monitor_fdset_add_fd(first,true,set,NULL,&error))return 74;
+        if(strcmp(mode,"dual")==0 && !monitor_fdset_add_fd(second,true,set,NULL,&error))return 75;
+    }
+    errno=0; int ro=monitor_fdset_dup_fd_add(2,O_RDONLY,&error);int ro_error=errno;
+    errno=0; int rw=monitor_fdset_dup_fd_add(2,O_RDWR,&error);int rw_error=errno;
+    struct stat left={0},right={0};
+    bool same=ro>=0 && rw>=0 && !fstat(ro,&left) && !fstat(rw,&right) &&
+        left.st_dev==right.st_dev && left.st_ino==right.st_ino && left.st_size==right.st_size;
+    char byte=0; bool denied=false,writable=false;
+    if(ro>=0){pread(ro,&byte,1,0);errno=0;denied=pwrite(ro,&byte,1,0)==-1 && errno==EBADF;}
+    if(rw>=0){pread(rw,&byte,1,0);writable=pwrite(rw,&byte,1,0)==1;}
+    printf("{\"ro\":%d,\"rw\":%d,\"ro_errno\":%d,\"rw_errno\":%d,"
+           "\"ro_mode\":%d,\"rw_mode\":%d,\"same_inode_size\":%d,"
+           "\"ro_write_rejected\":%d,\"rw_write_accepted\":%d}\n",
+           ro,rw,ro_error,rw_error,ro>=0?(fcntl(ro,F_GETFL)&O_ACCMODE):-1,
+           rw>=0?(fcntl(rw,F_GETFL)&O_ACCMODE):-1,same,denied,writable);
+    if(ro>=0)close(ro);if(rw>=0)close(rw);
+    return 0;
+}
+'''
+    source = tmp_path / 'pinned-fdset-unit.c'
+    source.write_text(license_text + shims + lists + types + functions + driver)
+    binary = tmp_path / 'pinned-fdset-unit'
+    subprocess.run(['xcrun', 'clang', '-Wall', '-Wextra', '-Werror', source, '-o', binary],
+                   check=True, capture_output=True, timeout=30)
+    return binary
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('mode', ['dual', 'dual-reverse', 'single-rw', 'readonly', 'wrong-set'])
+def test_pinned_qemu_fdset_production_matcher_uses_real_modes(tmp_path, pinned_qemu_fdset_unit, mode):
+    import errno
+    image = inert_image(tmp_path, 'reviewer' if mode == 'readonly' else 'developer')
+    with image.open_devices() as devices:
+        primary, ro = devices.fds['task'], devices.fds.get('task_ro', -1)
+        fds = (primary, ro) if ro >= 0 else (primary,)
+        result = subprocess.run([pinned_qemu_fdset_unit, str(primary), str(ro), mode],
+                                pass_fds=fds, capture_output=True, text=True, check=True, timeout=5)
+        report = json.loads(result.stdout)
+    if mode.startswith('dual'):
+        assert report['ro'] >= 0 and report['rw'] >= 0
+        assert report['ro_mode'] == os.O_RDONLY and report['rw_mode'] == os.O_RDWR
+        assert report['same_inode_size'] == report['ro_write_rejected'] == report['rw_write_accepted'] == 1
+    elif mode == 'single-rw':
+        assert report['ro'] == -1 and report['ro_errno'] == errno.EACCES
+        assert report['rw'] >= 0 and report['rw_mode'] == os.O_RDWR
+    elif mode == 'readonly':
+        assert report['ro'] >= 0 and report['ro_mode'] == os.O_RDONLY and report['ro_write_rejected'] == 1
+        assert report['rw'] == -1 and report['rw_errno'] == errno.EACCES
+    else:
+        assert report['ro'] == report['rw'] == -1
+        assert report['ro_errno'] == report['rw_errno'] == errno.ENOENT

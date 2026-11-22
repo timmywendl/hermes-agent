@@ -267,3 +267,24 @@ Native grant must bind the accepted Host integration HEAD and exact Guest source
 and artifact identities separately. Live Cockpit account/route/header/retry/cache
 policy, credentials, real-model streaming/cancellation/billing and full original
 Owner physical retirement require their own explicit operational qualification.
+
+## FD-set access-mode repair (Main Control 7077643727)
+
+The first Native attempt failed before HVF creation: QEMU's initial read-only
+open could not select a Developer task FD supplied only as O_RDWR. That failed
+grant, raw logs and STOP_UNCERTAIN remain preserved; this repair does not retire
+or resume it.
+
+Developer now inherits two independently opened task descriptors of the same
+inode and size, O_RDWR and O_RDONLY, both in QEMU FD set 2. There are still three
+physical devices. Reviewer task, root and assignment remain read-only. Bootstrap,
+preflight and pre-release verification bind the extra descriptor's identity and
+access mode; Owner closes all four Developer handles. Auto-read-only remains on.
+
+Offline tests exercise actual kernel FD permissions and the pinned upstream
+QEMU FD-set selection functions in an inert driver. They do not initialize QEMU
+or prove Guest boot. A newly signed Helper must pass its own two-role no-VM
+Sandbox diagnostic before a fresh three-slot request is frozen. Original seven
+Guest artifacts are verified without rebuilding. New evidence is under
+`/Users/timmywen/Documents/AI_Colleague/evidence/q2-fdset-access-mode-repair-20261122`.
+No new Native grant is issued by this repair.

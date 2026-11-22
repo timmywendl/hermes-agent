@@ -9,6 +9,7 @@ from contextlib import ExitStack
 import argparse
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import plistlib
@@ -333,7 +334,7 @@ def emit_metadata(root, receipt):
     return result
 
 
-def qemu_argv(resources, devices, serial_fd, role):
+def qemu_argv(resources, devices, serial_fd, role, *, scope_sha256=None):
     resources = Path(resources)
     args = ['-L', str(resources), '-nodefaults', '-display', 'none', '-monitor', 'none', '-qmp', 'stdio',
             '-chardev', f'socket,id=worker,fd={serial_fd}', '-serial', 'chardev:worker',
@@ -341,6 +342,10 @@ def qemu_argv(resources, devices, serial_fd, role):
             '-no-reboot', '-kernel', str(resources / 'kernel.Image'),
             '-initrd', str(resources / 'initramfs.cpio.gz'),
             '-append', 'console=tty0 root=/dev/vda ro rdinit=/init panic=-1']
+    if scope_sha256 is not None:
+        if not isinstance(scope_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', scope_sha256):
+            raise ValueError('q2_boot_scope_digest_required')
+        args[-1] += ' HERMES_Q2_SCOPE_SHA256=' + scope_sha256
     for index, name in enumerate(('root', 'task', 'assignment'), 1):
         writable = role == 'developer' and name == 'task'
         args += ['-add-fd', f'fd={devices[name]["fd"]},set={index}']
@@ -351,7 +356,7 @@ def qemu_argv(resources, devices, serial_fd, role):
     return args
 
 
-def make_bootstrap(package, devices, serial_fd, role, owner):
+def make_bootstrap(package, devices, serial_fd, role, owner, *, scope_sha256):
     if role not in ('developer', 'reviewer') or set(devices) != {'root', 'task', 'assignment'}:
         raise ValueError('q2_exact_role_devices_required')
     projected = {}
@@ -367,10 +372,13 @@ def make_bootstrap(package, devices, serial_fd, role, owner):
         if (type(ro_fd) is not int or ro_fd < 3 or ro_fd == serial_fd
                 or ro_fd in {row['fd'] for row in projected.values()}):
             raise ValueError('q2_distinct_task_readonly_handle_required')
-    return {'schema': 'HERMES_Q2_SANDBOX_PLAN_V1', 'role': role,
+    if not isinstance(scope_sha256, str) or not re.fullmatch(r'[0-9a-f]{64}', scope_sha256):
+        raise ValueError('q2_boot_scope_digest_required')
+    return {'schema': 'HERMES_Q2_SANDBOX_PLAN_V1', 'role': role, 'scope_sha256': scope_sha256,
             'policy_sha256': package['static_policy_sha256'],
             'devices': projected,
-            'serial_fd': serial_fd, 'qemu_argv': qemu_argv(package['resources'], projected, serial_fd, role), 'owner': owner}
+            'serial_fd': serial_fd, 'qemu_argv': qemu_argv(package['resources'], projected, serial_fd, role,
+                scope_sha256=scope_sha256), 'owner': owner}
 
 
 def verify_sandbox_controls(report, package):
@@ -555,7 +563,8 @@ def _one_control(package, role, mode, output):
             current['resources'] = package['positive_resources']
         owner = {'task_id': 'PUBLIC_CANARY', 'run_id': 1, 'epoch': 1,
                  'vm_id': 'NO_VM', 'attempt': role + '-' + mode, 'instance': 'NO_OWNER_CANARY'}
-        bootstrap = make_bootstrap(current, devices, child.fileno(), role, owner)
+        bootstrap = make_bootstrap(current, devices, child.fileno(), role, owner,
+            scope_sha256=hashlib.sha256(canonical(owner).encode()).hexdigest())
         manifest = output / 'bootstrap.json'
         manifest.write_text(canonical(bootstrap))
         fd = os.open(manifest, os.O_RDONLY)

@@ -1195,3 +1195,75 @@ def test_lookup_disappearance_records_the_contemporaneous_poll_branch(monkeypatc
     assert actual['lookup_exception'] == 'ProcessLookupError' and actual['observed_monotonic'] > 0
     assert child._q2_verified_identity == history
     assert not any(value == 'RETIRED' for value in observer.observation.values())
+
+
+def test_boot_hints_persist_in_existing_two_records_and_survive_unknown(owner):
+    from gateway.session_guest_serial import boot_scope_sha256
+    from hermes_cli.kanban_db_connect import connect_closing, write_txn
+    authority, batch, source, head = owner
+    handle, _work = reserve(owner)
+    stale = dict(handle.record)
+    frame = {'boot': 1, 'errno': 0, 'failed': 0, 'seq': 1, 'stage': 1,
+             'scope_sha256': boot_scope_sha256(handle.scope)}
+    q2.persist_boot_hint(handle, frame)
+    assert handle.record['boot_hints'] == [frame] and handle.record['state'] == 'STARTING'
+    with connect_closing(batch.board) as board, write_txn(board):
+        q2._persist(board, handle, {**stale, 'phase': 'SYNTHETIC_STALE_UPDATE'})
+    assert handle.record['boot_hints'] == [frame]
+    q2.mark_uncertain(handle, RuntimeStoreError('synthetic_failure_no_native'))
+    saved = q2.metadata(authority.db.get_meta(handle.key))
+    with connect_closing(batch.board) as board:
+        value = q2.metadata(board.execute('SELECT metadata FROM task_runs WHERE id=?', (saved['run_id'],)).fetchone()[0])
+    assert value[q2.NAMESPACE] == saved and saved['state'] == 'STOP_UNCERTAIN'
+    assert saved['boot_hints'] == [frame] and not saved['native_spawned']
+    assert authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+    with pytest.raises(RuntimeStoreError):
+        q2.reserve_attempt(authority, batch, 2, source=source, head=head)
+
+
+def test_foreign_boot_scope_cannot_change_custody(owner):
+    handle, _work = reserve(owner)
+    before = handle.authority.db.get_meta(handle.key)
+    with pytest.raises(RuntimeStoreError, match='q2_boot_scope_or_history_changed'):
+        q2.persist_boot_hint(handle, {'scope_sha256': 'f' * 64, 'seq': 1})
+    assert handle.authority.db.get_meta(handle.key) == before
+
+
+def test_real_owner_service_persists_failed_boot_then_existing_unknown_policy(owner):
+    import struct
+    from gateway.session_guest_serial import OwnerSerialSession, boot_scope_sha256
+    from hermes_cli.kanban_db_connect import connect_closing
+    handle, _work = reserve(owner)
+    host, peer = socket.socketpair()
+    handle.channel = OwnerSerialSession(handle.endpoint, host.fileno(), handle.work,
+        defer_heartbeat=True, boot_diagnostics=True,
+        boot_hint=lambda frame: q2.persist_boot_hint(handle, frame))
+    host.close()
+    frames = []
+    for seq, stage, failed, error in ((1, 1, 0, 0), (2, 2, 1, 13)):
+        frame = {'boot': 1, 'seq': seq, 'stage': stage, 'failed': failed, 'errno': error,
+                 'scope_sha256': boot_scope_sha256(handle.scope)}
+        raw = q2.canonical(frame).encode()
+        frames.append(struct.pack('!I', len(raw)) + raw)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(q2._service, handle)
+            handle.channel.bind_service(future)
+            peer.sendall(b''.join(frames))
+            future.result(timeout=5)
+        assert handle.service_done.is_set() and len(handle.errors) == 1
+        assert str(handle.errors[0]) == 'guest_boot_failure_hint'
+        assert handle.channel.wire.received == 0 and handle.channel.wire.pump is None
+        q2.mark_uncertain(handle, handle.errors[0])
+        saved = q2.metadata(handle.authority.db.get_meta(handle.key))
+        with connect_closing(handle.batch.board) as board:
+            raw = board.execute('SELECT metadata FROM task_runs WHERE id=?', (saved['run_id'],)).fetchone()[0]
+        assert q2.metadata(raw)[q2.NAMESPACE] == saved
+        assert saved['state'] == 'STOP_UNCERTAIN' and len(saved['boot_hints']) == 2
+        assert saved['boot_hints'][-1]['failed'] == 1 and not saved['native_spawned']
+        assert not handle.channel.ready.is_set() and not handle.channel.physical_observation()['complete']
+        assert handle.authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+        assert handle.authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+    finally:
+        peer.close()
+        handle.channel.close_transport(deadline=time.monotonic() + 5)

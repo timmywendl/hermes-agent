@@ -201,7 +201,8 @@ static NSArray *qemu_arguments(NSDictionary *plan, NSString *resources) {
         @"-machine", @"virt", @"-cpu", @"host", @"-smp", @"2", @"-m", @"2048", @"-no-reboot",
         @"-kernel", [resources stringByAppendingPathComponent:@"kernel.Image"],
         @"-initrd", [resources stringByAppendingPathComponent:@"initramfs.cpio.gz"],
-        @"-append", @"console=tty0 root=/dev/vda ro rdinit=/init panic=-1"]];
+        @"-append", [@"console=tty0 root=/dev/vda ro rdinit=/init panic=-1 HERMES_Q2_SCOPE_SHA256="
+                     stringByAppendingString:plan[@"scope_sha256"]]]];
     int index = 1;
     for (NSString *name in @[@"root", @"task", @"assignment"]) {
         int fd = [plan[@"devices"][name][@"fd"] intValue];
@@ -235,10 +236,14 @@ static NSDictionary *manifest(const char *path, int *manifest_fd) {
     NSDictionary *value = [NSJSONSerialization JSONObjectWithData:bytes options:0 error:NULL];
     if (![value isKindOfClass:NSDictionary.class] ||
         ![[NSSet setWithArray:value.allKeys] isEqualToSet:[NSSet setWithArray:
-          @[@"schema", @"role", @"policy_sha256", @"devices", @"serial_fd", @"qemu_argv", @"owner"]]]) return nil;
+          @[@"schema", @"role", @"policy_sha256", @"devices", @"serial_fd", @"qemu_argv", @"owner", @"scope_sha256"]]]) return nil;
     NSData *canonical = [NSJSONSerialization dataWithJSONObject:value
         options:NSJSONWritingSortedKeys | NSJSONWritingWithoutEscapingSlashes error:NULL];
     if (![canonical isEqualToData:bytes]) return nil;
+    NSString *scope = value[@"scope_sha256"];
+    NSCharacterSet *not_hex = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789abcdef"] invertedSet];
+    if (![scope isKindOfClass:NSString.class] || scope.length != 64 ||
+        [scope rangeOfCharacterFromSet:not_hex].location != NSNotFound) return nil;
     NSDictionary *owner = value[@"owner"];
     if (![owner isKindOfClass:NSDictionary.class] ||
         ![[NSSet setWithArray:owner.allKeys] isEqualToSet:[NSSet setWithArray:

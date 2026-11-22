@@ -1342,3 +1342,174 @@ def test_deferred_pre_ready_peer_eof_is_fact_without_fabricated_pump_or_retireme
         assert facts['complete'] is False and not server.ready.is_set()
     finally:
         server.close_transport(deadline=time.monotonic() + 5)
+
+
+def boot_packet(scope, *, seq=1, stage=1, failed=0, error=0):
+    import json
+    import struct
+    from gateway.session_guest_serial import boot_scope_sha256
+    frame = {'boot': 1, 'errno': error, 'failed': failed, 'scope_sha256': boot_scope_sha256(scope),
+             'seq': seq, 'stage': stage}
+    raw = json.dumps(frame, sort_keys=True, separators=(',', ':')).encode()
+    return struct.pack('!I', len(raw)) + raw
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('prelude', [False, True])
+def test_real_socketpair_boot_prelude_keeps_first_rpc_sequence_one(owner, prelude):
+    import time
+    _authority, _row, scope, endpoint = owner
+    hints = []
+    host, guest = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=hints.append)
+    host.close()
+    wire = SerialWire(guest.fileno(), scope)
+    before = _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0]
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(server.serve_one)
+        if prelude:
+            guest.sendall(boot_packet(scope) + boot_packet(scope, seq=2, stage=2))
+        assert wire.send('context', 'request', {'operation': 'assignment'}) == 1
+        reply = wire.receive()
+        assert reply['seq'] == reply['reply_to'] == 1 and reply['payload']['result'] == endpoint.test_work
+        future.result(timeout=5)
+    assert server.wire.received == server.wire.sent == 1
+    assert len(server.wire.boot_hints) == (2 if prelude else 0) and not server.ready.is_set()
+    assert hints == server.wire.boot_hints
+    assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == before
+    try:
+        assert not server.physical_observation()['complete']
+    finally:
+        wire.close(); wire.release_fd(); guest.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('damage', ['scope', 'duplicate_key', 'extra_key', 'noncanonical', 'gap',
+                                  'stage_gap', 'stage_zero', 'errno', 'oversized', 'partial', 'late'])
+def test_real_serial_reader_rejects_bad_boot_prelude_without_rpc_authority(damage):
+    import json
+    import struct
+    from gateway.session_guest_serial import BootSerialWire
+    scope = {'execution_id': 'private-disposable', 'epoch': 1}
+    host, peer = socket.socketpair()
+    hints = []
+    wire = BootSerialWire(host.fileno(), scope, hints.append)
+    host.close()
+    raw = boot_packet(scope)
+    frame = json.loads(raw[4:])
+    changes = {'scope': lambda: frame.update(scope_sha256='f' * 64),
+               'extra_key': lambda: frame.update(extra=1), 'gap': lambda: frame.update(seq=2),
+               'stage_gap': lambda: frame.update(stage=3), 'stage_zero': lambda: frame.update(stage=0),
+               'errno': lambda: frame.update(errno=4096),
+               'oversized': lambda: frame.update(extra='x' * 200)}
+    if damage in changes:
+        changes[damage]()
+        data = json.dumps(frame, sort_keys=True, separators=(',', ':')).encode()
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'duplicate_key':
+        data = raw[4:-1] + b',"boot":1}'
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'noncanonical':
+        data = json.dumps(frame, sort_keys=True).encode()
+        raw = struct.pack('!I', len(data)) + data
+    if damage == 'partial':
+        raw = raw[:13]
+    if damage == 'late':
+        wire.boot_done = True
+    try:
+        peer.sendall(raw)
+        peer.shutdown(socket.SHUT_WR)
+        with pytest.raises((SerialError, EOFError)):
+            wire.receive()
+        assert wire.received == wire.sent == 0 and hints == [] and wire.failed
+    finally:
+        peer.close(); wire.close(); wire.release_fd()
+
+
+@pytest.mark.platforms('posix')
+@pytest.mark.parametrize('failed', [0, 1])
+def test_boot_hint_then_eof_or_failure_never_becomes_ready(owner, failed):
+    import time
+    _authority, _row, scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    peer.sendall(boot_packet(scope, failed=failed, error=13 if failed else 0))
+    peer.shutdown(socket.SHUT_WR)
+    try:
+        with pytest.raises((SerialError, EOFError)):
+            server.serve_one()
+        assert len(server.wire.boot_hints) == 1
+        assert not server.ready.is_set() and not server.result_ready.is_set()
+        assert server.wire.received == 0 and server.wire.pump is None
+        assert not server.physical_observation()['complete']
+        assert _authority.db._read_one('SELECT status FROM worker_executions')[0] == 'unknown'
+        assert _authority.db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 0
+    finally:
+        peer.close(); server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_boot_frames_use_existing_service_reader_and_not_a_second_pump(owner):
+    import time
+    from gateway.session_guest_serial import BootSerialWire
+    _authority, _row, scope, endpoint = owner
+    seen = threading.Event()
+    threads = []
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    original = server.wire.on_boot
+
+    def same_reader(frame):
+        assert server.wire.pump is None
+        threads.append(threading.get_ident())
+        original(frame)
+        seen.set()
+
+    server.wire.on_boot = same_reader
+    guest = SerialWire(peer.fileno(), scope)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            peer.sendall(boot_packet(scope))
+            assert seen.wait(5) and not future.done() and server.wire.pump is None
+            peer.sendall(boot_packet(scope, seq=2, stage=2))
+            guest.send('context', 'request', {'operation': 'assignment'})
+            guest.receive()
+            future.result(timeout=5)
+        assert type(server.wire) is BootSerialWire and len(set(threads)) == 1 and len(threads) == 2
+        assert server.wire.pump is not None
+    finally:
+        guest.close(); guest.release_fd(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)
+
+
+@pytest.mark.platforms('posix')
+def test_first_v2_heartbeat_after_boot_is_still_sequence_one(owner):
+    import time
+    _authority, _row, scope, endpoint = owner
+    host, peer = socket.socketpair()
+    server = OwnerSerialSession(endpoint, host.fileno(), endpoint.test_work,
+                                defer_heartbeat=True, boot_diagnostics=True, boot_hint=lambda _frame: None)
+    host.close()
+    guest = SerialWire(peer.fileno(), scope)
+    try:
+        with ThreadPoolExecutor(1) as pool:
+            future = pool.submit(server.serve_one)
+            peer.sendall(boot_packet(scope))
+            assert guest.send('lifecycle', 'heartbeat', {'ping': 1}) == 1
+            ack = guest.receive()
+            assert ack['seq'] == 1 and ack['payload'] == {'ack': 1}
+            assert guest.send('context', 'request', {'operation': 'assignment'}) == 2
+            assert guest.receive()['reply_to'] == 2
+            future.result(timeout=5)
+        assert server.wire.received == server.wire.sent == 2 and len(server.wire.boot_hints) == 1
+        assert not server.ready.is_set()
+    finally:
+        guest.close(); guest.release_fd(); peer.close()
+        server.close_transport(deadline=time.monotonic() + 5)

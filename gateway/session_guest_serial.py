@@ -5,6 +5,8 @@ supply the inherited socketpair endpoint bound to this exact reservation. Q1's
 inert campaign, grant and helper are not extended or reused as launch authority.
 """
 import json
+import hashlib
+import struct
 import sqlite3
 import threading
 import time
@@ -12,19 +14,95 @@ import queue
 from concurrent.futures import Future, CancelledError
 
 from agent.guest_inference import validate_request
-from agent.guest_serial import SerialError, SerialWire
+from agent.guest_serial import MAX_FRAME, SerialError, SerialWire, _json, _read
 from gateway.session_worker_guest import GuestOwnerEndpoint
 from hermes_state_runtime import RuntimeStoreError
 
 
+BOOT_FRAME_MAX = 192
+BOOT_FRAME_COUNT = 16
+BOOT_LAST_STAGE = 14
+
+
+def boot_scope_sha256(scope):
+    raw = json.dumps(scope, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+class BootSerialWire(SerialWire):
+    """The existing sole reader, specialized for an optional bounded prelude."""
+
+    def __init__(self, fd, scope, on_boot):
+        super().__init__(fd, scope)
+        self.boot_digest = boot_scope_sha256(self.scope)
+        self.boot_hints = []
+        self.boot_done = False
+        self.boot_deadline = time.monotonic() + 60
+        self.on_boot = on_boot
+
+    def _boot_schema(self, frame, raw):
+        keys = {'boot', 'errno', 'failed', 'scope_sha256', 'seq', 'stage'}
+        if (not isinstance(frame, dict) or set(frame) != keys or len(raw) > BOOT_FRAME_MAX or
+                json.dumps(frame, sort_keys=True, separators=(',', ':'), allow_nan=False).encode() != raw or
+                any(type(frame[key]) is not int for key in ('boot', 'errno', 'failed', 'seq', 'stage')) or
+                frame['boot'] != 1 or frame['failed'] not in (0, 1) or
+                not 0 <= frame['errno'] <= 4095 or (not frame['failed'] and frame['errno'] != 0)):
+            raise SerialError('invalid_boot_prelude')
+
+    def _boot(self, frame, raw):
+        self._boot_schema(frame, raw)
+        previous = self.boot_hints[-1]['stage'] if self.boot_hints else 0
+        if (self.boot_done or self.pump is not None or frame['scope_sha256'] != self.boot_digest or
+                frame['seq'] != len(self.boot_hints) + 1 or frame['seq'] > BOOT_FRAME_COUNT or
+                not 1 <= frame['stage'] <= BOOT_LAST_STAGE or
+                frame['stage'] not in (previous, previous + 1) or
+                (not frame['failed'] and frame['stage'] != previous + 1)):
+            raise SerialError('invalid_boot_prelude')
+        # Persist on the existing service thread before accepting the next frame.
+        self.on_boot(dict(frame))
+        self.boot_hints.append(dict(frame))
+        if frame['failed']:
+            self.boot_done = True
+            raise SerialError('guest_boot_failure_hint')
+
+    def _receive_frame(self):
+        if self.failed:
+            raise SerialError('serial_failed')
+        try:
+            while True:
+                timeout = self.timeout if self.boot_done else min(self.timeout, self.boot_deadline - time.monotonic())
+                size = struct.unpack('!I', _read(self.fd, 4, timeout, self.closed))[0]
+                if not 0 < size <= MAX_FRAME:
+                    raise SerialError('serial_frame_too_large')
+                timeout = self.timeout if self.boot_done else min(self.timeout, self.boot_deadline - time.monotonic())
+                raw = _read(self.fd, size, timeout, self.closed)
+                frame = _json(raw)
+                if isinstance(frame, dict) and ('boot' in frame or 'scope_sha256' in frame):
+                    self._boot(frame, raw)
+                    continue
+                self._validate(frame)
+                self.received += 1
+                self.boot_done = True
+                return frame
+        except (TypeError, KeyError, RecursionError) as error:
+            self.failed = True
+            raise SerialError('invalid_serial_frame') from error
+        except (ValueError, OSError, EOFError):
+            self.failed = True
+            raise
+
+
 class OwnerSerialSession:
     def __init__(self, endpoint, fd, work, *, inference=None, activity=None, heartbeat_interval=5, heartbeat_lease=90,
-                 defer_heartbeat=False):
+                 defer_heartbeat=False, boot_diagnostics=False, boot_hint=None):
         if not isinstance(endpoint, GuestOwnerEndpoint) or work['assignment'] != endpoint.scope:
             raise RuntimeStoreError('guest_scope_mismatch')
         from gateway.session_hvf_adapter import _require_owner
         _require_owner(endpoint.authority)
         from agent.runtime_session_guest import validate_guest_work
+        if boot_diagnostics and (not defer_heartbeat or not callable(boot_hint)):
+            raise RuntimeStoreError('boot_requires_original_owner_service_callback')
+        self.boot_hint = boot_hint
         self.endpoint, self.work = endpoint, validate_guest_work(work)
         # Protected Host injection only; D2 policy acceptance does not enable
         # a live connector, credential discovery or a Guest-selected route.
@@ -64,7 +142,8 @@ class OwnerSerialSession:
                 raise RuntimeStoreError('guest_work_not_prepared')
             if isinstance(inference, OwnerResponses):
                 inference.bind(endpoint, self.stop, conn)
-            self.wire = SerialWire(fd, endpoint.scope)
+            self.wire = (BootSerialWire(fd, endpoint.scope, self._boot_hint) if boot_diagnostics
+                         else SerialWire(fd, endpoint.scope))
             if defer_heartbeat:
                 self.wire.timeout = 60
             workers[key] = self  # retained on EOF, cancel, result or Owner loss
@@ -82,6 +161,11 @@ class OwnerSerialSession:
                 except (sqlite3.Error, OSError, RuntimeStoreError) as storage_failure:
                     failure.add_note('Guest attachment revocation persistence failed: ' + str(storage_failure))
             raise
+
+    def _boot_hint(self, frame):
+        if self.wire.pump is not None or self.ready.is_set():
+            raise SerialError('boot_after_worker_traffic')
+        self.boot_hint(frame)
 
     def serve_one(self):
         with self.io_lock:
@@ -362,6 +446,7 @@ class OwnerSerialSession:
                   'receive_pump_started': pump is not None,
                   'frames_received': self.wire.received,
                   'frames_sent': self.wire.sent,
+                  'boot_hints_untrusted': list(getattr(self.wire, 'boot_hints', [])),
                   'writer_joined': writer and self.wire.closed.is_set(),
                   'service_joined': service and self.service_observed and self.service_future is not None
                                     and self.service_future.done(),

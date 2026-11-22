@@ -956,3 +956,218 @@ def test_candidate_rejects_invalid_empty_diagnostic_directory(repository, tmp_pa
     disk = image_tree(root, tmp_path / 'task.raw', ext4_tools, 'Q2INVALIDEMPTY')
     with pytest.raises(ValueError, match='q2_startup_node_invalid'):
         freeze_candidate(disk, tmp_path / 'candidate', expected_base=base)
+
+
+@pytest.fixture
+def boot_codec(tmp_path):
+    import ctypes
+    from types import SimpleNamespace
+    from hermes_platform.resolver import locate_command
+    command = locate_command('clang').command
+    if not command:
+        pytest.skip('Host C compiler unavailable')
+    output = tmp_path / 'codec.dylib'
+    source = Path(__file__).resolve().parents[2] / 'native/qemu_guest/boot_init.c'
+    subprocess.run([*command, '-dynamiclib', '-DHERMES_BOOT_CODEC_ONLY', '-O2', '-Wall', '-Wextra',
+                    '-Werror', str(source), '-o', str(output)], check=True, capture_output=True, timeout=30)
+    library = ctypes.CDLL(str(output), use_errno=True)
+
+    class State(ctypes.Structure):
+        _fields_ = [('seq', ctypes.c_uint), ('last_stage', ctypes.c_uint), ('disabled', ctypes.c_int)]
+
+    writer = ctypes.CFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, use_errno=True)
+    waiter = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_int, ctypes.c_int)
+    clock = ctypes.CFUNCTYPE(ctypes.c_int64)
+
+    class IO(ctypes.Structure):
+        _fields_ = [('write_bytes', writer), ('writable', waiter), ('now_ms', clock)]
+
+    library.hermes_boot_encode.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_char_p,
+                                          ctypes.c_uint, ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_encode.restype = ctypes.c_size_t
+    library.hermes_boot_emit.argtypes = [ctypes.POINTER(State), ctypes.POINTER(IO), ctypes.c_int,
+                                        ctypes.c_char_p, ctypes.c_uint, ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_emit.restype = ctypes.c_int
+    library.hermes_boot_descriptor.argtypes = [ctypes.c_int, ctypes.c_int]
+    library.hermes_boot_descriptor.restype = ctypes.c_int
+    return SimpleNamespace(lib=library, State=State, IO=IO, writer=writer, waiter=waiter, clock=clock)
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('seq,stage,error,failed', [(1, 1, 0, 0), (16, 14, 4095, 1), (2, 2, 13, 1)])
+def test_actual_c_boot_encoder_canonical_fixed_vectors(boot_codec, seq, stage, error, failed):
+    import ctypes
+    import struct
+    scope = 'a' * 64
+    buffer = ctypes.create_string_buffer(197)
+    count = boot_codec.lib.hermes_boot_encode(buffer, len(buffer), scope.encode(), seq, stage, error, failed)
+    expected = json.dumps({'boot': 1, 'errno': error, 'failed': failed, 'scope_sha256': scope,
+                           'seq': seq, 'stage': stage}, sort_keys=True, separators=(',', ':')).encode()
+    assert count == len(expected) + 4 and count <= 196
+    assert buffer.raw[:count] == struct.pack('!I', len(expected)) + expected
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('damage', ['scope', 'scope_hex', 'seq', 'stage', 'errno', 'failed', 'progress_errno', 'capacity'])
+def test_actual_c_boot_encoder_bounds(boot_codec, damage):
+    import ctypes
+    values = {'scope': b'a' * 64, 'seq': 1, 'stage': 1, 'error': 0, 'failed': 0, 'capacity': 197}
+    updates = {'scope': {'scope': b'bad'}, 'scope_hex': {'scope': b'x' * 64}, 'seq': {'seq': 17}, 'stage': {'stage': 15},
+               'errno': {'error': 4096, 'failed': 1}, 'failed': {'failed': 2},
+               'progress_errno': {'error': 1}, 'capacity': {'capacity': 4}}
+    values.update(updates[damage])
+    buffer = ctypes.create_string_buffer(197)
+    assert boot_codec.lib.hermes_boot_encode(buffer, values['capacity'], values['scope'], values['seq'],
+                                             values['stage'], values['error'], values['failed']) == 0
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('mode', ['partial_success', 'timeout', 'ordering', 'count', 'failure_final', 'clock_failure',
+                                  'write_zero', 'eintr_then_success', 'eagain_then_success'])
+def test_actual_c_boot_writer_partial_timeout_and_sequence(boot_codec, mode):
+    import ctypes
+    output = bytearray()
+    tick = [0]
+    waits = []
+    writes = []
+
+    def write(_fd, pointer, length):
+        import errno
+        writes.append(length)
+        if mode == 'write_zero':
+            return 0
+        if len(writes) == 1 and mode in ('eintr_then_success', 'eagain_then_success'):
+            ctypes.set_errno(errno.EINTR if mode == 'eintr_then_success' else errno.EAGAIN)
+            return -1
+        count = min(length, 7)
+        output.extend(ctypes.string_at(pointer, count))
+        return count
+
+    def writable(_fd, timeout):
+        waits.append(timeout)
+        assert 0 < timeout <= 10
+        return 1
+
+    def now():
+        if mode == 'clock_failure':
+            return -1
+        if mode == 'timeout':
+            tick[0] += 4
+        return tick[0]
+
+    callbacks = (boot_codec.writer(write), boot_codec.waiter(writable), boot_codec.clock(now))
+    io = boot_codec.IO(*callbacks)
+    state = boot_codec.State()
+    if mode == 'ordering':
+        state.seq = state.last_stage = 3
+    if mode == 'count':
+        state.seq, state.last_stage = 16, 1
+    result = boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), 99, b'a' * 64,
+                                             1 if mode != 'count' else 2, 0, int(mode == 'failure_final'))
+    if mode in ('timeout', 'ordering', 'count', 'clock_failure', 'write_zero'):
+        assert result == 0
+        assert state.seq == (3 if mode == 'ordering' else 16 if mode == 'count' else 0)
+        if mode != 'ordering':
+            assert state.disabled == 1
+    else:
+        assert result == 1 and state.seq == state.last_stage == 1
+        assert len(waits) > 1 and len(output) > 100
+        if mode == 'failure_final':
+            before = bytes(output)
+            assert boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), 99,
+                                                   b'a' * 64, 2, 0, 0) == 0
+            assert bytes(output) == before
+
+
+def test_newc_static_uart_character_node_encoding_needs_no_host_mknod(tmp_path):
+    import gzip
+    import stat
+    from native.qemu_guest.artifact_fs import newc
+    root = tmp_path / 'initramfs'
+    (root / 'dev').mkdir(parents=True)
+    (root / 'init').write_bytes(b'data-only')
+    data = gzip.decompress(newc(root, pl011_node=True))
+    offset = 0
+    found = []
+    while offset + 110 <= len(data):
+        header = data[offset:offset + 110]
+        assert header[:6] == b'070701'
+        fields = [int(header[6 + i * 8:14 + i * 8], 16) for i in range(13)]
+        offset += 110
+        name = data[offset:offset + fields[11] - 1].decode()
+        offset = (offset + fields[11] + 3) & ~3
+        payload = data[offset:offset + fields[6]]
+        offset = (offset + fields[6] + 3) & ~3
+        if name == 'TRAILER!!!':
+            break
+        if stat.S_ISCHR(fields[1]):
+            found.append(name)
+            assert name == 'dev/ttyAMA0' and stat.S_IMODE(fields[1]) == 0o600
+            assert fields[2] == fields[3] == 0 and fields[9:11] == [204, 64] and payload == b''
+    assert found == ['dev/ttyAMA0'] and not (root / 'dev/ttyAMA0').exists()
+
+
+@pytest.mark.platforms('macos')
+def test_actual_c_partial_timeout_is_stream_unknown_never_silently_resynced_to_rpc(boot_codec):
+    import ctypes
+    from agent.guest_serial import SerialWire
+    from gateway.session_guest_serial import BootSerialWire, boot_scope_sha256
+    scope = {'execution_id': 'disposable', 'epoch': 1}
+    host, peer = socket.socketpair()
+    hints = []
+    receiver = BootSerialWire(host.fileno(), scope, hints.append)
+    sender = SerialWire(peer.fileno(), scope)
+    host.close()
+    tick = [0]
+
+    def write(fd, pointer, length):
+        return os.write(fd, ctypes.string_at(pointer, min(length, 7)))
+
+    def now():
+        tick[0] += 4
+        return tick[0]
+
+    callbacks = (boot_codec.writer(write), boot_codec.waiter(lambda _fd, _ms: 1), boot_codec.clock(now))
+    io = boot_codec.IO(*callbacks)
+    state = boot_codec.State()
+    try:
+        assert boot_codec.lib.hermes_boot_emit(ctypes.byref(state), ctypes.byref(io), peer.fileno(),
+                                               boot_scope_sha256(scope).encode(), 1, 0, 0) == 0
+        assert state.disabled == 1  # bounded best effort returns; it never exits/reboots the caller
+        assert sender.send('context', 'request', {'operation': 'assignment'}) == 1
+        peer.shutdown(socket.SHUT_WR)
+        with pytest.raises((ValueError, EOFError)):
+            receiver.receive()
+        assert receiver.failed and receiver.received == 0 and hints == []
+        with pytest.raises(ValueError, match='serial_failed'):
+            receiver.receive()
+    finally:
+        sender.close(); sender.release_fd(); peer.close()
+        receiver.close(); receiver.release_fd()
+
+
+@pytest.mark.platforms('macos')
+@pytest.mark.parametrize('disabled', [0, 1])
+def test_actual_c_descriptor_handoff_keeps_even_disabled_channel_until_worker_fd_exists(boot_codec, disabled):
+    import fcntl
+    host, peer = socket.socketpair()
+    carried = os.dup(peer.fileno())
+    try:
+        os.set_inheritable(carried, False)
+        state = boot_codec.State(7, 7, disabled)
+        assert boot_codec.lib.hermes_boot_descriptor(carried, 0) == 1
+        assert not fcntl.fcntl(carried, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+        assert os.fstat(carried).st_ino == os.fstat(peer.fileno()).st_ino
+        # Once the original protocol descriptor is open, enabling CLOEXEC does
+        # not last-close/flush the shared transport; disabled follows same path.
+        worker = os.dup(peer.fileno())
+        try:
+            assert boot_codec.lib.hermes_boot_descriptor(carried, 1) == 1
+            assert fcntl.fcntl(carried, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+            assert state.disabled == disabled
+            os.write(worker, b'normal-protocol-still-open')
+            assert host.recv(64) == b'normal-protocol-still-open'
+        finally:
+            os.close(worker)
+    finally:
+        os.close(carried); host.close(); peer.close()

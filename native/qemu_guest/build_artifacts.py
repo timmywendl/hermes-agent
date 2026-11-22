@@ -205,12 +205,14 @@ def boot_files(args, output, root, lock):
             target.write_bytes(data)
             if digest(target) != row['sha256']:
                 raise ValueError('vendor_module_changed')
-    (output / 'initramfs.cpio.gz').write_bytes(newc(init))
+    (output / 'initramfs.cpio.gz').write_bytes(newc(init, pl011_node=True))
     if digest(output / 'kernel.Image') != lock['kernel_payload']['sha256']:
         raise ValueError('vendor_kernel_changed')
     return {'compiler_argv': [str(value) for value in command],
             'compiler_sha256': digest(args.zig), 'init_sha256': digest(binary),
-            'kernel_sha256': digest(output / 'kernel.Image'), 'modules': selected}
+            'kernel_sha256': digest(output / 'kernel.Image'), 'modules': selected,
+            'early_uart': {'path': '/dev/ttyAMA0', 'major': 204, 'minor': 64, 'mode': '0600',
+                           'console': 'tty0', 'boot_frames': 16, 'payload_max': 192}}
 
 
 def task_fixture(output):

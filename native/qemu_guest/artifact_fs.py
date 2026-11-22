@@ -147,20 +147,29 @@ def normalize_tree(root):
         os.utime(path, (EPOCH, EPOCH), follow_symlinks=False)
 
 
-def newc(root):
+def newc(root, *, pl011_node=False):
     """Stable metadata; only explicitly supplied files are placed in initramfs."""
     root = Path(root)
     result = bytearray()
-    for inode, path in enumerate([root, *sorted(root.rglob('*')), None], 1):
+    paths: list[Path | str] = [root, *sorted(root.rglob('*'))]
+    if pl011_node:
+        if (root / 'dev/ttyAMA0').exists() or (root / 'dev/ttyAMA0').is_symlink():
+            raise ValueError('static_pl011_collision')
+        paths.append('PL011_CHARACTER_NODE')
+    for inode, path in enumerate([*paths, None], 1):
+        major = minor = 0
         if path is None:
             name, mode, data = 'TRAILER!!!', 0, b''
+        elif isinstance(path, str):
+            name, mode, data = 'dev/ttyAMA0', stat.S_IFCHR | 0o600, b''
+            major, minor = 204, 64
         else:
             name = '.' if path == root else path.relative_to(root).as_posix()
             mode = path.lstat().st_mode
             data = os.readlink(path).encode() if path.is_symlink() else (
                 path.read_bytes() if path.is_file() else b'')
         encoded = name.encode() + b'\0'
-        fields = (inode, mode, 0, 0, 1, EPOCH, len(data), 0, 0, 0, 0, len(encoded), 0)
+        fields = (inode, mode, 0, 0, 1, EPOCH, len(data), 0, 0, major, minor, len(encoded), 0)
         result.extend(b'070701' + ''.join(f'{value:08x}' for value in fields).encode() + encoded)
         result.extend(b'\0' * (-len(result) % 4))
         result.extend(data)

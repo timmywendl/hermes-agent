@@ -870,3 +870,77 @@ assignment-role/task-mount and directory-validation failures can still precede
 a usable task receipt; Reviewer remains intentionally read-only. No fourth VM
 is authorized to resolve those unknowns. This bounded package ends after source,
 artifact and evidence delivery, without claiming a specific Guest root cause.
+
+## Early UART diagnostic prelude (Main Control 7082704659)
+
+The pinned Debian6.12.107 arm64 config enables AMBA/PL011/TTY/OF/common-clock
+built in. Reviewed kernel registration/init ordering, QEMU11.1.3 virt UART0 DT
+(PL011 at0x09000000, serial0,24MHz clocks), and major204/minor64 support a static
+initramfs `/dev/ttyAMA0` character entry before proc/sys/devtmpfs. newc encodes
+this one0600 root-owned node directly; no privileged Host mknod is used. This is
+SOURCE_VERIFIED feasibility, not a runtime-open or boot claim.
+
+The exact original Owner hashes canonical endpoint.scope (sorted compact JSON,
+no newline) and binds its64 lowercase hex bytes into the protected Helper plan
+and exact QEMU argv as `HERMES_Q2_SCOPE_SHA256=...`. The pinned kernel forwards
+an unrecognized no-dot NAME=value into init's environment; no `/proc/cmdline`
+read is required. Console remains tty0, with no earlycon/unframed UART text.
+The digest is non-secret and only binds an untrusted hint to the active scope;
+it is not Guest code provenance or authority.
+
+PID1 opens the same UART nonblocking/raw before root transition. Its boot fd is
+at least4, survives root exec with a validated character-device identity and
+sequence/env handoff, and remains owned even when diagnostics are disabled.
+It never last-closes at root transition. Parent after fork relinquishes its
+reference; the child enables CLOEXEC only after opening original Worker fd3.
+The normal Worker receives neither the diagnostic fd nor scope/sequence env.
+
+The existing4-byte big-endian length framing carries one exact canonical JSON
+schema: boot=1, errno, failed, scope_sha256, seq, stage. Payload≤192 bytes,
+sequence≤16, stage1..14, bounded integer errors, strictly ordered progress.
+Progress follows each milestone; failure marks the attempted/current stage.
+The C writer has a10ms deadline and finite I/O attempts per frame; missing UART,
+clock/write failure disables diagnostics without calling Guest fail/reboot/exit.
+The same pinned serial-core TX FIFO is4096 bytes (4KiB pages); all16*196 boot
+bytes fit under the healthy initially-empty/sole-writer/raw/no-console assumptions.
+This is conditional capacity evidence, not an atomic-write or delivery proof.
+A physical partial-write timeout can damage the shared stream: Host must retain
+sticky UNKNOWN and never scan/resynchronize into a purported successful RPC.
+No transparency after physical transport loss is claimed.
+
+| Stage | Progress fact if observed | Missing/failure boundary |
+| --- | --- | --- |
+| 1 | PID1 reached scope/UART/raw initialization | Kernel, exec, scope and initial UART-open failures remain unobservable |
+| 2/3/4 | proc/sys/devtmpfs mount completed respectively | Failure hint labels attempted mount only |
+| 5 | fixed modules loaded | Loader/module failure is numeric hint, not a root-cause oracle |
+| 6/7 | root device observed/root mounted RO | Missing progress remains UNKNOWN |
+| 8 | root exec reached new PID1 image | Same UART open description and seq survive switch |
+| 9 | private runtime tmpfs mounts/directories completed | Grouped phase, not individual syscall trace |
+| 10 | assignment mounted/read and role accepted | No raw assignment content crosses diagnostic frame |
+| 11/12 | task mounted/role-specific diagnostic setup completed | Reviewer retains no disk write directory |
+| 13 | stdio/limits/capability/UID setup completed | Cwd/nearby failure remains a bounded phase hint |
+| 14 | about to exec accepted Python bootstrap | Does NOT prove Python import, entry or Worker READY |
+
+BootSerialWire specializes the same existing SerialWire in the Host gateway
+file; accepted agent/guest_serial.py and Guest RPCv2 bytes remain unchanged.
+Only the existing deferred Owner service consumes prelude frames; the original
+heartbeat pump starts after the first normal v2 frame. Prelude seq is separate:
+normal first request/heartbeat remains seq1. Late boot frames, wrong scope,
+sequence/stage gaps, extra/duplicate keys, oversized/noncanonical data reject.
+There is no second UART reader, thread, transport or diagnostic store.
+
+A required original-Owner callback persists hints in the existing Q2Attempt
+namespace in both Board and SessionDB. Prefix-preserving updates retain them
+through stale metadata updates/STOP_UNCERTAIN. A failed hint invokes existing
+slot/batch failure handling. Progress+EOF, a missing frame or bad framing never
+produces READY, Worker receipt, candidate authorization or RETIRED. Hints remain
+untrusted; all physical, serial, thread and accounting evidence is independent.
+
+Offline Ccodec vectors/partial/EINTR/EAGAIN/timeout/handoff tests, real socketpair
+and original Owner service tests are not Guest execution. New artifacts and a
+new signed Helper must bind this argv contract and be independently frozen.
+Only two actual Helper no-VM preflight entries (one per role, plus existing
+unrestricted calibrations) may run after independent safety review. QEMU normal
+initialization/VM/Guest/Worker remain NOT_RUN. No new execution profile or Native
+grant candidate is created. Three old failed grants stay STOP_UNCERTAIN and
+nonresumable; old missing evidence and Guest root causes remain UNKNOWN.

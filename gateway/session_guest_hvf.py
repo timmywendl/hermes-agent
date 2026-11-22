@@ -356,6 +356,14 @@ def _board_guard(board, handle):
 
 def _persist(board, handle, record):
     """Two existing stores, fail-closed on every partial commit; not cross-DB atomic."""
+    current = handle.record.get('boot_hints', [])
+    incoming = record.get('boot_hints', [])
+    if (not isinstance(current, list) or not isinstance(incoming, list) or
+            max(len(current), len(incoming)) > 16 or
+            incoming[:min(len(current), len(incoming))] != current[:min(len(current), len(incoming))]):
+        raise RuntimeStoreError('q2_boot_history_changed')
+    if current or incoming:
+        record = {**record, 'boot_hints': incoming if len(incoming) >= len(current) else current}
     row = board.execute('SELECT metadata FROM task_runs WHERE id=?', (record['run_id'],)).fetchone()
     data = metadata(row[0], canonical_required=False)
     data[NAMESPACE] = record
@@ -490,12 +498,27 @@ def _serve_until(handle, observer, predicate, deadline):
         observer.poll(deadline)
 
 
+def persist_boot_hint(handle, frame):
+    """Untrusted bounded hints in the existing two custody records only."""
+    from hermes_cli.kanban_db_connect import connect_closing, write_txn
+    from gateway.session_guest_serial import boot_scope_sha256
+    with connect_closing(handle.batch.board) as board, write_txn(board):
+        _board_guard(board, handle)
+        hints = list(handle.record.get('boot_hints', []))
+        if (frame['scope_sha256'] != boot_scope_sha256(handle.scope) or
+                frame['seq'] != len(hints) + 1 or len(hints) >= 16):
+            raise RuntimeStoreError('q2_boot_scope_or_history_changed')
+        hints.append(dict(frame))
+        _persist(board, handle, {**handle.record, 'boot_hints': hints})
+
+
 def _bootstrap(handle, devices, child_fd, path):
     from native.qemu_guest.qualification_package import make_bootstrap
     descriptors = devices.descriptors()
     owner = {key: handle.record[key] for key in ('task_id', 'run_id', 'epoch', 'vm_id', 'attempt', 'instance')}
     plan = make_bootstrap(handle.batch.body['helper_package'], descriptors, child_fd,
-                          'reviewer' if handle.record['slot'] == 2 else 'developer', owner)
+                          'reviewer' if handle.record['slot'] == 2 else 'developer', owner,
+                          scope_sha256=digest(handle.scope))
     checksum = write_receipt(path, plan, newline=False)
     return plan, checksum
 
@@ -536,7 +559,9 @@ def acquire_child(handle, image, inference, bootstrap_path):
                                                  'identity': handle.identity})
                     _booked_readback(handle)
                     handle.channel = OwnerSerialSession(handle.endpoint, host.fileno(), handle.work,
-                                                        inference=inference, defer_heartbeat=True)
+                                                        inference=inference, defer_heartbeat=True,
+                                                        boot_diagnostics=True,
+                                                        boot_hint=lambda frame: persist_boot_hint(handle, frame))
                     host.close()  # SerialWire owns the only Host protocol descriptor now.
                     handle.executor = ThreadPoolExecutor(1, thread_name_prefix='q2-original-owner-rpc')
                     handle.service = handle.executor.submit(_service, handle)
@@ -641,6 +666,7 @@ def mark_uncertain(handle, error):
     try:
         with connect_closing(handle.batch.board) as board, write_txn(board):
             _persist(board, handle, record)
+            record = handle.record
     except (ValueError, OSError, sqlite3.Error) as failure:
         errors.append(repr(failure))
     try:

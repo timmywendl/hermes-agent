@@ -27,7 +27,7 @@ def test_bootstrap_projects_capabilities_without_guest_path_authority():
     owner = {'task_id': 'task', 'run_id': 1, 'epoch': 1, 'vm_id': 'vm',
              'attempt': 'one', 'instance': 'owner'}
     package = {'static_policy_sha256': 'b' * 64, 'resources': '/approved/Resources'}
-    bootstrap = make_bootstrap(package, devices, 20, 'reviewer', owner)
+    bootstrap = make_bootstrap(package, devices, 20, 'reviewer', owner, scope_sha256='a' * 64)
     assert set(bootstrap['devices']['task']) == {'fd', 'st_dev', 'st_ino', 'size'}
     assert bootstrap['owner'] == owner
     assert bootstrap['role'] == 'reviewer'
@@ -42,7 +42,7 @@ def test_bootstrap_projects_capabilities_without_guest_path_authority():
 def test_bootstrap_refuses_unapproved_role(role):
     with pytest.raises(ValueError):
         make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'},
-                       device_records(), 20, role, {})
+                       device_records(), 20, role, {}, scope_sha256='a' * 64)
 
 
 def test_developer_is_the_only_writable_fdset():
@@ -70,7 +70,7 @@ def test_bootstrap_rejects_unbound_task_readonly_handle(damage):
                   'reviewer': lambda: records['task'].update(ro_fd=13)}
     operations[damage]()
     with pytest.raises(ValueError):
-        make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'}, records, 20, role, {})
+        make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'}, records, 20, role, {}, scope_sha256='a' * 64)
 
 
 def control(role, sandboxed):
@@ -330,8 +330,8 @@ def test_native_dual_handle_rejects_tampering_before_any_runtime(tmp_path, signe
     original_make, original_invoke = module.make_bootstrap, module._invoke_control
     replaced = {}
     role = 'reviewer' if damage == 'reviewer' else 'developer'
-    def changed(package, devices, serial, selected_role, owner):
-        plan = original_make(package, devices, serial, selected_role, owner)
+    def changed(package, devices, serial, selected_role, owner, **kwargs):
+        plan = original_make(package, devices, serial, selected_role, owner, **kwargs)
         if damage in {'writable', 'inode', 'size'}:
             path = tmp_path / 'refused/task.public' if damage == 'writable' else tmp_path / 'foreign.public'
             if damage != 'writable':
@@ -347,7 +347,8 @@ def test_native_dual_handle_rejects_tampering_before_any_runtime(tmp_path, signe
                           'reviewer': lambda: plan['devices']['task'].update(ro_fd=devices['task']['fd'])}
             operations[damage]()
         if damage not in {'missing', 'malformed'}:
-            plan['qemu_argv'] = module.qemu_argv(package['resources'], plan['devices'], serial, selected_role)
+            plan['qemu_argv'] = module.qemu_argv(package['resources'], plan['devices'], serial, selected_role,
+                                                  scope_sha256=plan['scope_sha256'])
         return plan
     def invoked(argv, fds, output):
         if replaced:
@@ -365,7 +366,7 @@ def test_native_dual_handle_rejects_tampering_before_any_runtime(tmp_path, signe
 
 
 @pytest.mark.platforms('macos')
-@pytest.mark.parametrize('damage', ['extra-argument', 'wrong-role', 'wrong-inode', 'writable-root', 'hardlink-root', 'duplicate-key'])
+@pytest.mark.parametrize('damage', ['extra-argument', 'wrong-role', 'wrong-inode', 'writable-root', 'hardlink-root', 'duplicate-key', 'scope-field', 'scope-argument'])
 def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, signed_inert_helper_package, monkeypatch, damage):
     import native.qemu_guest.qualification_package as module
     original = module.make_bootstrap
@@ -373,8 +374,8 @@ def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, sig
         encode = module.canonical
         monkeypatch.setattr(module, 'canonical', lambda value: encode(value)[:-1] + ',"role":"developer"}'
                             if value.get('schema') == 'HERMES_Q2_SANDBOX_PLAN_V1' else encode(value))
-    def changed(*args):
-        record = original(*args)
+    def changed(*args, **kwargs):
+        record = original(*args, **kwargs)
         operations = {
             'extra-argument': lambda: record['qemu_argv'].extend(['-netdev', 'user,id=forbidden']),
             'wrong-role': lambda: record.update(role='reviewer'),
@@ -382,6 +383,9 @@ def test_compiled_preflight_refuses_changed_manifest_before_any_vm(tmp_path, sig
             'writable-root': lambda: record['devices'].update(root=dict(record['devices']['task'])),
             'hardlink-root': lambda: os.link(tmp_path / 'refused/root.public', tmp_path / 'foreign-link'),
             'duplicate-key': lambda: None,
+            'scope-field': lambda: record.update(scope_sha256='x' * 64),
+            'scope-argument': lambda: record['qemu_argv'].__setitem__(
+                record['qemu_argv'].index('-append') + 1, 'console=tty0 root=/dev/vda ro rdinit=/init panic=-1 HERMES_Q2_SCOPE_SHA256=' + 'f' * 64),
         }
         operations[damage]()
         return record
@@ -452,7 +456,8 @@ def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
     record = {'task_id': 'PUBLIC_OWNER_WRITER_FIXTURE', 'run_id': 1, 'epoch': 1,
               'vm_id': 'NO_VM', 'attempt': 'owner-native-parser-' + role,
               'instance': 'NO_OWNER_CANARY', 'slot': 2 if role == 'reviewer' else 1}
-    handle = SimpleNamespace(record=record, batch=SimpleNamespace(body={'helper_package': package}))
+    handle = SimpleNamespace(record=record, scope={'session_id': 'PUBLIC_FIXTURE', **record},
+                             batch=SimpleNamespace(body={'helper_package': package}))
     with ExitStack() as stack:
         policy = json.loads(Path(package['static_policy']).read_text())
         for path in policy['unix'].values():
@@ -494,3 +499,22 @@ def test_original_owner_bootstrap_is_consumed_by_actual_native_parser(
         reports = [json.loads(line[len(PREFIX):]) for line in result.stderr.splitlines() if line.startswith(PREFIX)]
         assert len(reports) == 1 and reports[0]['pass'] is True
         assert reports[0]['vm_created'] is False and reports[0]['canary'] is True
+
+
+def test_bootstrap_binds_canonical_owner_scope_digest_to_only_kernel_env():
+    from gateway.session_guest_serial import boot_scope_sha256
+    from native.qemu_guest.qualification_package import make_bootstrap
+    scope = {'epoch': 1, 'session_id': 'public', 'execution_id': 'worker'}
+    digest = boot_scope_sha256(scope)
+    assert digest == boot_scope_sha256(dict(reversed(list(scope.items()))))
+    owner = {'task_id': 'public', 'run_id': 1, 'epoch': 1, 'vm_id': 'public',
+             'attempt': 'public', 'instance': 'public'}
+    plan = make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'},
+                          device_records(), 20, 'developer', owner, scope_sha256=digest)
+    cmdline = plan['qemu_argv'][plan['qemu_argv'].index('-append') + 1]
+    assert cmdline == 'console=tty0 root=/dev/vda ro rdinit=/init panic=-1 HERMES_Q2_SCOPE_SHA256=' + digest
+    assert plan['scope_sha256'] == digest and 'earlycon' not in cmdline and 'ttyAMA0' not in cmdline
+    for bad in ('x' * 64, 'a' * 63, 'a' * 64 + ' extra=evil', None):
+        with pytest.raises(ValueError, match='q2_boot_scope_digest_required'):
+            make_bootstrap({'static_policy_sha256': 'b' * 64, 'resources': '/approved'},
+                           device_records(), 20, 'developer', owner, scope_sha256=bad)

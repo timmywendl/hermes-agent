@@ -288,3 +288,17 @@ Sandbox diagnostic before a fresh three-slot request is frozen. Original seven
 Guest artifacts are verified without rebuilding. New evidence is under
 `/Users/timmywen/Documents/AI_Colleague/evidence/q2-fdset-access-mode-repair-20261122`.
 No new Native grant is issued by this repair.
+
+The repaired Helper subsequently passed actual Developer and Reviewer no-VM
+Sandbox diagnostics, one invocation per role, after independent binary review.
+Helper SHA256: `500af6a2606bf91225dbbe7861448b1b2279d7c28ab90b1b2c054734663b7efe`;
+CDHash: `f2934725129058d93c9d33bf96c3fcc8ea715210`.
+The Helper observed Developer's task RO handle reject writes with EBADF while
+the same-inode RW handle accepted them; Reviewer remained fully read-only.
+All six diagnostic/calibration children were exactly waited/reaped and their
+pipes closed, with no parent FD accumulation. Execution counts: Helper
+preflight 2, normal QEMU initialization 0, VM/Guest/Worker starts 0.
+This is PASS_EXACT_HELPER_SANDBOX_PREFLIGHT, not a new Native qualification.
+A completely fresh three-slot grant request is prepared in the new evidence
+root; Main Control review and a new Human grant remain required before Slot1.
+The failed campaign's serial cleanup remains UNKNOWN and is not retired.

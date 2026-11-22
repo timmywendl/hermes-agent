@@ -783,3 +783,47 @@ def test_startup_stage_classifier_uses_bounded_names_without_guessing_first_fram
         fixture[function]()
     except ValueError as failure:
         assert namespace['classify'](failure, STARTUP_STAGES['ENTRY_MAIN']) == STARTUP_STAGES[stage]
+
+
+def test_manifest_bytes_parsed_are_the_bytes_whose_digest_was_checked(tmp_path, monkeypatch):
+    from native.qemu_guest import qualification_artifacts as artifacts
+    manifest = artifacts._write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'scope': {'run_id': 1},
+        'role': 'developer', 'task': {'path': 'must-not-be-opened.raw'}})
+    original_record = artifacts.file_record
+
+    def replace_after_hash(path):
+        result = original_record(path)
+        if str(path) == manifest['manifest_path']:
+            target = Path(path)
+            target.chmod(0o600)
+            target.write_text(target.read_text().replace('"run_id":1', '"run_id":2'))
+        return result
+
+    monkeypatch.setattr(artifacts, 'file_record', replace_after_hash)
+    with pytest.raises(ValueError, match='q2_manifest_changed'):
+        artifacts.inspect_startup(manifest['manifest_path'],
+                                  expected_manifest_sha256=manifest['manifest_sha256'])
+
+
+def test_startup_disk_open_binds_the_actual_descriptor_before_ext4_parse(tmp_path, monkeypatch):
+    from native.qemu_guest import qualification_artifacts as artifacts
+    disk = tmp_path / 'task.raw'
+    disk.write_bytes(b'not-ext4')
+    alternate = tmp_path / 'alternate.raw'
+    alternate.write_bytes(b'not-ext4')
+    original_record = artifacts.file_record
+    manifest = artifacts._write_manifest(tmp_path, 'slot.json', {
+        'schema': 'HERMES_Q2_SLOT_DEVICES_V1', 'scope': {'run_id': 1},
+        'role': 'developer', 'task': original_record(disk)})
+
+    def replace_disk_after_hash(path):
+        result = original_record(path)
+        if Path(path) == disk:
+            os.replace(alternate, disk)
+        return result
+
+    monkeypatch.setattr(artifacts, 'file_record', replace_disk_after_hash)
+    with pytest.raises(ValueError, match='q2_startup_device_changed'):
+        artifacts.inspect_startup(manifest['manifest_path'],
+                                  expected_manifest_sha256=manifest['manifest_sha256'])

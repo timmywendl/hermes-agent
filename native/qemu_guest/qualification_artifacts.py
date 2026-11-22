@@ -86,7 +86,16 @@ def _read_manifest(path, schema):
     info = file_record(path)
     if info['size'] > MAX_MANIFEST_BYTES:
         raise ValueError('q2_manifest_bounds')
-    raw = Path(path).read_text()
+    with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1 or
+                (opened.st_dev, opened.st_ino, opened.st_size) !=
+                (info['st_dev'], info['st_ino'], info['size'])):
+            raise ValueError('q2_manifest_changed')
+        encoded = stream.read(MAX_MANIFEST_BYTES + 1)
+    if len(encoded) > MAX_MANIFEST_BYTES or _digest(encoded) != info['sha256']:
+        raise ValueError('q2_manifest_changed')
+    raw = encoded.decode('utf-8')
     record = json.loads(raw)
     if not isinstance(record, dict) or canonical(record) != raw or record.get('schema') != schema:
         raise ValueError('q2_manifest_unavailable')
@@ -133,6 +142,10 @@ def inspect_startup(manifest, *, expected_manifest_sha256):
               'status': 'UNKNOWN', 'reason': 'NO_DURABLE_RECEIPT', 'task': before,
               'scope': record['scope']}
     with os.fdopen(os.open(disk['path'], os.O_RDONLY | os.O_NOFOLLOW), 'rb') as stream:
+        opened = os.fstat(stream.fileno())
+        if (opened.st_dev, opened.st_ino, opened.st_size) != (
+                before['st_dev'], before['st_ino'], before['size']):
+            raise ValueError('q2_startup_device_changed')
         fs = ExtFS(stream)
         names = {entry.filename for entry in fs.get('/').iterdir()}
         if STARTUP_DIRECTORY in names:

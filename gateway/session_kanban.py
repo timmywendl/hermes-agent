@@ -397,6 +397,41 @@ def _claude_review_config(context):
     return paths
 
 
+def _review_sandbox_policy(config_dir, workspace):
+    import subprocess
+
+    # User settings are also loaded for the Cockpit provider. Refuse known
+    # sandbox escapes rather than copying or logging any provider settings.
+    settings_path = Path(config_dir) / 'settings.json'
+    try:
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        sandbox = settings.get('sandbox', {})
+        network = sandbox.get('network', {})
+        filesystem = sandbox.get('filesystem', {})
+        permissions = settings.get('permissions', {})
+        if (not isinstance(sandbox, dict) or not isinstance(network, dict)
+                or not isinstance(filesystem, dict) or filesystem.get('disabled') or filesystem.get('allowWrite')
+                or not isinstance(permissions, dict) or not isinstance(permissions.get('allow', []), list)
+                or sandbox.get('excludedCommands')
+                or network.get('allowedDomains') or network.get('httpProxyPort') or network.get('socksProxyPort')
+                or network.get('allowLocalBinding') or network.get('allowUnixSockets') or network.get('allowAllUnixSockets')
+                or any(isinstance(rule, str) and rule.startswith(('WebFetch(', 'Edit('))
+                       for rule in permissions.get('allow', []))):
+            raise ValueError('sandbox exception')
+        common = subprocess.check_output(
+            ['git', '-C', workspace, 'rev-parse', '--git-common-dir'],
+            stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8', timeout=10,
+        ).strip()
+        if not common:
+            raise ValueError('missing git common directory')
+        common_dir = (Path(workspace) / common).resolve(strict=True)
+    except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
+        raise RuntimeStoreError('kanban_claude_review_sandbox_unavailable') from exc
+    return {'sandbox': {'enabled': True, 'failIfUnavailable': True, 'allowUnsandboxedCommands': False,
+                        'filesystem': {'disabled': False, 'denyWrite': [str(Path(workspace).resolve()), str(common_dir)]},
+                        'network': {'strictAllowlist': True, 'allowedDomains': [], 'deniedDomains': ['*']}}}
+
+
 def _is_review_validation_command(command):
     import re
 
@@ -471,6 +506,14 @@ def _review_command_matches_task(command, criteria):
     # Unknown options can suppress execution or carry secrets. Only accept
     # complete task-named test files and harmless presentation switches.
     selectors = args[3:] if (len(args) >= 3 and args[0].startswith('python') and args[1] == '-m') else args[1:]
+    # Project addopts can hide pytest's real summary (for example, -qq),
+    # leaving only test-controlled output. Clear it for qualifying receipts.
+    if selectors.count('-o') != 1:
+        return False
+    override = selectors.index('-o')
+    if override + 1 >= len(selectors) or selectors[override + 1] != 'addopts=':
+        return False
+    selectors = selectors[:override] + selectors[override + 2:]
     paths = set(re.findall(
         r'(?im)^\s*(?:[-*]\s*)?(?:run|offline_test:)\s+`?((?:tests?/)?[\w./-]*test_[\w.-]+\.py)`?(?:\s+offline)?[.!]?\s*$',
         criteria,
@@ -520,8 +563,9 @@ def _review_tool_result(call, block, runtime, cli_version=None):
             and runtime.get('interrupted') is False and not runtime.get('returnCodeInterpretation')
             and _is_review_validation_command(call['command'])):
         status = 0
-    if block.get('is_error') is True and cli_version == '2.1.323 (Claude Code)' and isinstance(content, str):
-        match = re.match(r'^Exit code ([1-9]\d*)(?:\n|$)', content)
+    if block.get('is_error') is True:
+        match = (re.match(r'^Exit code ([1-9]\d*)(?:\n|$)', content)
+                 if cli_version == '2.1.323 (Claude Code)' and isinstance(content, str) else None)
         status = int(match.group(1)) if match else None
     elif (type(status) is not int or status < 0 or not isinstance(runtime, dict)
           or runtime.get('interrupted') is not False or runtime.get('backgroundTaskId')
@@ -627,6 +671,7 @@ def _claude_verdict(context, handoff, base):
     from agent.skill_commands import build_preloaded_skills_prompt
 
     executable, config_dir = _claude_review_config(context)
+    sandbox_policy = _review_sandbox_policy(config_dir, context['workspace'])
     skill, loaded, missing = build_preloaded_skills_prompt(['sdlc-review'])
     if not skill or 'sdlc-review' not in loaded or missing:
         raise RuntimeStoreError('kanban_claude_review_skill_unavailable')
@@ -648,6 +693,7 @@ def _claude_verdict(context, handoff, base):
         f"against base branch {handoff['base']} for Task {context['task_id']} Run {context['run_id']}. "
         "Use the review skill's criteria and verify every prior requested correction before approving. "
         "Run the project tests, build, or behavior checks needed to verify this exact candidate. "
+        "For a qualifying pytest receipt pass -o addopts= so its actual summary is visible. "
         "Approval requires at least one successful relevant Bash validation whose tool result the Owner can verify. "
         "Return the structured verdict for the Owner to apply. Escalate when a Human decision is required. "
         "Do not call Kanban tools, change files or use the network. "
@@ -663,31 +709,43 @@ def _claude_verdict(context, handoff, base):
             [executable, '--version'], cwd=context['workspace'], env=env,
             stdin=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding='utf-8', timeout=10,
         ).strip()
-        process = subprocess.run(
-            [executable, '-p', '--verbose', '--output-format', 'stream-json', '--json-schema', json.dumps(schema),
-             '--tools', 'Read,Glob,Grep,Bash', '--allowedTools', 'Read,Glob,Grep,Bash',
-             '--permission-mode', 'dontAsk', '--permission-prompts', 'none',
-             '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
-             '--setting-sources', 'user', '--no-session-persistence', '--max-turns', '16'],
-            cwd=context['workspace'], env=env, input=prompt, encoding='utf-8',
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=min(seconds, 900), check=True,
-        )
-        envelope, executions, missing = _parse_claude_review_stream(process.stdout, cli_version)
+        if cli_version != '2.1.323 (Claude Code)':
+            raise RuntimeStoreError('kanban_claude_review_sandbox_unavailable')
+        try:
+            process = subprocess.run(
+                [executable, '-p', '--verbose', '--output-format', 'stream-json', '--json-schema', json.dumps(schema),
+                 '--tools', 'Read,Glob,Grep,Bash', '--allowedTools', 'Read,Glob,Grep,Bash',
+                 '--permission-mode', 'dontAsk', '--permission-prompts', 'none',
+                 '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
+                 '--settings', json.dumps(sandbox_policy),
+                 '--setting-sources', 'user', '--no-session-persistence', '--max-turns', '16'],
+                cwd=context['workspace'], env=env, input=prompt, encoding='utf-8',
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=min(seconds, 900), check=False,
+            )
+            output, returncode = process.stdout, process.returncode
+        except subprocess.TimeoutExpired as exc:
+            output = exc.stdout or b''
+            if isinstance(output, bytes):
+                output = output.decode('utf-8', 'replace')
+            # A timeout may cut the final JSON line in half. Only complete
+            # records can be associated with the exact tool call.
+            output = output.rpartition('\n')[0]
+            returncode = None
+        envelope, executions, missing = _parse_claude_review_stream(output, cli_version)
         for item in executions:
             item['relevant'] = _review_command_matches_task(item['command'], context['goal_text'])
-        if envelope is None:
-            raise ValueError('missing result event')
-        verdict = envelope['structured_output']
-        if (envelope['type'] == 'result' and envelope['subtype'] == 'success'
-                and envelope['is_error'] is False and isinstance(verdict, dict)
+        verdict = envelope.get('structured_output') if isinstance(envelope, dict) else None
+        if (returncode == 0 and isinstance(envelope, dict)
+                and envelope.get('type') == 'result' and envelope.get('subtype') == 'success'
+                and envelope.get('is_error') is False and isinstance(verdict, dict)
                 and set(verdict) == {'verdict', 'reason'}
                 and verdict['verdict'] in ('approved', 'changes_requested', 'escalate')
                 and isinstance(verdict['reason'], str) and 0 < len(verdict['reason'].strip()) <= 2000):
-            if verdict['verdict'] == 'approved' and (
+            approval_evidence_ok = not (
                     missing or not any(item['relevant'] and item['ran_tests'] for item in executions)
-                    or any(item['exit_status'] != 0 for item in executions)):
-                raise ValueError('approved without successful execution evidence')
-            return verdict, _review_execution_record(context, handoff, executions)
+                    or any(item['exit_status'] != 0 for item in executions))
+            return verdict, _review_execution_record(context, handoff, executions), approval_evidence_ok
+        return None, _review_execution_record(context, handoff, executions), False
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
         pass
     raise RuntimeStoreError('kanban_claude_review_failed')
@@ -714,7 +772,7 @@ def _run_claude_review(context):
         base = _check_review_candidate(context['workspace'], handoff, context['profile'])
         if not _bound_claim_is_live(context):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
-        verdict, execution = _claude_verdict(context, handoff, base)
+        verdict, execution, approval_evidence_ok = _claude_verdict(context, handoff, base)
         if _check_review_candidate(context['workspace'], handoff, context['profile']) != base:
             raise RuntimeStoreError('kanban_claude_review_candidate_changed')
         if (not _bound_claim_is_live(context)
@@ -722,7 +780,6 @@ def _run_claude_review(context):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
         task_id = context['task_id']
         claim = {'expected_run_id': context['run_id'], 'expected_claim_lock': context['claim_lock']}
-        reason = verdict['reason'].strip()
         if execution['commands']:
             with kb.write_txn(conn):
                 current = kb.get_task(conn, task_id)
@@ -730,6 +787,11 @@ def _run_claude_review(context):
                         or current.claim_lock != context['claim_lock'] or not _bound_worker_matches(conn, context)):
                     raise RuntimeStoreError('kanban_claude_review_stale_claim')
                 kb._append_event(conn, task_id, 'review_execution', execution, run_id=context['run_id'])
+        if verdict is None:
+            raise RuntimeStoreError('kanban_claude_review_failed')
+        reason = verdict['reason'].strip()
+        if verdict['verdict'] == 'approved' and not approval_evidence_ok:
+            raise RuntimeStoreError('kanban_claude_review_failed')
         if verdict['verdict'] == 'approved':
             ok = kb.complete_task(conn, task_id, result=reason, metadata={
                 'published_pr': handoff['url'], 'head_sha': handoff['head'], 'review_verdict': 'approved',

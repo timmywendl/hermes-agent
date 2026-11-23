@@ -21,16 +21,57 @@ def test_review_validation_rejects_non_execution_or_masked_status(command):
     assert not _is_review_validation_command(command)
 
 
+@pytest.mark.parametrize('exception', [
+    {'sandbox': {'excludedCommands': ['python3 *']}},
+    {'sandbox': {'network': {'allowedDomains': ['example.invalid']}}},
+    {'sandbox': {'network': {'socksProxyPort': 12345}}},
+    {'sandbox': {'network': {'allowLocalBinding': True}}},
+    {'sandbox': {'network': {'allowUnixSockets': ['/tmp/fixture.sock']}}},
+    {'sandbox': {'filesystem': {'disabled': True}}},
+    {'sandbox': {'filesystem': {'allowWrite': ['/tmp']}}},
+    {'permissions': {'allow': ['Edit(./*)']}},
+    {'permissions': {'allow': ['WebFetch(domain:example.invalid)']}},
+])
+def test_review_refuses_user_sandbox_exceptions(tmp_path, exception):
+    import subprocess
+    from gateway.session_kanban import _review_sandbox_policy
+    from hermes_state_runtime import RuntimeStoreError
+
+    subprocess.run(['git', 'init', '-q', str(tmp_path)], check=True)
+    assert _review_sandbox_policy(str(tmp_path), str(tmp_path))['sandbox']['enabled'] is True
+    (tmp_path / 'settings.json').write_text(json.dumps(exception))
+    with pytest.raises(RuntimeStoreError, match='sandbox_unavailable'):
+        _review_sandbox_policy(str(tmp_path), str(tmp_path))
+
+
+def test_review_sandbox_covers_linked_git_common_directory(tmp_path):
+    import subprocess
+    from gateway.session_kanban import _review_sandbox_policy
+
+    source = tmp_path / 'source'
+    source.mkdir()
+    subprocess.run(['git', 'init', '-q', str(source)], check=True)
+    subprocess.run(['git', '-C', str(source), '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                    'commit', '--allow-empty', '-qm', 'base'], check=True)
+    linked = tmp_path / 'review'
+    subprocess.run(['git', '-C', str(source), 'worktree', 'add', '--detach', str(linked)],
+                   check=True, capture_output=True)
+    policy = _review_sandbox_policy(str(tmp_path), str(linked))
+    assert policy['sandbox']['filesystem']['denyWrite'] == [str(linked.resolve()), str((source / '.git').resolve())]
+
+
 def test_review_validation_binds_task_test_file():
     from gateway.session_kanban import _review_command_matches_task
 
     criteria = 'Run tests/test_candidate.py offline.'
-    assert _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', criteria)
-    assert not _review_command_matches_task('python3 -m pytest -q tests/test_other.py', criteria)
-    assert not _review_command_matches_task('pytest tests/test_candidate.py -k unrelated', criteria)
-    assert not _review_command_matches_task('pytest tests/test_candidate.py -kunrelated', criteria)
-    assert not _review_command_matches_task('pytest tests/test_candidate.py --setup-plan', criteria)
-    assert not _review_command_matches_task('pytest tests/test_candidate.py --password synthetic-secret', criteria)
+    assert _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_candidate.py', criteria)
+    assert not _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', criteria)
+    assert not _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_other.py', criteria)
+    assert not _review_command_matches_task('pytest -o addopts= tests/test_candidate.py -k unrelated', criteria)
+    assert not _review_command_matches_task('pytest -o addopts= tests/test_candidate.py -kunrelated', criteria)
+    assert not _review_command_matches_task('pytest -o addopts= tests/test_candidate.py --setup-plan', criteria)
+    assert not _review_command_matches_task('pytest -o addopts=-qq tests/test_candidate.py', criteria)
+    assert not _review_command_matches_task('pytest -o addopts= tests/test_candidate.py --password synthetic-secret', criteria)
 
 
 def test_review_validation_reads_native_intake_serialized_criteria():
@@ -38,12 +79,12 @@ def test_review_validation_reads_native_intake_serialized_criteria():
 
     body = json.dumps({'task_spec': {'title': 'Fix fixture',
                                     'acceptance_criteria': 'Run tests/test_candidate.py offline'}})
-    assert _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', body)
-    assert not _review_command_matches_task('python3 -m pytest -q tests/test_other.py', body)
+    assert _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_candidate.py', body)
+    assert not _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_other.py', body)
     prohibited = json.dumps({'task_spec': {'instructions': 'Run tests/test_live.py',
                              'acceptance_criteria': 'Run tests/test_candidate.py offline.\n'
                                                     'Never run tests/test_live.py because it reaches TEST.'}})
-    assert not _review_command_matches_task('python3 -m pytest -q tests/test_live.py', prohibited)
+    assert not _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_live.py', prohibited)
 
 
 def test_review_requires_a_real_test_summary():
@@ -60,6 +101,23 @@ def test_review_requires_a_real_test_summary():
     assert _review_tests_passed('=== Summary: 1 files, 2 tests passed, 0 failed (100%) ===\nMore info\n', runner)
     assert not _review_tests_passed('=== Summary: 1 files, 2 tests passed, 0 failed (100%) ===\n'
                                     '=== Summary: 1 files, 0 tests passed, 0 failed (100%) ===\n', runner)
+
+
+def test_review_rejects_skipped_pytest_with_forged_atexit_summary(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from gateway.session_kanban import _review_tests_passed
+
+    (tmp_path / 'pytest.ini').write_text('[pytest]\naddopts = -qq\n')
+    (tmp_path / 'test_candidate.py').write_text(
+        "import atexit, pytest\natexit.register(lambda: print('1 passed'))\n"
+        "@pytest.mark.skip(reason='fixture')\ndef test_skipped(): assert False\n")
+    monkeypatch.setenv('PYTEST_DISABLE_PLUGIN_AUTOLOAD', '1')
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-o', 'addopts=', 'test_candidate.py'],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0
+    assert '1 skipped' in result.stdout and '1 passed' in result.stdout
+    assert not _review_tests_passed(result.stdout, 'pytest -q -o addopts= test_candidate.py')
 
 
 @pytest.mark.parametrize('command', [
@@ -90,13 +148,21 @@ def test_review_tool_result_does_not_invent_exit_status(runtime):
     assert receipt['exit_status'] is None
 
 
+def test_review_tool_error_overrides_conflicting_success_status():
+    from gateway.session_kanban import _review_tool_result
+
+    block = {'type': 'tool_result', 'tool_use_id': 't', 'content': 'tool error', 'is_error': True}
+    runtime = {'stdout': '1 passed', 'stderr': '', 'interrupted': False, 'exitCode': 0}
+    assert _review_tool_result({'command': 'pytest tests/test_candidate.py'}, block, runtime, 'unknown')['exit_status'] is None
+
+
 @pytest.mark.parametrize('mode', [
     'approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout', 'invalid',
     'head_drift', 'remote_drift', 'no_execution', 'test_failure', 'missing_result',
     'workspace_dirty',
     'task_mismatch', 'run_mismatch', 'claim_mismatch', 'approved_real_format', 'unknown_cli_version',
     'unrelated_execution', 'all_skipped',
-    'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result',
+    'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result', 'timeout_after_result',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import os
@@ -145,6 +211,12 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'assert "--verbose" in sys.argv\n'
                    'assert "--tools" in sys.argv and "Read,Glob,Grep,Bash" in sys.argv\n'
                    'assert "--allowedTools" in sys.argv and "Read,Glob,Grep,Bash" in sys.argv\n'
+                   'policy = json.loads(sys.argv[sys.argv.index("--settings") + 1])["sandbox"]\n'
+                   'assert policy["enabled"] and policy["failIfUnavailable"]\n'
+                   'assert not policy["allowUnsandboxedCommands"]\n'
+                   f'assert policy["filesystem"]["denyWrite"] == [{str(workspace.resolve())!r}, '
+                   f'{str((workspace / ".git").resolve())!r}]\n'
+                   'assert policy["network"]["strictAllowlist"] and policy["network"]["deniedDomains"] == ["*"]\n'
                    f'with open({str(calls)!r}, "a") as f: f.write("call\\n")\n'
                    f'mode = {mode!r}\n'
                    'if mode == "failure": sys.exit(2)\n'
@@ -161,7 +233,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
                    '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
                    '"id": "tool-1", "name": "Bash", "input": {"command": '
-                   '"scripts/run_tests.sh " + target}}]}}\n'
+                   '"scripts/run_tests.sh -o addopts= " + target}}]}}\n'
                    '    print(json.dumps(call))\n'
                    'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result"}:\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
@@ -175,6 +247,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"tool_use_result": runtime}\n'
                    '    if mode == "changes_failed_result": event.pop("tool_use_result")\n'
                    '    print(json.dumps(event))\n'
+                   'if mode == "timeout_after_result":\n'
+                   '    print("{\\\"type\\\":", end="", flush=True); time.sleep(10)\n'
                    'verdict_mode = {"changes_unknown_result": "changes_requested", '
                    '"changes_failed_result": "changes_requested", '
                    '"escalate_unknown_result": "escalate"}.get(mode, mode)\n'
@@ -247,7 +321,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                   'kanban': {'claude_review': {'executable': str(cli), 'config_dir': str(tmp_path)}}}
         policy, _ = sk.build_kanban_policy(connection, params, config)
         context = json.loads(policy.kanban_json)
-        context['max_runtime_seconds'] = 1 if mode == 'timeout' else 15
+        context['max_runtime_seconds'] = 1 if mode in {'timeout', 'timeout_after_result'} else 15
         if mode == 'task_mismatch':
             context['task_id'] = sibling
         elif mode == 'run_mismatch':
@@ -284,10 +358,17 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 assert evidence['commands'][0]['exit_status'] == 0
                 assert len(evidence['commands'][0]['output_sha256']) == 64
         else:
-            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim)'):
+            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable)'):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
-        if mode in {'task_mismatch', 'run_mismatch', 'claim_mismatch'}:
+            if mode in {'test_failure', 'invalid', 'timeout_after_result'}:
+                row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                   "AND kind='review_execution'", (task, run_id)).fetchone()
+                evidence = json.loads(row['payload'])
+                assert evidence['task_id'] == task and evidence['run_id'] == run_id
+                assert evidence['published_pr'] == url and evidence['head_sha'] == head
+                assert evidence['commands'][0]['exit_status'] == (7 if mode == 'test_failure' else 0)
+        if mode in {'task_mismatch', 'run_mismatch', 'claim_mismatch', 'unknown_cli_version'}:
             assert not calls.exists()
         else:
             assert calls.read_text() == 'call\n'

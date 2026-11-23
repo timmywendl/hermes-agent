@@ -203,11 +203,6 @@ async def _read_owner_finish(conn, task_id, run_id, *, profile_home):
                 return result
         finally:
             reset_hermes_home_override(token)
-        current = conn.execute('SELECT status,current_run_id FROM tasks WHERE id=?', (task_id,)).fetchone()
-        latest_after = conn.execute('SELECT max(id) FROM task_runs WHERE task_id=?', (task_id,)).fetchone()[0]
-        events_after = conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? AND run_id=? AND kind IN ('owner_admitted','owner_admission_bound') ORDER BY id", (task_id, run_id)).fetchall()
-        if current is None or tuple(current) != tuple(task) or latest_after != latest or [tuple(r) for r in events_after] != [tuple(r) for r in rows]:
-            return dict(board_terminal='UNKNOWN', receipt='UNKNOWN', ack='UNKNOWN', physical_retirement='UNKNOWN')
         finish = response.get('worker_finish')
         if isinstance(finish, dict) and finish.get('receipt') == 'RECORDED':
             result['receipt'] = 'RECORDED'

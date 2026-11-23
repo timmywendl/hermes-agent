@@ -119,6 +119,106 @@ def _wave2_run(conn, task_id, run_id):
     return row
 
 
+def valid_publication_target(target, *, repo):
+    import re
+    from hermes_cli.kanban_pr_acceptance import _REPO
+    return (isinstance(target, dict) and set(target) == {'repo', 'base', 'branch'}
+            and isinstance(repo, str) and bool(_REPO.fullmatch(repo)) and target.get('repo') == repo
+            and all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', v)
+                    and '..' not in v and not v.endswith(('/', '.'))
+                    for v in (target.get('base'), target.get('branch'))))
+
+
+def _authorized_publication_target(conn, task_id):
+    task = conn.execute('SELECT created_by,completion_contract,branch_name FROM tasks WHERE id=?', (task_id,)).fetchone()
+    rows = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='created'", (task_id,)).fetchall()
+    created = _wave2_event(conn, task_id, 'created') if len(rows) == 1 else None
+    if not task or task[0] != 'ai-colleague-stage3' or not created:
+        return None
+    origin = created[1]
+    target = origin.get('publication_target')
+    repo = origin.get('completion_contract')
+    if not isinstance(task[1], str):
+        return None
+    match = _PR.fullmatch(task[1])
+    if (origin.get('publication_protocol') != 'wave2_v1' or not valid_publication_target(target, repo=repo)
+            or (match[1] if match else task[1]) != repo or (task[2] and task[2] != target['branch'])):
+        return None
+    return target
+
+
+def publication_recovery_snapshot(conn, task_id, grant):
+    """Read the original spent attempt, without giving a later Run its authority."""
+    import hashlib
+    import json
+    import re
+    if conn.in_transaction:
+        return None
+    version = conn.execute('PRAGMA data_version').fetchone()[0]
+    target = _authorized_publication_target(conn, task_id)
+    rows = conn.execute("SELECT id,run_id,payload FROM task_events WHERE task_id=? AND kind='wave2_publication_attempt'", (task_id,)).fetchall()
+    attempt = _wave2_event(conn, task_id, 'wave2_publication_attempt') if len(rows) == 1 else None
+    run_id = rows[0][1] if rows else None
+    intents = conn.execute("SELECT id FROM task_events WHERE task_id=? AND run_id=? AND kind='wave2_publication_intent'", (task_id, run_id)).fetchall()
+    intent = _wave2_event(conn, task_id, 'wave2_publication_intent', run_id) if len(intents) == 1 else None
+    run = conn.execute('SELECT profile FROM task_runs WHERE task_id=? AND id=?', (task_id, run_id)).fetchone()
+    task = conn.execute('SELECT completion_contract,body,title,idempotency_key,workspace_kind,workspace_path,branch_name FROM tasks WHERE id=?', (task_id,)).fetchone()
+    created = _wave2_event(conn, task_id, 'created')
+    from hermes_cli.kanban_db import _json_dict
+    body = _json_dict(task[1]) if task else {}
+    work = grant.get('work_item') if isinstance(grant, dict) else None
+    if (not target or not attempt or not intent or intent[0] >= attempt[0] or intent[1] != attempt[1]
+            or not isinstance(work, dict) or work.get('enabled') is not True
+            or not created or created[1].get('creator_task_id') != work.get('root_id')
+            or any(body.get(k) != work.get(k) for k in ('repo', 'objective_id', 'work_key', 'root_id', 'decision_ref', 'completion_contract'))
+            or target != work.get('publication_target')
+            or not isinstance(body.get('task_spec'), dict) or task[2] != work.get('title')
+            or any(body['task_spec'].get(k) != work.get(k) for k in ('title', 'instructions', 'acceptance_criteria', 'publication_target'))
+            or not run or not isinstance(run[0], str) or not run[0] or attempt[1].get('implementer') != run[0]
+            or any(attempt[1].get(k) != v for k, v in target.items())
+            or not isinstance(attempt[1].get('head'), str) or not re.fullmatch(r'[0-9a-f]{40}', attempt[1]['head'])):
+        return None
+    workspace = work.get('workspace_admission')
+    if workspace is None:
+        if 'workspace_admission' in work or created[1].get('workspace_admission') is not None:
+            return None
+    else:
+        from pathlib import Path
+        board_file = conn.execute('PRAGMA database_list').fetchone()[2]
+        if (not isinstance(workspace, dict) or 'task_id' in workspace or workspace.get('repo') != work['repo']
+                or workspace.get('branch_name') != target['branch'] or not board_file
+                or created[1].get('workspace_admission') != {**workspace, 'task_id': task_id, 'board_db': str(Path(board_file).resolve())}
+                or task[4] != 'worktree' or task[5] != workspace.get('workspace_path') or task[6] != workspace.get('branch_name')):
+            return None
+    root_key = 'project-status-next-legal-step/v1'
+    root_digest = hashlib.sha256(json.dumps([work['repo'], work['objective_id'], root_key], separators=(',', ':')).encode()).hexdigest()
+    roots = conn.execute("SELECT id,body,status,assignee,current_run_id,created_by,idempotency_key FROM tasks WHERE created_by='ai-colleague-k1' OR idempotency_key=?", ('colleague-k1:' + root_digest,)).fetchall()
+    if len(roots) != 1:
+        return None
+    root = roots[0]
+    root_body = _json_dict(root[1])
+    root_origin = _wave2_event(conn, root[0], 'created')
+    root_identity = {'repo': work['repo'], 'objective_id': work['objective_id'], 'work_key': root_key}
+    triples = [row[0] for row in conn.execute('SELECT id,body FROM tasks')
+               if all(_json_dict(row[1]).get(k) == v for k, v in root_identity.items())]
+    if (root[0] != work['root_id'] or root[5] != 'ai-colleague-k1' or root[6] != 'colleague-k1:' + root_digest
+            or root[2] not in ('blocked', 'archived') or root[3] is not None or root[4] is not None
+            or any(root_body.get(k) != v for k, v in root_identity.items()) or triples != [root[0]]
+            or not root_origin or 'creator_task_id' not in root_origin[1] or root_origin[1]['creator_task_id'] is not None
+            or root_origin[1].get('parents') != []
+            or conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='created'", (root[0],)).fetchone()[0] != 1
+            or conn.execute('SELECT 1 FROM task_runs WHERE task_id=?', (root[0],)).fetchone()
+            or conn.execute('SELECT 1 FROM task_links WHERE child_id=? OR parent_id=?', (root[0], root[0])).fetchone()):
+        return None
+    spec = json.dumps(body['task_spec'], sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()
+    key = json.dumps([work['repo'], work['objective_id'], work['work_key']], separators=(',', ':')).encode()
+    if (body.get('task_spec_digest') != hashlib.sha256(spec).hexdigest()
+            or task[3] != 'colleague-stage3:' + hashlib.sha256(key).hexdigest()
+            or version != conn.execute('PRAGMA data_version').fetchone()[0]):
+        return None
+    return version, run_id, target, attempt[1]['head'], run[0], task[0], intent[0], attempt[0]
+
+
 def record_publication_intent(conn, task_id, *, run_id, claim_lock, repo, base, branch, head, attempt=False):
     """Persist a cooperative intent, or spend the one automatic create attempt.
 
@@ -127,21 +227,17 @@ def record_publication_intent(conn, task_id, *, run_id, claim_lock, repo, base, 
     """
     import re
     from hermes_cli.kanban_db import _append_event
-    from hermes_cli.kanban_pr_acceptance import _REPO
-    if not (isinstance(repo, str) and _REPO.fullmatch(repo) and
-            isinstance(head, str) and re.fullmatch(r'[0-9a-f]{40}', head) and
-            all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}', v)
-                and '..' not in v and not v.endswith(('/', '.')) for v in (base, branch))):
+    target = {'repo': repo, 'base': base, 'branch': branch}
+    if not (valid_publication_target(target, repo=repo)
+            and isinstance(head, str) and re.fullmatch(r'[0-9a-f]{40}', head)):
         return False
     with write_txn(conn):
         row = _wave2_run(conn, task_id, run_id)
         task = conn.execute('SELECT completion_contract,branch_name FROM tasks WHERE id=?', (task_id,)).fetchone()
         if not row or row[2] != claim_lock or not task or not wave2_enabled(conn, task_id):
             return False
-        created = _wave2_event(conn, task_id, 'created')
         match = _PR.fullmatch(task[0] or '')
-        if (not created or created[1].get('completion_contract') != repo or
-                (match[1] if match else task[0]) != repo or (task[1] and task[1] != branch)):
+        if _authorized_publication_target(conn, task_id) != target:
             return False
         intent = {'repo': repo, 'base': base, 'branch': branch, 'head': head, 'implementer': row[5]}
         prior = _wave2_event(conn, task_id, 'wave2_publication_intent', run_id)
@@ -169,7 +265,8 @@ def prepare_wave2_handoff(conn, task_id, run_id, metadata, reviewer, expected_cl
     if (not row or not expected_claim_lock or row[2] != expected_claim_lock or not intent or not attempt
             or not reviewer or reviewer == row[5] or not isinstance(metadata, dict)):
         return False
-    if any(attempt[1].get(k) != intent[1].get(k) for k in ('repo', 'base', 'branch')):
+    if (any(attempt[1].get(k) != intent[1].get(k) for k in ('repo', 'base', 'branch'))
+            or _authorized_publication_target(conn, task_id) != {k: intent[1].get(k) for k in ('repo', 'base', 'branch')}):
         return False
     url = metadata.get('published_pr')
     match = _PR.fullmatch(url) if isinstance(url, str) else None
@@ -234,6 +331,8 @@ def validate_wave2_handoff(conn, task_id, handoff):
             or (previous[0] if previous else None) != handoff['previous_handoff_id']
             or (previous and (previous[1].get('url') != handoff['url'] or not _valid_first_handoff(conn, task_id, attempt)))):
         return False
+    if _authorized_publication_target(conn, task_id) != {k: intent[1].get(k) for k in ('repo', 'base', 'branch')}:
+        return False
     match = _PR.fullmatch(handoff['url'])
     if (not match or intent[1].get('repo') != match[1] or intent[1].get('implementer') != row[5]
             or any(intent[1].get(k) != handoff[k] for k in ('base', 'branch', 'head'))):
@@ -252,11 +351,11 @@ def _wave2_owner_binding(conn, task_id, run_id, admitted, owner):
     from pathlib import Path
     from hermes_cli import kanban_db as kb
     try:
-        for kind in ('owner_admitted', 'owner_admission_bound'):
-            count = conn.execute('SELECT count(*) FROM task_events WHERE task_id=? AND run_id=? AND kind=?',
-                                 (task_id, run_id, kind)).fetchone()[0]
-            if count != 1:
-                return False
+        counts = dict(conn.execute("SELECT kind,count(*) FROM task_events WHERE task_id=? AND run_id=? "
+                                   "AND kind IN ('owner_admitted','owner_admission_bound') GROUP BY kind",
+                                   (task_id, run_id)).fetchall())
+        if counts != {'owner_admitted': 1, 'owner_admission_bound': 1}:
+            return False
         marker, binding = admitted[1], owner[1]
         request = marker['request_id']
         identity = json.loads(request.removeprefix('kanban:'))

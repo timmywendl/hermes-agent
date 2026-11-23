@@ -412,6 +412,10 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
 
 def test_wave2_publication_cli_requires_remote_read_and_never_retries(monkeypatch, tmp_path, capsys):
     import argparse
+    import hashlib
+    import os
+    import subprocess
+    import sys
     from hermes_cli import kanban_pr_acceptance as acceptance
 
     home = tmp_path / "home"
@@ -421,26 +425,54 @@ def test_wave2_publication_cli_requires_remote_read_and_never_retries(monkeypatc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="publish", body=json.dumps({"publication_protocol": "wave2_v1"}),
+        root_key = "project-status-next-legal-step/v1"
+        root_identity = {"repo": "acme/repo", "objective_id": "fixture", "work_key": root_key}
+        root_hash = hashlib.sha256(json.dumps(list(root_identity.values()), separators=(',', ':')).encode()).hexdigest()
+        root = kb.create_task(conn, title="root", body=json.dumps(root_identity), initial_status="blocked",
+                              created_by="ai-colleague-k1", idempotency_key="colleague-k1:" + root_hash)
+        target = {"repo": "acme/repo", "base": "main", "branch": "topic"}
+        work = {"enabled": True, "repo": "acme/repo", "objective_id": "fixture", "work_key": "work",
+                "root_id": root, "decision_ref": "approved", "completion_contract": "acme/repo",
+                "title": "publish", "instructions": "fixture", "acceptance_criteria": "offline", "publication_target": target}
+        spec = {k: work[k] for k in ("title", "instructions", "acceptance_criteria", "publication_target")}
+        spec["publication_instructions"] = "fixture"
+        digest = hashlib.sha256(json.dumps(spec, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode()).hexdigest()
+        key = hashlib.sha256(json.dumps([work[k] for k in ("repo", "objective_id", "work_key")], separators=(',', ':')).encode()).hexdigest()
+        body = {**work, "publication_protocol": "wave2_v1", "task_spec": spec, "task_spec_digest": digest}
+        tid = kb.create_task(conn, title="publish", body=json.dumps(body), creator_task_id=root,
             created_by="ai-colleague-stage3", assignee="builder", workspace_kind="worktree",
-            branch_name="topic", completion_contract="acme/repo")
+            branch_name="topic", completion_contract="acme/repo", idempotency_key="colleague-stage3:" + key)
         task = kb.claim_task(conn, tid, claimer="builder:test")
+    grant = {"enabled": True, "allow_read": True, "repo": "acme/repo", "objective_id": "fixture",
+             "decision_ref": "approved", "profile_home": str(home.resolve()), "db_path": str(kb.kanban_db_path().resolve()), "work_item": work}
+    config_path = home / 'config.yaml'
+    def save_grant(value):
+        config_path.write_text(json.dumps({"plugins": {"enabled": ["ai-colleague-k1"], "entries": {"ai-colleague-k1": {"settings": {"grant": value}}}}}))
+    save_grant(grant)
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
     monkeypatch.setattr(acceptance, "_assignee_profile_home", lambda assignee: None)
     reads = []
-    state = {"created": False}
+    state = {"created": False, "ambiguous": False, "race": False, "grant_race": False}
 
     def fake_api(endpoint, **kwargs):
         reads.append(endpoint)
         if "/git/ref/" in endpoint:
+            if state["grant_race"]:
+                state["grant_race"] = False
+                grant["decision_ref"] = "changed during read"
+            if state["race"]:
+                state["race"] = False
+                with kbc.connect() as rival:
+                    rival.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
             return {"object": {"sha": "a" * 40}}
         if not state["created"]:
             return [[]]
-        return [[{"html_url": "https://github.com/acme/repo/pull/7", "state": "open", "draft": True,
+        pr = {"html_url": "https://github.com/acme/repo/pull/7", "state": "open", "draft": True,
                   "head": {"sha": "a" * 40, "ref": "topic", "repo": {"full_name": "acme/repo"}},
-                  "base": {"ref": "main"}}]]
+                  "base": {"ref": "main"}}
+        return [[pr, pr] if state["ambiguous"] else [pr]]
 
     monkeypatch.setattr(acceptance, "_api", fake_api)
     parser = argparse.ArgumentParser()
@@ -456,9 +488,114 @@ def test_wave2_publication_cli_requires_remote_read_and_never_retries(monkeypatc
     assert "already attempted" in capsys.readouterr().err
     # A response lost after remote success is resolved only by readback.
     state["created"] = True
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK"):
+        monkeypatch.delenv(name)
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET claim_expires=0 WHERE id=?", (tid,))
     assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 0
-    assert "https://github.com/acme/repo/pull/7" in capsys.readouterr().out
-    assert len(reads) == 4
+    assert json.loads(capsys.readouterr().out)['original_run_id'] == task.current_run_id
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET status='blocked', claim_lock=NULL, claim_expires=0 WHERE id=?", (tid,))
+        conn.execute("UPDATE task_runs SET status='crashed', outcome='crashed' WHERE id=?", (task.current_run_id,))
+    monkeypatch.setenv('WAVE2_EMPTY_DECISION', '')
+    for invalid in ({**grant, 'allow_read': False}, {**grant, 'db_path': str(home / 'other.db')},
+                    {**grant, 'decision_ref': '${WAVE2_EMPTY_DECISION}'},
+                    {**grant, 'work_item': {**work, 'unexpected': True}},
+                    {**grant, 'work_item': {**work, 'root_id': 'other'}}):
+        save_grant(invalid)
+        assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    config_path.write_text(json.dumps({"plugins": {"enabled": [], "entries": {"ai-colleague-k1": {"settings": {"grant": grant}}}}}))
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    config_path.write_text('plugins: [invalid')
+    before_files = {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')}
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')} == before_files
+    save_grant(grant)
+    from hermes_cli import managed_scope
+    class InaccessiblePolicy:
+        def __truediv__(self, _name):
+            return self
+        def stat(self):
+            raise PermissionError('policy inaccessible')
+    with monkeypatch.context() as scoped:
+        scoped.setattr(managed_scope, 'get_managed_dir', lambda: InaccessiblePolicy())
+        assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (b'bad-contract', tid))
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET completion_contract='acme/repo' WHERE id=?", (tid,))
+        conn.execute("UPDATE tasks SET created_by='foreign' WHERE id=?", (root,))
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET created_by='ai-colleague-k1' WHERE id=?", (root,))
+        conn.execute("UPDATE tasks SET id='missing-root' WHERE id=?", (root,))
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    with kbc.connect() as conn:
+        conn.execute("UPDATE tasks SET id=? WHERE id='missing-root'", (root,))
+    for index in (argv.index("main"), argv.index("topic")):
+        bad = argv.copy()
+        bad[index] = "unapproved"
+        assert kc.kanban_command(parser.parse_args(bad + ["--reconcile"])) == 1
+    assert len(reads) == 4  # reject before the remote read
+    before_files = {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')}
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 0
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')} == before_files
+    observed = json.loads(capsys.readouterr().out)
+    assert observed['pr_url'] == "https://github.com/acme/repo/pull/7"
+    assert observed['original_run_id'] == task.current_run_id
+    assert observed['intent_id'] < observed['attempt_id'] and observed['status'] == 'MATCHED_READ_ONLY'
+    assert len(reads) == 6
+    # A fresh CLI process uses an inert gh executable, including the real _api
+    # subprocess path, without initializing or changing the profile or Board.
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    gh = bin_dir / 'gh'
+    gh.write_text(f'''#!{sys.executable}\nimport json, sys\nif '/git/ref/' in sys.argv[2]:\n print(json.dumps({{"object": {{"sha": "{'a' * 40}"}}}}))\nelse:\n print(json.dumps([[{{"html_url": "https://github.com/acme/repo/pull/7", "state": "open", "draft": True, "head": {{"sha": "{'a' * 40}", "ref": "topic", "repo": {{"full_name": "acme/repo"}}}}, "base": {{"ref": "main"}}}}]]))\n''')
+    gh.chmod(0o755)
+    env = {**os.environ, 'HOME': str(home), 'HERMES_HOME': str(home), 'HERMES_KANBAN_HOME': str(home),
+           'PATH': str(bin_dir) + os.pathsep + os.environ['PATH']}
+    before_files = {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')}
+    code = ('import argparse,sys; from hermes_cli import kanban as k; '
+            'p=argparse.ArgumentParser(); k.build_parser(p.add_subparsers(dest="top")); '
+            'raise SystemExit(k.kanban_command(p.parse_args(sys.argv[1:])))')
+    child = subprocess.run([sys.executable, '-B', '-c', code, *argv, '--reconcile'],
+                           env=env, capture_output=True, text=True, timeout=20, check=False)
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout)['original_run_id'] == task.current_run_id
+    assert {p.relative_to(home): p.read_bytes() for p in home.rglob('*') if p.is_file() and not p.name.endswith('-shm')} == before_files
+    with kbc.connect() as conn:
+        assert kb.unblock_task(conn, tid)
+        successor = kb.claim_task(conn, tid, claimer="successor:test")
+        assert successor and successor.current_run_id != task.current_run_id
+        before = [tuple(row) for row in conn.execute("SELECT id,kind,payload,run_id FROM task_events WHERE task_id=? ORDER BY id", (tid,))]
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 0
+    with kbc.connect() as conn:
+        assert [tuple(row) for row in conn.execute("SELECT id,kind,payload,run_id FROM task_events WHERE task_id=? ORDER BY id", (tid,))] == before
+        assert kb.get_task(conn, tid).current_run_id == successor.current_run_id
+        attempt = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='wave2_publication_attempt'", (tid,)).fetchone()
+        damaged = json.loads(attempt['payload'])
+        damaged['head'] = 'b' * 40
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(damaged), attempt['id']))
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    with kbc.connect() as conn:
+        conn.execute("UPDATE task_events SET payload=? WHERE id=?", (attempt['payload'], attempt['id']))
+    state["ambiguous"] = True
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    state["ambiguous"] = False
+    state["race"] = True
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    import hermes_yaml
+    cached_config = {"plugins": {"enabled": ["ai-colleague-k1"], "entries": {"ai-colleague-k1": {"settings": {"grant": grant}}}}}
+    with monkeypatch.context() as scoped:
+        scoped.setattr(hermes_yaml, "safe_load", lambda _source: cached_config)
+        state["grant_race"] = True
+        assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    grant["decision_ref"] = "approved"
+    state["created"] = False
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 1
+    assert "publication UNKNOWN" in capsys.readouterr().err
     assert kc.kanban_command(parser.parse_args(argv + ["--attempt"])) == 1
 
 
@@ -482,7 +619,8 @@ def test_wave2_stale_claim_token_rejected_by_cli_and_worker_tools(monkeypatch, t
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
     with kbc.connect() as conn:
-        tid = kb.create_task(conn, title="publish", body=json.dumps({"publication_protocol": "wave2_v1"}),
+        tid = kb.create_task(conn, title="publish", body=json.dumps({"publication_protocol": "wave2_v1",
+            "publication_target": {"repo": "acme/repo", "base": "main", "branch": "topic"}}),
             created_by="ai-colleague-stage3", assignee="builder", workspace_kind="worktree",
             branch_name="topic", completion_contract="acme/repo")
         implementer = kb.claim_task(conn, tid, claimer="old-builder")

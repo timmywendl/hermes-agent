@@ -1313,7 +1313,8 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "completion_contract": completion_contract,
-                        **({"publication_protocol": "wave2_v1"} if created_by == "ai-colleague-stage3" and _json_dict(body).get("publication_protocol") == "wave2_v1" else {}),
+                        **({"publication_protocol": "wave2_v1", "publication_target": _json_dict(body).get("publication_target")}
+                           if created_by == "ai-colleague-stage3" and _json_dict(body).get("publication_protocol") == "wave2_v1" else {}),
                         **({"workspace_admission": workspace_creation_admission(conn, task_id, workspace_admission)} if workspace_admission is not None else {}),
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,

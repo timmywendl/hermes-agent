@@ -793,21 +793,32 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
     assert _failures(conn, ok_id) == 0
 
 
-def _wave2_task(conn):
+def _wave2_task(conn, *, workspace_branch="topic"):
     import json
-    task_id = kb.create_task(conn, title="wave2", body=json.dumps({"publication_protocol": "wave2_v1"}),
+    task_id = kb.create_task(conn, title="wave2", body=json.dumps({"publication_protocol": "wave2_v1",
+        "publication_target": {"repo": "acme/repo", "base": "main", "branch": "topic"}}),
         created_by="ai-colleague-stage3", assignee="builder", completion_contract="acme/repo",
-        branch_name="topic", workspace_kind="worktree")
+        branch_name=workspace_branch, workspace_kind="worktree")
     task = kb.claim_task(conn, task_id, claimer="builder:test")
     assert task is not None
     return task_id, task
 
 
 def test_wave2_intent_is_durable_one_attempt_and_bad_creation_fails_closed(conn):
+    import json
     from hermes_cli.kanban_pr_acceptance_store import record_publication_intent, wave2_enabled
-    task_id, task = _wave2_task(conn)
+    task_id, task = _wave2_task(conn, workspace_branch=None)
     args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
                 base="main", branch="topic", head="a" * 40)
+    assert not record_publication_intent(conn, task_id, **{**args, "base": "unapproved"})
+    assert not record_publication_intent(conn, task_id, **{**args, "branch": "unapproved"})
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_publication_intent'", (task_id,)).fetchone()[0] == 0
+    created = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='created'", (task_id,)).fetchone()
+    origin = json.loads(created["payload"])
+    origin.pop("publication_target")
+    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(origin), created["id"]))
+    assert not record_publication_intent(conn, task_id, **args)
+    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (created["payload"], created["id"]))
     assert record_publication_intent(conn, task_id, **args)
     assert record_publication_intent(conn, task_id, **args)
     assert not record_publication_intent(conn, task_id, **{**args, "head": "b" * 40})

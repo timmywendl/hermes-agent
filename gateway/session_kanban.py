@@ -456,10 +456,25 @@ def _review_command_matches_task(command, criteria):
         args = shlex.split(command)
     except ValueError:
         return False
+    # Native intake freezes the authoritative acceptance criteria in task_spec.
+    # An arbitrary mention in instructions or a prohibition is not a request.
+    body = criteria.split('\n\n', 1)[-1]
+    try:
+        document = json.loads(body)
+    except ValueError:
+        document = None
+    if isinstance(document, dict):
+        spec = document.get('task_spec')
+        criteria = spec.get('acceptance_criteria') if isinstance(spec, dict) else None
+        if not isinstance(criteria, str):
+            return False
     # Unknown options can suppress execution or carry secrets. Only accept
     # complete task-named test files and harmless presentation switches.
     selectors = args[3:] if (len(args) >= 3 and args[0].startswith('python') and args[1] == '-m') else args[1:]
-    paths = set(re.findall(r'(?<![\w./-])(?:tests?/)?[\w./-]*test_[\w.-]+\.py(?![\w./-])', criteria))
+    paths = set(re.findall(
+        r'(?im)^\s*(?:[-*]\s*)?(?:run|offline_test:)\s+`?((?:tests?/)?[\w./-]*test_[\w.-]+\.py)`?(?:\s+offline)?[.!]?\s*$',
+        criteria,
+    ))
     safe_flags = {'-q', '-v', '-vv', '-s', '--quiet', '--verbose', '--disable-warnings', '--tb=short'}
     return (any(arg.removeprefix('./') in paths for arg in selectors)
             and all(arg in safe_flags or arg.removeprefix('./') in paths for arg in selectors))
@@ -475,15 +490,21 @@ def _review_tests_passed(stdout, command):
         return False
     last = lines[-1].strip('= ')
     pytest_summary = r'[1-9]\d* passed(?:, \d+ (?:skipped|xfailed|xpassed|warnings?))*(?: in \S+)?'
+    pytest_any = r'(?:\d+ (?:passed|failed|skipped|xfailed|xpassed|warnings?))(?:, \d+ (?:passed|failed|skipped|xfailed|xpassed|warnings?))*(?: in \S+)?'
+    summaries = [line.strip('= ') for line in lines if re.fullmatch(pytest_any, line.strip('= '))]
+    unittest_outcomes = [line for line in lines if re.match(r'^(?:OK|FAILED)(?:\s|\(|$)', line)]
+    runner_lines = [line for line in lines if re.match(r'^=== Summary: \d+ files,', line)]
     runner_summary = (command.lstrip().startswith(('scripts/run_tests.sh ', './scripts/run_tests.sh '))
-                      and any(re.fullmatch(r'=== Summary: \d+ files, [1-9]\d* tests passed, 0 failed .+ ===', line)
-                              for line in lines))
-    return bool(runner_summary or re.fullmatch(pytest_summary, last)
-                or (last == 'OK' and any(re.fullmatch(r'Ran [1-9]\d* tests? in \S+', line) for line in lines)))
+                      and len(runner_lines) == 1
+                      and re.fullmatch(r'=== Summary: \d+ files, [1-9]\d* tests passed, 0 failed .+ ===', runner_lines[0]))
+    return bool(runner_summary or (len(summaries) == 1 and re.fullmatch(pytest_summary, last))
+                or (unittest_outcomes == ['OK'] and last == 'OK'
+                    and sum(bool(re.fullmatch(r'Ran [1-9]\d* tests? in \S+', line)) for line in lines) == 1))
 
 
 def _review_tool_result(call, block, runtime, cli_version=None):
     import hashlib
+    import re
 
     if not isinstance(block, dict) or block.get('type') != 'tool_result':
         raise ValueError('invalid tool result')
@@ -499,9 +520,12 @@ def _review_tool_result(call, block, runtime, cli_version=None):
             and runtime.get('interrupted') is False and not runtime.get('returnCodeInterpretation')
             and _is_review_validation_command(call['command'])):
         status = 0
-    if (type(status) is not int or status < 0 or runtime.get('interrupted') is not False
-            or runtime.get('backgroundTaskId') or runtime.get('timedOutAfterMs')
-            or (status == 0 and block.get('is_error') is True)):
+    if block.get('is_error') is True and cli_version == '2.1.323 (Claude Code)' and isinstance(content, str):
+        match = re.match(r'^Exit code ([1-9]\d*)(?:\n|$)', content)
+        status = int(match.group(1)) if match else None
+    elif (type(status) is not int or status < 0 or not isinstance(runtime, dict)
+          or runtime.get('interrupted') is not False or runtime.get('backgroundTaskId')
+          or runtime.get('timedOutAfterMs')):
         status = None
     stdout = runtime.get('stdout', '') if isinstance(runtime, dict) else ''
     ran_tests = _review_tests_passed(stdout, call['command'])
@@ -699,6 +723,13 @@ def _run_claude_review(context):
         task_id = context['task_id']
         claim = {'expected_run_id': context['run_id'], 'expected_claim_lock': context['claim_lock']}
         reason = verdict['reason'].strip()
+        if execution['commands']:
+            with kb.write_txn(conn):
+                current = kb.get_task(conn, task_id)
+                if (current is None or current.status != 'running' or current.current_run_id != context['run_id']
+                        or current.claim_lock != context['claim_lock'] or not _bound_worker_matches(conn, context)):
+                    raise RuntimeStoreError('kanban_claude_review_stale_claim')
+                kb._append_event(conn, task_id, 'review_execution', execution, run_id=context['run_id'])
         if verdict['verdict'] == 'approved':
             ok = kb.complete_task(conn, task_id, result=reason, metadata={
                 'published_pr': handoff['url'], 'head_sha': handoff['head'], 'review_verdict': 'approved',

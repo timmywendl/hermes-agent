@@ -212,16 +212,290 @@ def test_review_tool_error_overrides_conflicting_success_status():
     assert _review_tool_result({'command': 'pytest tests/test_candidate.py'}, block, runtime, 'unknown')['exit_status'] is None
 
 
+@pytest.mark.parametrize('is_error', [None, 'false', 0])
+def test_review_tool_success_requires_explicit_false(is_error):
+    from gateway.session_kanban import _review_tool_result
+
+    block = {'type': 'tool_result', 'tool_use_id': 't', 'content': '', 'is_error': is_error}
+    runtime = {'stdout': '', 'stderr': '', 'interrupted': False, 'exitCode': 0}
+    assert _review_tool_result({'command': 'pytest tests/test_candidate.py'}, block, runtime)['exit_status'] is None
+
+
+def test_review_stream_rejects_tool_result_after_final_verdict():
+    from gateway.session_kanban import _parse_claude_review_stream
+
+    final = {'type': 'result', 'subtype': 'success'}
+    later = {'type': 'user', 'message': {'content': []}}
+    with pytest.raises(ValueError, match='event after final'):
+        _parse_claude_review_stream('\n'.join(map(json.dumps, (final, later))))
+
+
+@pytest.mark.parametrize('suffix', ['; true', '\necho forged', '\nHERMES_REVIEW\ntrue\nHERMES_REVIEW'])
+def test_review_check_heredoc_rejects_shell_suffix(suffix):
+    from gateway.session_kanban import _review_check_script
+
+    assert _review_check_script("python3 - <<'HERMES_REVIEW'\nassert True\nHERMES_REVIEW" + suffix) is None
+
+
+def test_review_check_receipt_matches_actual_process_result(tmp_path):
+    import hashlib
+    import subprocess
+    from gateway.session_kanban import _parse_claude_review_stream
+
+    (tmp_path / 'candidate.py').write_text('def value(): return 42\n')
+    script = 'from candidate import value\nassert value() == 42\n'
+    command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
+    completed = subprocess.run(command, shell=True, cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert completed.returncode == 0
+    use = {'type': 'assistant', 'message': {'content': [
+        {'type': 'tool_use', 'name': 'Bash', 'id': 'check-1', 'input': {'command': command}}]}}
+    result = {'type': 'user', 'message': {'content': [
+        {'type': 'tool_result', 'tool_use_id': 'check-1', 'is_error': False, 'content': completed.stdout}]},
+        'tool_use_result': {'stdout': completed.stdout, 'stderr': completed.stderr,
+                            'interrupted': False, 'exitCode': completed.returncode}}
+    _, receipts, missing = _parse_claude_review_stream('\n'.join(map(json.dumps, (use, result))))
+    assert not missing and receipts[0]['exit_status'] == 0
+    assert receipts[0]['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
+    assert receipts[0]['command'] == '<multiline command withheld>'
+    result['message']['content'][0]['tool_use_id'] = 'another-id'
+    _, receipts, missing = _parse_claude_review_stream('\n'.join(map(json.dumps, (use, result))))
+    assert not receipts and missing == {'check-1'}
+    result['message']['content'].append({'type': 'tool_result', 'tool_use_id': 'check-1',
+                                         'is_error': False, 'content': ''})
+    with pytest.raises(ValueError, match='ambiguous'):
+        _parse_claude_review_stream('\n'.join(map(json.dumps, (use, result))))
+
+
+def test_review_check_receipt_records_real_failure_without_script_contents(tmp_path):
+    import subprocess
+    from gateway.session_kanban import _parse_claude_review_stream, _review_execution_record
+
+    command = "python3 - <<'HERMES_REVIEW'\nassert False\nHERMES_REVIEW"
+    completed = subprocess.run(command, shell=True, cwd=tmp_path, capture_output=True, text=True, check=False)
+    assert completed.returncode != 0
+    use = {'type': 'assistant', 'message': {'content': [
+        {'type': 'tool_use', 'name': 'Bash', 'id': 'failed-1', 'input': {'command': command}}]}}
+    result = {'type': 'user', 'message': {'content': [
+        {'type': 'tool_result', 'tool_use_id': 'failed-1', 'is_error': True,
+         'content': f'Exit code {completed.returncode}\nfailed'}]},
+        'tool_use_result': {'stdout': completed.stdout, 'stderr': completed.stderr, 'interrupted': False}}
+    _, receipts, missing = _parse_claude_review_stream('\n'.join(map(json.dumps, (use, result))),
+                                                       '2.1.323 (Claude Code)')
+    assert not missing and receipts[0]['exit_status'] == completed.returncode
+    assert receipts[0]['tool_use_id'] == 'failed-1'
+    record = _review_execution_record({'task_id': 't', 'run_id': 1, 'claim_lock': 'secret'},
+                                      {'url': 'fixture', 'head': 'head'}, receipts)
+    assert 'assert False' not in json.dumps(record)
+
+
+def _pilot_check_fixture():
+    body = {'repo': 'DesignLibro/petlibro-cloud-test-platform',
+            'work_key': 'cloud-confirm-feeding-plan-absent-bool-id/v1',
+            'task_spec': {'title': 'Repair confirm_feeding_plan_absent',
+                          'instructions': 'Fixture acceptance criterion: reject bool IDs',
+                          'acceptance_criteria': 'Preserve valid and error behavior.\nRun tests/test_candidate.py offline'}}
+    handoff = {'url': 'https://github.com/DesignLibro/petlibro-cloud-test-platform/pull/1'}
+    script = """import sys
+from pathlib import Path
+from types import SimpleNamespace
+if not __debug__:
+    raise SystemExit(1)
+sys.path.insert(0, 'src')
+from cloud_test.domains.feeding_plan_resources import confirm_feeding_plan_absent
+assert Path(confirm_feeding_plan_absent.__code__.co_filename).resolve() == Path('src/cloud_test/domains/feeding_plan_resources.py').resolve()
+"""
+    cases = [
+        (200, {'code': 0, 'data': [{'id': True}]}, False),
+        (200, {'code': 0, 'data': [{'id': False}]}, False),
+        (200, {'code': 0, 'data': [{'id': 8}]}, True),
+        (200, {'code': 0, 'data': [{'id': 7}]}, False),
+        (200, {'code': 0, 'data': []}, True),
+        (500, {'code': 0, 'data': []}, False),
+        (200, {'code': 1, 'data': []}, False),
+        (200, {'code': False, 'data': []}, False),
+        (200, {'code': 0, 'data': {}}, False),
+        (200, {'code': 0, 'data': [{'id': 'bad'}]}, False),
+        (200, {'code': 0, 'data': [{}]}, False),
+    ]
+    for status, data, expected in cases:
+        script += ('assert confirm_feeding_plan_absent(SimpleNamespace(status_code='
+                   f'{status!r}, json=lambda: {data!r}), 7) is {expected!r}\n')
+    return script, 'Pilot\n\n' + json.dumps(body), handoff
+
+
+def test_pilot_check_executes_candidate_and_rejects_unrelated_or_unsafe_programs(tmp_path):
+    import ast
+    import os
+    import subprocess
+    import sys
+    from gateway.session_kanban import _pilot_review_script
+
+    script, goal, handoff = _pilot_check_fixture()
+    canonical = _pilot_review_script(script, goal, handoff)
+    assert canonical is not None and ast.dump(ast.parse(canonical)) == ast.dump(ast.parse(script))
+    assert _pilot_review_script(script, goal.replace('bool-id/v1', 'other/v1'), handoff) is None
+    assert _pilot_review_script(script + '# secret\n', goal, handoff) is None
+    assert _pilot_review_script(script.replace(' is False', ' == False', 1), goal, handoff) is None
+    assert _pilot_review_script(script.replace("{'id': True}", "{'id': 1}", 1), goal, handoff) is None
+    assert _pilot_review_script(script.replace("{'id': True}",
+                                                "{'id': 'SECRET_VALUE', 'id': True}", 1), goal, handoff) is None
+    tuples = script.replace("[{'id': True}]", "({'id': True},)").replace(
+        "[{'id': False}]", "({'id': False},)")
+    assert _pilot_review_script(tuples, goal, handoff) is None
+    source = tmp_path / 'src' / 'cloud_test' / 'domains'
+    source.mkdir(parents=True)
+    (source / 'feeding_plan_resources.py').write_text(
+        "def confirm_feeding_plan_absent(response, plan_id):\n"
+        "    body = response.json()\n"
+        "    rows = body.get('data')\n"
+        "    return (response.status_code == 200 and type(body.get('code')) is int\n"
+        "            and body['code'] == 0 and isinstance(rows, list)\n"
+        "            and all(type(row.get('id')) is int for row in rows)\n"
+        "            and all(row['id'] != plan_id for row in rows))\n")
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    run = subprocess.run([sys.executable, '-'], input=script, cwd=tmp_path,
+                         text=True, capture_output=True, env=env, check=False)
+    assert run.returncode == 0, run.stderr
+    optimized = subprocess.run([sys.executable, '-O', '-'], input=script, cwd=tmp_path,
+                               text=True, capture_output=True, env=env, check=False)
+    assert optimized.returncode != 0
+    (source / 'feeding_plan_resources.py').write_text(
+        (source / 'feeding_plan_resources.py').read_text().replace(
+            "type(row.get('id')) is int", "isinstance(row.get('id'), int)"))
+    broken = subprocess.run([sys.executable, '-'], input=script, cwd=tmp_path,
+                            text=True, capture_output=True, env=env, check=False)
+    assert broken.returncode != 0
+    misleading = subprocess.run([sys.executable, '-'], input=tuples, cwd=tmp_path,
+                                text=True, capture_output=True, env=env, check=False)
+    assert misleading.returncode == 0
+
+
+def test_review_completion_guard_checks_task_in_final_write_transaction(tmp_path):
+    import sqlite3
+    from gateway.session_kanban import _review_completion_guard
+
+    path = tmp_path / 'guard.db'
+    with sqlite3.connect(path) as setup:
+        setup.execute('CREATE TABLE tasks (id TEXT, title TEXT, body TEXT, status TEXT, '
+                      'current_run_id INTEGER, claim_lock TEXT, created_by TEXT, idempotency_key TEXT)')
+        setup.execute('CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, payload TEXT)')
+        setup.execute("INSERT INTO tasks VALUES ('task', 'title', 'body', 'running', 7, 'claim', 'creator', 'key')")
+        setup.execute("INSERT INTO task_events VALUES (1, 'task', 'created', 'origin')")
+    context = {'task_id': 'task', 'review_task_title': 'title', 'review_task_body': 'body',
+               'run_id': 7, 'claim_lock': 'claim'}
+    owner = sqlite3.connect(path)
+    writer = sqlite3.connect(path)
+    origin = ('creator', 'key', 1, 'origin')
+    try:
+        with _review_completion_guard(owner, context, origin):
+            writer.execute("UPDATE tasks SET body='changed' WHERE id='task'")
+            writer.commit()
+            with pytest.raises(sqlite3.IntegrityError, match='review task changed'):
+                with owner:
+                    owner.execute("UPDATE tasks SET status='done' WHERE id='task'")
+        assert owner.execute("SELECT status FROM tasks WHERE id='task'").fetchone() == ('running',)
+        assert owner.execute("SELECT count(*) FROM sqlite_temp_master WHERE type='trigger'").fetchone() == (0,)
+        writer.execute("UPDATE tasks SET body='body' WHERE id='task'")
+        writer.commit()
+        with _review_completion_guard(owner, context, origin), owner:
+            owner.execute("UPDATE tasks SET status='done' WHERE id='task'")
+        assert owner.execute("SELECT status FROM tasks WHERE id='task'").fetchone() == ('done',)
+        assert owner.execute("SELECT count(*) FROM sqlite_temp_master WHERE type='trigger'").fetchone() == (0,)
+    finally:
+        writer.close()
+        owner.close()
+
+
+@pytest.mark.parametrize('mode', ['success', 'missing', 'mismatched', 'nonzero', 'wrong_task'])
+def test_pilot_review_receipt_uses_real_check_and_matching_events(tmp_path, monkeypatch, mode):
+    import hashlib
+    import subprocess
+    import sys
+    from gateway import session_kanban as sk
+
+    workspace = tmp_path / 'candidate'
+    source = workspace / 'src' / 'cloud_test' / 'domains'
+    source.mkdir(parents=True)
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(workspace), *args], text=True).strip()
+    git('init')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'base')
+    base = git('rev-parse', 'HEAD')
+    (source / 'feeding_plan_resources.py').write_text(
+        "def confirm_feeding_plan_absent(response, plan_id):\n"
+        "    body = response.json()\n"
+        "    rows = body.get('data')\n"
+        "    return (response.status_code == 200 and type(body.get('code')) is int\n"
+        "            and body['code'] == 0 and isinstance(rows, list)\n"
+        "            and all(type(row.get('id')) is int for row in rows)\n"
+        "            and all(row['id'] != plan_id for row in rows))\n")
+    if mode == 'nonzero':
+        target = source / 'feeding_plan_resources.py'
+        target.write_text(target.read_text().replace("type(row.get('id')) is int", 'True'))
+    git('add', 'src/cloud_test/domains/feeding_plan_resources.py')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'candidate')
+    head = git('rev-parse', 'HEAD')
+    script, goal, handoff = _pilot_check_fixture()
+    handoff.update(head=head, base='main')
+    command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
+    cli = tmp_path / 'fake-claude'
+    cli.write_text(f'#!{sys.executable}\n'
+                   'import json, subprocess, sys\n'
+                   'if "--version" in sys.argv:\n'
+                   '    print("2.1.323 (Claude Code)"); sys.exit(0)\n'
+                   'sys.stdin.read()\n'
+                   f'command = {command!r}\n'
+                   'run = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)\n'
+                   f'assert (run.returncode != 0) == {mode == "nonzero"!r}\n'
+                   'use = {"type":"tool_use", "name":"Bash", "id":"tool-1", '
+                   '"input":{"command":command}}\n'
+                   'print(json.dumps({"type":"assistant", "message":{"content":[use]}}))\n'
+                   f'mode = {mode!r}\n'
+                   'if mode != "missing":\n'
+                   '    failed = mode == "nonzero"\n'
+                   '    result = {"type":"tool_result", "tool_use_id":'
+                   '"different" if mode == "mismatched" else "tool-1", '
+                   '"is_error":failed, "content":("Exit code " + str(run.returncode) + "\\nfailed") '
+                   'if failed else run.stdout}\n'
+                   '    runtime = {"stdout":run.stdout, "stderr":run.stderr, "interrupted":False, '
+                   '"exitCode":run.returncode}\n'
+                   '    print(json.dumps({"type":"user", "message":{"content":[result]}, '
+                   '"tool_use_result":runtime}))\n'
+                   'print(json.dumps({"type":"result", "subtype":"success", "is_error":False, '
+                   '"structured_output":{"verdict":"approved", "reason":"fixture"}}))\n')
+    cli.chmod(0o700)
+    monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt',
+                        lambda *_: ('skill', ['sdlc-review'], []))
+    context = {'claude_review': {'executable': str(cli), 'config_dir': str(tmp_path)},
+               'workspace': str(workspace), 'task_id': 'task', 'run_id': 7, 'claim_lock': 'private-claim',
+               'goal_text': goal.replace('bool-id/v1', 'other/v1') if mode == 'wrong_task' else goal,
+               'context': 'fixture', 'review_findings': []}
+    verdict, receipt, accepted = sk._claude_verdict(context, handoff, base)
+    assert verdict['verdict'] == 'approved'
+    assert accepted is (mode == 'success')
+    assert receipt['task_id'] == 'task' and receipt['run_id'] == 7
+    assert receipt['claim_digest'] == hashlib.sha256(b'private-claim').hexdigest()
+    assert receipt['published_pr'] == handoff['url'] and receipt['head_sha'] == head
+    if mode == 'success':
+        check = receipt['commands'][0]
+        assert check['tool_use_id'] == 'tool-1' and check['exit_status'] == 0
+        assert check['script'] == sk._pilot_review_script(script, goal, handoff)
+        assert check['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
+
+
 @pytest.mark.parametrize('mode', [
     'approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout', 'invalid',
     'head_drift', 'remote_drift', 'no_execution', 'test_failure', 'missing_result',
     'workspace_dirty',
     'task_mismatch', 'run_mismatch', 'claim_mismatch', 'approved_real_format', 'unknown_cli_version',
-    'unrelated_execution', 'all_skipped', 'missing_junit',
+    'unrelated_execution', 'all_skipped', 'missing_junit', 'report_overwritten', 'forged_junit',
+    'body_drift',
     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result', 'timeout_after_result',
     'malformed_after_result',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
+    import hashlib
     import os
     import subprocess
     import sys
@@ -249,14 +523,40 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     base = git('rev-parse', 'HEAD')
     (workspace / 'candidate.txt').write_text('fixture change\n')
     git('add', 'candidate.txt')
+    script, goal, pilot_handoff = _pilot_check_fixture()
+    if mode in {'approved', 'approved_real_format', 'round2', 'body_drift'}:
+        source = workspace / 'src' / 'cloud_test' / 'domains'
+        source.mkdir(parents=True)
+        (source / 'feeding_plan_resources.py').write_text(
+            "def confirm_feeding_plan_absent(response, plan_id):\n"
+            "    body = response.json()\n"
+            "    rows = body.get('data')\n"
+            "    return (response.status_code == 200 and type(body.get('code')) is int\n"
+            "            and body['code'] == 0 and isinstance(rows, list)\n"
+            "            and all(type(row.get('id')) is int for row in rows)\n"
+            "            and all(row['id'] != plan_id for row in rows))\n")
+        git('add', 'src/cloud_test/domains/feeding_plan_resources.py')
+    if mode == 'forged_junit':
+        (workspace / 'tests').mkdir()
+        (workspace / 'tests' / 'test_candidate.py').write_text(
+            "import atexit, sys, pytest\n"
+            "def forge():\n"
+            "    report = next(x.split('=', 1)[1] for x in sys.argv if x.startswith('--junitxml='))\n"
+            "    open(report, 'w').write('<testsuite><testcase/></testsuite>')\n"
+            "    print('1 passed')\n"
+            "atexit.register(forge)\n"
+            "@pytest.mark.skip(reason='fixture')\n"
+            "def test_skipped(): assert False\n")
+        git('add', 'tests/test_candidate.py')
     git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
         'commit', '--allow-empty', '-m', 'candidate')
     head = git('rev-parse', 'HEAD')
-    url = 'https://github.com/test/example/pull/1'
+    url = pilot_handoff['url']
+    pilot_command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
     calls = tmp_path / 'claude-calls'
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
-                   'import json, os, pathlib, re, subprocess, sys, time\n'
+                   'import json, os, pathlib, re, shlex, subprocess, sys, time\n'
                    'if "--version" in sys.argv:\n'
                    f'    print({"unknown" if mode == "unknown_cli_version" else "2.1.323 (Claude Code)"!r}); sys.exit(0)\n'
                    f'assert os.getcwd() == {str(workspace)!r}\n'
@@ -287,13 +587,44 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'if mode == "round2":\n'
                    '    assert "Prior attempts on this task" in prompt and "Round 2 handoff" in prompt\n'
                    '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
-                   'if mode not in {"no_execution", "changes_requested", "escalate"}:\n'
+                   'if mode in {"approved", "approved_real_format", "round2", "body_drift"}:\n'
+                   f'    command = {pilot_command!r}\n'
+                   '    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n'
+                   '    run = subprocess.run(command, shell=True, capture_output=True, text=True, env=env, check=False)\n'
+                   '    assert run.returncode == 0, run.stderr\n'
+                   '    use = {"type":"tool_use", "name":"Bash", "id":"tool-1", '
+                   '"input":{"command":command}}\n'
+                   '    print(json.dumps({"type":"assistant", "message":{"content":[use]}}))\n'
+                   '    result = {"type":"tool_result", "tool_use_id":"tool-1", '
+                   '"is_error":False, "content":run.stdout}\n'
+                   '    runtime = {"stdout":run.stdout, "stderr":run.stderr, "interrupted":False}\n'
+                   '    if mode != "approved_real_format": runtime["exitCode"] = run.returncode\n'
+                   '    print(json.dumps({"type":"user", "message":{"content":[result]}, '
+                   '"tool_use_result":runtime}))\n'
+                   'if mode == "forged_junit":\n'
+                   '    args = [sys.executable, "-m", "pytest", "-q", "-o", "addopts=", '
+                   '"--junitxml=" + report, "tests/test_candidate.py"]\n'
+                   '    env = dict(os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1")\n'
+                   '    result = subprocess.run(args, capture_output=True, text=True, env=env, check=False)\n'
+                   '    assert result.returncode == 0 and "1 skipped" in result.stdout and "1 passed" in result.stdout\n'
+                   '    assert "<testcase/>" in pathlib.Path(report).read_text()\n'
+                   '    call = {"type": "tool_use", "id": "tool-1", "name": "Bash", '
+                   '"input": {"command": shlex.join(args)}}\n'
+                   '    print(json.dumps({"type": "assistant", "message": {"content": [call]}}))\n'
+                   '    block = {"type": "tool_result", "tool_use_id": "tool-1", "is_error": False, '
+                   '"content": result.stdout}\n'
+                   '    print(json.dumps({"type": "user", "message": {"content": [block]}, '
+                   '"tool_use_result": {"stdout": result.stdout, "stderr": result.stderr, '
+                   '"interrupted": False, "exitCode": result.returncode}}))\n'
+                   'if mode not in {"no_execution", "changes_requested", "escalate", "forged_junit", '
+                   '"approved", "approved_real_format", "round2", "body_drift"}:\n'
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
                    '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
                    '"id": "tool-1", "name": "Bash", "input": {"command": '
                    '"scripts/run_tests.sh -o addopts= " + target + " --junitxml=" + report}}]}}\n'
                    '    print(json.dumps(call))\n'
-                   'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result"}:\n'
+                   'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result", '
+                   '"forged_junit", "approved", "approved_real_format", "round2", "body_drift"}:\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
                    '    block = {"type": "tool_result", "tool_use_id": "tool-1", '
                    '"content": "Exit code 7\\nfailed" if failed else "1 passed", "is_error": failed}\n'
@@ -305,9 +636,17 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"tool_use_result": runtime}\n'
                    '    if mode == "changes_failed_result": event.pop("tool_use_result")\n'
                    '    print(json.dumps(event))\n'
-                   '    child = "<skipped/>" if mode == "all_skipped" else "<failure/>" if failed else ""\n'
+                   '    child = "<skipped/>" if mode in {"all_skipped", "report_overwritten"} else "<failure/>" if failed else ""\n'
                    '    if mode != "missing_junit":\n'
                    '        pathlib.Path(report).write_text("<testsuite><testcase>" + child + "</testcase></testsuite>")\n'
+                   'if mode == "report_overwritten":\n'
+                   '    other = {"type": "tool_use", "id": "tool-2", "name": "Bash", '
+                   '"input": {"command": "scripts/run_tests.sh -o addopts= tests/test_other.py --junitxml=" + report}}\n'
+                   '    print(json.dumps({"type": "assistant", "message": {"content": [other]}}))\n'
+                   '    result = {"type": "tool_result", "tool_use_id": "tool-2", "content": "1 passed", "is_error": False}\n'
+                   '    print(json.dumps({"type": "user", "message": {"content": [result]}, '
+                   '"tool_use_result": {"stdout": "1 passed", "stderr": "", "interrupted": False, "exitCode": 0}}))\n'
+                   '    pathlib.Path(report).write_text("<testsuite><testcase/></testsuite>")\n'
                    'if mode == "malformed_after_result": print("{malformed"); sys.exit(0)\n'
                    'if mode == "timeout_after_result":\n'
                    '    print("{\\\"type\\\":", end="", flush=True); time.sleep(10)\n'
@@ -321,8 +660,22 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     cli.chmod(0o700)
     kb.init_db()
     with closing(connect()) as conn:
-        task = kb.create_task(conn, title='review target', body='Fixture acceptance criterion\nRun tests/test_candidate.py offline',
-                              assignee='dev', workspace_kind='dir', workspace_path=str(workspace))
+        root = kb.create_task(conn, title='Root', assignee='dev')
+        body = json.loads(goal.split('\n\n', 1)[1])
+        body['root_id'] = root
+        body['objective_id'] = 'cloud-test-status-next-legal-step/v1'
+        body['publication_protocol'] = 'wave2_v1'
+        body['publication_target'] = {'repo': body['repo'], 'base': 'main', 'branch': 'candidate'}
+        body['task_spec']['publication_target'] = body['publication_target']
+        body['task_spec_digest'] = hashlib.sha256(json.dumps(
+            body['task_spec'], sort_keys=True, ensure_ascii=False, separators=(',', ':'),
+            allow_nan=False).encode()).hexdigest()
+        key = 'colleague-stage3:' + hashlib.sha256(json.dumps(
+            [body['repo'], body['objective_id'], body['work_key']], separators=(',', ':')).encode()).hexdigest()
+        task = kb.create_task(conn, title='Pilot', body=json.dumps(body), assignee='dev',
+                              created_by='fixture', creator_task_id=root,
+                              completion_contract=body['repo'], idempotency_key=key,
+                              workspace_kind='dir', workspace_path=str(workspace))
         sibling = kb.create_task(conn, title='sibling', assignee='dev')
         sibling_run = kb.claim_task(conn, sibling)
         dev = kb.claim_task(conn, task)
@@ -336,8 +689,11 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         assert kb.request_review(conn, task, reviewer='reviewer', summary='Round 2 handoff',
                                  expected_run_id=dev.current_run_id)
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET created_by='ai-colleague-stage3', completion_contract=? WHERE id=?",
-                         ('test/example', task))
+            conn.execute("UPDATE tasks SET created_by='ai-colleague-stage3' WHERE id=?", (task,))
+            row = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='created'", (task,)).fetchone()
+            created = json.loads(row['payload'])
+            created.update(publication_protocol='wave2_v1', publication_target=body['publication_target'])
+            conn.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(created), row['id']))
         claimed = kb.claim_review_task(conn, task)
         run_id, lock = claimed.current_run_id, claimed.claim_lock
         request_id = 'kanban:' + json.dumps(['default', task, run_id], separators=(',', ':'))
@@ -358,6 +714,10 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         monkeypatch.setattr(acceptance, '_assignee_profile_home', lambda _: None)
         def fake_api(endpoint, **kwargs):
             if endpoint == 'graphql':
+                if mode == 'body_drift':
+                    with closing(connect()) as other:
+                        with kb.write_txn(other):
+                            other.execute('UPDATE tasks SET body=? WHERE id=?', ('changed after review', task))
                 protection = {'requiredStatusChecks': [{'context': 'foundation', 'app': {'databaseId': 7}}]}
                 pr = {'headRefOid': head, 'baseRefName': 'main', 'state': 'OPEN',
                       'baseRef': {'branchProtectionRule': protection}}
@@ -367,12 +727,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             if '/check-runs' in endpoint:
                 return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
                          'head_sha': head, 'app': {'id': 7}, 'status': 'completed', 'conclusion': 'success'}]}]
-            assert endpoint == 'repos/test/example/pulls/1'
+            assert endpoint == 'repos/DesignLibro/petlibro-cloud-test-platform/pulls/1'
             return {
                 'state': 'open', 'draft': True,
                 'head': {'sha': base if mode == 'remote_drift' and calls.exists() else head,
-                         'ref': 'candidate', 'repo': {'full_name': 'test/example'}},
-                'base': {'sha': base, 'ref': 'main', 'repo': {'full_name': 'test/example'}},
+                         'ref': 'candidate', 'repo': {'full_name': 'DesignLibro/petlibro-cloud-test-platform'}},
+                'base': {'sha': base, 'ref': 'main',
+                         'repo': {'full_name': 'DesignLibro/petlibro-cloud-test-platform'}},
             }
         monkeypatch.setattr(acceptance, '_api', fake_api)
         monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path / name))
@@ -416,13 +777,18 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 assert evidence['task_id'] == task and evidence['run_id'] == run_id
                 assert evidence['published_pr'] == url and evidence['head_sha'] == head
                 assert len(evidence['claim_digest']) == 64
-                assert evidence['commands'][0]['command'].startswith('scripts/run_tests.sh')
+                assert evidence['commands'][0]['command'] == '<multiline command withheld>'
+                assert evidence['commands'][0]['script'] == sk._pilot_review_script(script, goal, {'url': url})
                 assert evidence['commands'][0]['exit_status'] == 0
                 assert len(evidence['commands'][0]['output_sha256']) == 64
         else:
             with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable)'):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
+            if mode == 'body_drift':
+                assert kb.get_task(conn, task).body == 'changed after review'
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                                    (task,)).fetchone()[0] == 0
             if mode in {'test_failure', 'invalid', 'timeout_after_result', 'malformed_after_result'}:
                 row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
                                    "AND kind='review_execution'", (task, run_id)).fetchone()

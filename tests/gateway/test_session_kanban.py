@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize('mode', ['approved', 'changes_requested', 'failure', 'timeout',
+@pytest.mark.parametrize('mode', ['approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout',
                                  'invalid', 'head_drift', 'remote_drift'])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import os
@@ -22,6 +22,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
     monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    from tools import skills_tool
+    monkeypatch.setattr(skills_tool, '_skills_dir', lambda: Path(__file__).resolve().parents[2] / 'skills')
     workspace = tmp_path / 'candidate'
     workspace.mkdir()
 
@@ -54,16 +56,30 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'if mode == "head_drift":\n'
                    '    subprocess.run(["git","-c","user.name=Fake","-c","user.email=f@example.invalid",'
                    '"commit","--allow-empty","-m","drift"], stdout=subprocess.DEVNULL, check=True)\n'
-                   'verdict = {"verdict": "changes_requested" if mode == "changes_requested" else '
+                   'assert "Review Lenses" in prompt and "Fixture acceptance criterion" in prompt\n'
+                   'if mode == "round2":\n'
+                   '    assert "Prior attempts on this task" in prompt and "Round 2 handoff" in prompt\n'
+                   '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
+                   'verdict = {"verdict": mode if mode in {"changes_requested", "escalate"} else '
                    '"unexpected" if mode == "invalid" else "approved", "reason": "review evidence"}\n'
                    'print(json.dumps(dict(type="result", subtype="success", is_error=False, '
                    'structured_output=verdict)))\n')
     cli.chmod(0o700)
     kb.init_db()
     with closing(connect()) as conn:
-        task = kb.create_task(conn, title='review target', assignee='dev')
+        task = kb.create_task(conn, title='review target', body='Fixture acceptance criterion',
+                              assignee='dev', workspace_kind='dir', workspace_path=str(workspace))
+        sibling = kb.create_task(conn, title='sibling', assignee='dev')
+        sibling_run = kb.claim_task(conn, sibling)
         dev = kb.claim_task(conn, task)
-        assert kb.request_review(conn, task, reviewer='reviewer', summary='candidate',
+        if mode == 'round2':
+            assert kb.request_review(conn, task, reviewer='reviewer', summary='Round 1 handoff',
+                                     expected_run_id=dev.current_run_id)
+            prior_review = kb.claim_review_task(conn, task)
+            assert kb.request_changes(conn, task, reason='Round 1: preserve the exact ID type',
+                                      expected_run_id=prior_review.current_run_id)[0]
+            dev = kb.claim_task(conn, task)
+        assert kb.request_review(conn, task, reviewer='reviewer', summary='Round 2 handoff',
                                  expected_run_id=dev.current_run_id)
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET created_by='ai-colleague-stage3', completion_contract=? WHERE id=?",
@@ -105,17 +121,29 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 'base': {'sha': base, 'ref': 'main', 'repo': {'full_name': 'test/example'}},
             }
         monkeypatch.setattr(acceptance, '_api', fake_api)
-        context = dict(task_id=task, run_id=run_id, claim_lock=lock, db=str(kb.kanban_db_path()),
-                       workspace=str(workspace), profile='reviewer', goal_text='Inspect fixture',
-                       max_runtime_seconds=1 if mode == 'timeout' else 15,
-                       claude_review={'executable': str(cli), 'config_dir': str(tmp_path)})
-        if mode in {'approved', 'changes_requested'}:
+        monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path / name))
+        params = dict(task_id=task, run_id=run_id, claim_lock=lock, board='default')
+        actor = SimpleNamespace(profile_id=str(tmp_path / 'reviewer'), capabilities={'session:create'})
+        connection = SimpleNamespace(actor=actor, authority=actor, native_owner=True)
+        config = {'model': {'default': 'fake', 'provider': 'custom'},
+                  'kanban': {'claude_review': {'executable': str(cli), 'config_dir': str(tmp_path)}}}
+        policy, _ = sk.build_kanban_policy(connection, params, config)
+        context = json.loads(policy.kanban_json)
+        context['max_runtime_seconds'] = 1 if mode == 'timeout' else 15
+        prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
+        if mode in {'approved', 'changes_requested', 'escalate', 'round2'}:
             result = sk._run_task_turns(None, {}, [], context)
             assert result['final_response'] == 'review evidence'
             task_state = kb.get_task(conn, task)
-            assert task_state.status == ('done' if mode == 'approved' else 'ready')
+            assert task_state.status == {'changes_requested': 'ready', 'escalate': 'blocked'}.get(mode, 'done')
             if mode == 'changes_requested':
                 assert task_state.assignee == 'dev'
+            if mode == 'escalate':
+                assert task_state.assignee == 'reviewer' and task_state.block_kind == 'needs_input'
+                assert task_state.current_run_id is None and kb.get_run(conn, run_id).outcome == 'blocked'
+                assert kb.get_run(conn, run_id).summary == 'review evidence'
+                assert [r for r in kb.list_runs(conn, task) if r.id != run_id] == prior_runs
+                assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
         else:
             with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed)'):
                 sk._run_task_turns(None, {}, [], context)

@@ -6,8 +6,90 @@ from types import SimpleNamespace
 import pytest
 
 
-@pytest.mark.parametrize('mode', ['approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout',
-                                 'invalid', 'head_drift', 'remote_drift'])
+@pytest.mark.parametrize('command', [
+    'pytest --help',
+    'pytest tests/test_candidate.py -h',
+    'pytest tests/test_candidate.py --setup-only',
+    'pytest tests/test_candidate.py --collect-only=yes',
+    'pytest tests/other_project.py || true',
+    'pytest --collect-only',
+    'echo ignored; pytest tests/test_candidate.py',
+])
+def test_review_validation_rejects_non_execution_or_masked_status(command):
+    from gateway.session_kanban import _is_review_validation_command
+
+    assert not _is_review_validation_command(command)
+
+
+def test_review_validation_binds_task_test_file():
+    from gateway.session_kanban import _review_command_matches_task
+
+    criteria = 'Verify tests/test_candidate.py for the requested change.'
+    assert _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', criteria)
+    assert not _review_command_matches_task('python3 -m pytest -q tests/test_other.py', criteria)
+    assert not _review_command_matches_task('pytest tests/test_candidate.py -k unrelated', criteria)
+    assert not _review_command_matches_task('pytest tests/test_candidate.py -kunrelated', criteria)
+    assert not _review_command_matches_task('pytest tests/test_candidate.py --setup-plan', criteria)
+    assert not _review_command_matches_task('pytest tests/test_candidate.py --password synthetic-secret', criteria)
+
+
+def test_review_validation_reads_native_intake_serialized_criteria():
+    from gateway.session_kanban import _review_command_matches_task
+
+    body = json.dumps({'task_spec': {'title': 'Fix fixture',
+                                    'acceptance_criteria': 'Run tests/test_candidate.py offline'}})
+    assert _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', body)
+    assert not _review_command_matches_task('python3 -m pytest -q tests/test_other.py', body)
+
+
+def test_review_requires_a_real_test_summary():
+    from gateway.session_kanban import _review_tests_passed
+
+    command = 'pytest tests/test_candidate.py'
+    assert _review_tests_passed('..\n2 passed, 1 skipped in 0.2s\n', command)
+    assert not _review_tests_passed('1 passed\n1 skipped in 0.2s\n', command)
+    assert not _review_tests_passed('1 skipped in 0.2s\n', command)
+    assert _review_tests_passed('Ran 1 test in 0.01s\n\nOK\n', command)
+    runner = 'scripts/run_tests.sh tests/test_candidate.py'
+    assert _review_tests_passed('=== Summary: 1 files, 2 tests passed, 0 failed (100%) ===\nMore info\n', runner)
+
+
+@pytest.mark.parametrize('command', [
+    'TOKEN=synthetic-secret pytest tests/test_candidate.py',
+    'API_KEY=synthetic-secret pytest tests/test_candidate.py',
+    'pytest tests/test_candidate.py --password synthetic-secret',
+    'pytest tests/test_candidate.py --api-key=synthetic-secret',
+])
+def test_review_command_redacts_sensitive_values(command):
+    from gateway.session_kanban import _redact_review_command
+
+    redacted = _redact_review_command(command)
+    assert 'synthetic-secret' not in redacted
+    assert '<redacted>' in redacted
+
+
+@pytest.mark.parametrize('runtime', [
+    {'stdout': 'ok', 'stderr': '', 'interrupted': False},
+    {'stdout': '', 'stderr': '', 'interrupted': False, 'returnCodeInterpretation': 'No matches found'},
+    {'stdout': '', 'stderr': '', 'interrupted': True, 'exitCode': 0},
+    {'stdout': '', 'stderr': '', 'interrupted': False, 'exitCode': 0, 'backgroundTaskId': 'pending'},
+])
+def test_review_tool_result_does_not_invent_exit_status(runtime):
+    from gateway.session_kanban import _review_tool_result
+
+    block = {'type': 'tool_result', 'tool_use_id': 't', 'content': runtime['stdout']}
+    receipt = _review_tool_result({'command': 'pytest tests/test_candidate.py'}, block, runtime)
+    assert receipt['exit_status'] is None
+
+
+@pytest.mark.parametrize('mode', [
+    'approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout', 'invalid',
+    'head_drift', 'remote_drift', 'no_execution', 'test_failure', 'missing_result',
+    'workspace_dirty',
+    'task_mismatch', 'run_mismatch', 'claim_mismatch', 'approved_real_format', 'unknown_cli_version',
+    'unrelated_execution', 'all_skipped',
+    'changes_unknown_result', 'escalate_unknown_result',
+])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import os
     import subprocess
@@ -44,11 +126,17 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
                    'import json, os, pathlib, subprocess, sys, time\n'
+                   'if "--version" in sys.argv:\n'
+                   f'    print({"unknown" if mode == "unknown_cli_version" else "2.1.323 (Claude Code)"!r}); sys.exit(0)\n'
                    f'assert os.getcwd() == {str(workspace)!r}\n'
                    f'assert os.environ["CLAUDE_CONFIG_DIR"] == {str(tmp_path)!r}\n'
                    'prompt = sys.stdin.read()\n'
                    f'assert {head!r} in prompt and {url!r} in prompt\n'
                    'assert "+fixture change" in prompt\n'
+                   'assert "--output-format" in sys.argv and "stream-json" in sys.argv\n'
+                   'assert "--verbose" in sys.argv\n'
+                   'assert "--tools" in sys.argv and "Read,Glob,Grep,Bash" in sys.argv\n'
+                   'assert "--allowedTools" in sys.argv and "Read,Glob,Grep,Bash" in sys.argv\n'
                    f'with open({str(calls)!r}, "a") as f: f.write("call\\n")\n'
                    f'mode = {mode!r}\n'
                    'if mode == "failure": sys.exit(2)\n'
@@ -56,18 +144,38 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'if mode == "head_drift":\n'
                    '    subprocess.run(["git","-c","user.name=Fake","-c","user.email=f@example.invalid",'
                    '"commit","--allow-empty","-m","drift"], stdout=subprocess.DEVNULL, check=True)\n'
+                   'if mode == "workspace_dirty": pathlib.Path("candidate.txt").write_text("modified by review\\n")\n'
                    'assert "Review Lenses" in prompt and "Fixture acceptance criterion" in prompt\n'
                    'if mode == "round2":\n'
                    '    assert "Prior attempts on this task" in prompt and "Round 2 handoff" in prompt\n'
                    '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
-                   'verdict = {"verdict": mode if mode in {"changes_requested", "escalate"} else '
+                   'if mode not in {"no_execution", "changes_requested", "escalate"}:\n'
+                   '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
+                   '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
+                   '"id": "tool-1", "name": "Bash", "input": {"command": '
+                   '"scripts/run_tests.sh " + target}}]}}\n'
+                   '    print(json.dumps(call))\n'
+                   'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result"}:\n'
+                   '    failed = mode == "test_failure"\n'
+                   '    block = {"type": "tool_result", "tool_use_id": "tool-1", '
+                   '"content": "Exit code 7\\nfailed" if failed else "1 passed", "is_error": failed}\n'
+                   '    runtime = {"stdout": "1 skipped" if mode == "all_skipped" else "1 passed", '
+                   '"stderr": "", "interrupted": False}\n'
+                   '    if mode not in {"approved_real_format", "unknown_cli_version", "changes_unknown_result", '
+                   '"escalate_unknown_result"}: runtime["exitCode"] = 7 if failed else 0\n'
+                   '    event = {"type": "user", "message": {"content": [block]}, '
+                   '"tool_use_result": runtime}\n'
+                   '    print(json.dumps(event))\n'
+                   'verdict_mode = {"changes_unknown_result": "changes_requested", '
+                   '"escalate_unknown_result": "escalate"}.get(mode, mode)\n'
+                   'verdict = {"verdict": verdict_mode if verdict_mode in {"changes_requested", "escalate"} else '
                    '"unexpected" if mode == "invalid" else "approved", "reason": "review evidence"}\n'
                    'print(json.dumps(dict(type="result", subtype="success", is_error=False, '
                    'structured_output=verdict)))\n')
     cli.chmod(0o700)
     kb.init_db()
     with closing(connect()) as conn:
-        task = kb.create_task(conn, title='review target', body='Fixture acceptance criterion',
+        task = kb.create_task(conn, title='review target', body='Fixture acceptance criterion tests/test_candidate.py',
                               assignee='dev', workspace_kind='dir', workspace_path=str(workspace))
         sibling = kb.create_task(conn, title='sibling', assignee='dev')
         sibling_run = kb.claim_task(conn, sibling)
@@ -130,25 +238,44 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         policy, _ = sk.build_kanban_policy(connection, params, config)
         context = json.loads(policy.kanban_json)
         context['max_runtime_seconds'] = 1 if mode == 'timeout' else 15
+        if mode == 'task_mismatch':
+            context['task_id'] = sibling
+        elif mode == 'run_mismatch':
+            context['run_id'] = sibling_run.current_run_id
+        elif mode == 'claim_mismatch':
+            context['claim_lock'] = 'wrong-claim'
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
-        if mode in {'approved', 'changes_requested', 'escalate', 'round2'}:
+        if mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
+                    'changes_unknown_result', 'escalate_unknown_result'}:
             result = sk._run_task_turns(None, {}, [], context)
             assert result['final_response'] == 'review evidence'
             task_state = kb.get_task(conn, task)
-            assert task_state.status == {'changes_requested': 'ready', 'escalate': 'blocked'}.get(mode, 'done')
-            if mode == 'changes_requested':
+            assert task_state.status == {'changes_requested': 'ready', 'changes_unknown_result': 'ready',
+                                         'escalate': 'blocked', 'escalate_unknown_result': 'blocked'}.get(mode, 'done')
+            if mode in {'changes_requested', 'changes_unknown_result'}:
                 assert task_state.assignee == 'dev'
-            if mode == 'escalate':
+            if mode in {'escalate', 'escalate_unknown_result'}:
                 assert task_state.assignee == 'reviewer' and task_state.block_kind == 'needs_input'
                 assert task_state.current_run_id is None and kb.get_run(conn, run_id).outcome == 'blocked'
                 assert kb.get_run(conn, run_id).summary == 'review evidence'
                 assert [r for r in kb.list_runs(conn, task) if r.id != run_id] == prior_runs
                 assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
+            if mode in {'approved', 'approved_real_format', 'round2'}:
+                evidence = kb.get_run(conn, run_id).metadata['review_execution']
+                assert evidence['task_id'] == task and evidence['run_id'] == run_id
+                assert evidence['published_pr'] == url and evidence['head_sha'] == head
+                assert len(evidence['claim_digest']) == 64
+                assert evidence['commands'][0]['command'].startswith('scripts/run_tests.sh')
+                assert evidence['commands'][0]['exit_status'] == 0
+                assert len(evidence['commands'][0]['output_sha256']) == 64
         else:
-            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed)'):
+            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim)'):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
-        assert calls.read_text() == 'call\n'
+        if mode in {'task_mismatch', 'run_mismatch', 'claim_mismatch'}:
+            assert not calls.exists()
+        else:
+            assert calls.read_text() == 'call\n'
 
 
 def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):

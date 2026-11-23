@@ -29,7 +29,14 @@ def test_review_validation_rejects_non_execution_or_masked_status(command):
     {'sandbox': {'network': {'allowUnixSockets': ['/tmp/fixture.sock']}}},
     {'sandbox': {'filesystem': {'disabled': True}}},
     {'sandbox': {'filesystem': {'allowWrite': ['/tmp']}}},
+    {'sandbox': {'allowAppleEvents': True}},
+    {'sandbox': {'enableWeakerNetworkIsolation': True}},
+    {'sandbox': {'enableWeakerNestedSandbox': True}},
+    {'sandbox': {'allowNestedUserNamespaces': True}},
+    {'sandbox': {'network': {'allowMachLookup': ['example.invalid']}}},
     {'permissions': {'allow': ['Edit(./*)']}},
+    {'permissions': {'allow': ['WebFetch']}},
+    {'permissions': {'additionalDirectories': ['/tmp']}},
     {'permissions': {'allow': ['WebFetch(domain:example.invalid)']}},
 ])
 def test_review_refuses_user_sandbox_exceptions(tmp_path, exception):
@@ -65,6 +72,9 @@ def test_review_validation_binds_task_test_file():
 
     criteria = 'Run tests/test_candidate.py offline.'
     assert _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_candidate.py', criteria)
+    assert _review_command_matches_task('.venv/bin/python -m pytest -q -o addopts= tests/test_candidate.py', criteria)
+    assert _review_command_matches_task('uv run pytest -q -o addopts= tests/test_candidate.py', criteria)
+    assert _review_command_matches_task('uv run --extra test python -m pytest -q -o addopts= tests/test_candidate.py', criteria)
     assert not _review_command_matches_task('python3 -m pytest -q tests/test_candidate.py', criteria)
     assert not _review_command_matches_task('python3 -m pytest -q -o addopts= tests/test_other.py', criteria)
     assert not _review_command_matches_task('pytest -o addopts= tests/test_candidate.py -k unrelated', criteria)
@@ -106,18 +116,64 @@ def test_review_requires_a_real_test_summary():
 def test_review_rejects_skipped_pytest_with_forged_atexit_summary(tmp_path, monkeypatch):
     import subprocess
     import sys
-    from gateway.session_kanban import _review_tests_passed
+    from gateway.session_kanban import _review_junit_result, _review_tests_passed
 
     (tmp_path / 'pytest.ini').write_text('[pytest]\naddopts = -qq\n')
     (tmp_path / 'test_candidate.py').write_text(
         "import atexit, pytest\natexit.register(lambda: print('1 passed'))\n"
         "@pytest.mark.skip(reason='fixture')\ndef test_skipped(): assert False\n")
     monkeypatch.setenv('PYTEST_DISABLE_PLUGIN_AUTOLOAD', '1')
-    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-o', 'addopts=', 'test_candidate.py'],
+    report = tmp_path / 'results.xml'
+    result = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-o', 'addopts=',
+                             f'--junitxml={report}', 'test_candidate.py'],
                             cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0
     assert '1 skipped' in result.stdout and '1 passed' in result.stdout
     assert not _review_tests_passed(result.stdout, 'pytest -q -o addopts= test_candidate.py')
+    assert _review_junit_result(str(report)) is None
+
+
+def test_review_junit_rejects_runtime_suppressed_summary(tmp_path, monkeypatch):
+    import subprocess
+    import sys
+    from gateway.session_kanban import _review_junit_result, _review_tests_passed
+
+    (tmp_path / 'test_candidate.py').write_text(
+        "import atexit, pytest\natexit.register(lambda: print('1 passed'))\n"
+        "def test_skip(request):\n request.config.option.verbose = -3\n pytest.skip('fixture')\n")
+    monkeypatch.setenv('PYTEST_DISABLE_PLUGIN_AUTOLOAD', '1')
+    report = tmp_path / 'results.xml'
+    command = [sys.executable, '-m', 'pytest', '-q', '-o', 'addopts=', f'--junitxml={report}', 'test_candidate.py']
+    result = subprocess.run(command, cwd=tmp_path, capture_output=True, text=True, timeout=30, check=False)
+    assert result.returncode == 0 and _review_tests_passed(result.stdout, 'pytest test_candidate.py')
+    assert _review_junit_result(str(report)) is None
+
+
+@pytest.mark.parametrize(('content', 'accepted'), [
+    ('<testsuite><testcase/></testsuite>', True),
+    ('<testsuite><testcase><skipped/></testcase></testsuite>', False),
+    ('<testsuite><testcase><failure/></testcase></testsuite>', False),
+    ('<testsuite/>', False),
+    ('<!DOCTYPE x [<!ENTITY x "value">]><testsuite><testcase/></testsuite>', False),
+    ('not xml', False),
+])
+def test_review_junit_requires_passing_cases(tmp_path, content, accepted):
+    from gateway.session_kanban import _review_junit_result
+
+    report = tmp_path / 'results.xml'
+    report.write_text(content)
+    assert (_review_junit_result(str(report)) is not None) is accepted
+
+
+@pytest.mark.platforms('posix')
+def test_review_junit_rejects_symlink(tmp_path):
+    from gateway.session_kanban import _review_junit_result
+
+    target = tmp_path / 'foreign.xml'
+    target.write_text('<testsuite><testcase/></testsuite>')
+    report = tmp_path / 'results.xml'
+    report.symlink_to(target)
+    assert _review_junit_result(str(report)) is None
 
 
 @pytest.mark.parametrize('command', [
@@ -161,8 +217,9 @@ def test_review_tool_error_overrides_conflicting_success_status():
     'head_drift', 'remote_drift', 'no_execution', 'test_failure', 'missing_result',
     'workspace_dirty',
     'task_mismatch', 'run_mismatch', 'claim_mismatch', 'approved_real_format', 'unknown_cli_version',
-    'unrelated_execution', 'all_skipped',
+    'unrelated_execution', 'all_skipped', 'missing_junit',
     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result', 'timeout_after_result',
+    'malformed_after_result',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import os
@@ -199,12 +256,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     calls = tmp_path / 'claude-calls'
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
-                   'import json, os, pathlib, subprocess, sys, time\n'
+                   'import json, os, pathlib, re, subprocess, sys, time\n'
                    'if "--version" in sys.argv:\n'
                    f'    print({"unknown" if mode == "unknown_cli_version" else "2.1.323 (Claude Code)"!r}); sys.exit(0)\n'
                    f'assert os.getcwd() == {str(workspace)!r}\n'
                    f'assert os.environ["CLAUDE_CONFIG_DIR"] == {str(tmp_path)!r}\n'
                    'prompt = sys.stdin.read()\n'
+                   'report = re.search(r"--junitxml=(\\S+results\\.xml)", prompt).group(1)\n'
                    f'assert {head!r} in prompt and {url!r} in prompt\n'
                    'assert "+fixture change" in prompt\n'
                    'assert "--output-format" in sys.argv and "stream-json" in sys.argv\n'
@@ -233,7 +291,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
                    '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
                    '"id": "tool-1", "name": "Bash", "input": {"command": '
-                   '"scripts/run_tests.sh -o addopts= " + target}}]}}\n'
+                   '"scripts/run_tests.sh -o addopts= " + target + " --junitxml=" + report}}]}}\n'
                    '    print(json.dumps(call))\n'
                    'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result"}:\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
@@ -247,6 +305,10 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"tool_use_result": runtime}\n'
                    '    if mode == "changes_failed_result": event.pop("tool_use_result")\n'
                    '    print(json.dumps(event))\n'
+                   '    child = "<skipped/>" if mode == "all_skipped" else "<failure/>" if failed else ""\n'
+                   '    if mode != "missing_junit":\n'
+                   '        pathlib.Path(report).write_text("<testsuite><testcase>" + child + "</testcase></testsuite>")\n'
+                   'if mode == "malformed_after_result": print("{malformed"); sys.exit(0)\n'
                    'if mode == "timeout_after_result":\n'
                    '    print("{\\\"type\\\":", end="", flush=True); time.sleep(10)\n'
                    'verdict_mode = {"changes_unknown_result": "changes_requested", '
@@ -361,7 +423,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable)'):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
-            if mode in {'test_failure', 'invalid', 'timeout_after_result'}:
+            if mode in {'test_failure', 'invalid', 'timeout_after_result', 'malformed_after_result'}:
                 row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
                                    "AND kind='review_execution'", (task, run_id)).fetchone()
                 evidence = json.loads(row['payload'])

@@ -397,14 +397,14 @@ def _claude_review_config(context):
     return paths
 
 
-def _review_sandbox_policy(config_dir, workspace):
+def _review_sandbox_policy(config_dir, workspace, report_directory=None):
     import subprocess
 
     # User settings are also loaded for the Cockpit provider. Refuse known
     # sandbox escapes rather than copying or logging any provider settings.
     settings_path = Path(config_dir) / 'settings.json'
     try:
-        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        settings = json.loads(settings_path.read_text(encoding='utf-8-sig')) if settings_path.exists() else {}
         sandbox = settings.get('sandbox', {})
         network = sandbox.get('network', {})
         filesystem = sandbox.get('filesystem', {})
@@ -413,9 +413,12 @@ def _review_sandbox_policy(config_dir, workspace):
                 or not isinstance(filesystem, dict) or filesystem.get('disabled') or filesystem.get('allowWrite')
                 or not isinstance(permissions, dict) or not isinstance(permissions.get('allow', []), list)
                 or sandbox.get('excludedCommands')
+                or any(sandbox.get(key) for key in ('allowAppleEvents', 'enableWeakerNetworkIsolation',
+                                                    'enableWeakerNestedSandbox', 'allowNestedUserNamespaces'))
                 or network.get('allowedDomains') or network.get('httpProxyPort') or network.get('socksProxyPort')
                 or network.get('allowLocalBinding') or network.get('allowUnixSockets') or network.get('allowAllUnixSockets')
-                or any(isinstance(rule, str) and rule.startswith(('WebFetch(', 'Edit('))
+                or network.get('allowMachLookup') or permissions.get('additionalDirectories')
+                or any(isinstance(rule, str) and (rule in ('WebFetch', 'Edit') or rule.startswith(('WebFetch(', 'Edit(')))
                        for rule in permissions.get('allow', []))):
             raise ValueError('sandbox exception')
         common = subprocess.check_output(
@@ -427,8 +430,12 @@ def _review_sandbox_policy(config_dir, workspace):
         common_dir = (Path(workspace) / common).resolve(strict=True)
     except (OSError, ValueError, TypeError, AttributeError, subprocess.SubprocessError) as exc:
         raise RuntimeStoreError('kanban_claude_review_sandbox_unavailable') from exc
+    writable = [str(Path(report_directory).resolve(strict=True))] if report_directory else []
     return {'sandbox': {'enabled': True, 'failIfUnavailable': True, 'allowUnsandboxedCommands': False,
-                        'filesystem': {'disabled': False, 'denyWrite': [str(Path(workspace).resolve()), str(common_dir)]},
+                        'allowAppleEvents': False, 'enableWeakerNetworkIsolation': False,
+                        'enableWeakerNestedSandbox': False, 'allowNestedUserNamespaces': False,
+                        'filesystem': {'disabled': False, 'allowWrite': writable,
+                                       'denyWrite': [str(Path(workspace).resolve()), str(common_dir)]},
                         'network': {'strictAllowlist': True, 'allowedDomains': [], 'deniedDomains': ['*']}}}
 
 
@@ -442,9 +449,9 @@ def _is_review_validation_command(command):
     boundary = r'^\s*'
     runner = (
         r'(?:\./)?scripts/(?:run_tests\.sh|check)\b'
-        r'|python(?:3(?:\.\d+)?)?\s+(?:-m\s+)?(?:pytest|unittest|mypy|ruff)\b'
+        r'|(?:\./)?(?:\.venv/bin/)?python(?:3(?:\.\d+)?)?\s+(?:-m\s+)?(?:pytest|unittest|mypy|ruff)\b'
         r'|python(?:3(?:\.\d+)?)?\s+scripts/check\b'
-        r'|uv\s+run\s+(?:pytest|mypy|ruff)\b'
+        r'|uv\s+run\s+(?:(?:--extra\s+test)\s+)?(?:(?:python(?:3(?:\.\d+)?)?\s+-m\s+)?pytest|mypy|ruff)\b'
         r'|(?:pytest|mypy|ruff)\b'
         r'|(?:npm|pnpm|yarn|bun)\s+(?:test|run\s+(?:test|build|check|lint|typecheck))\b'
         r'|go\s+test\b|cargo\s+(?:test|check|clippy|build)\b'
@@ -481,7 +488,7 @@ def _redact_review_command(command):
     return shlex.join(result)[:2000]
 
 
-def _review_command_matches_task(command, criteria):
+def _review_command_matches_task(command, criteria, report_path=None):
     import re
     import shlex
 
@@ -505,7 +512,21 @@ def _review_command_matches_task(command, criteria):
             return False
     # Unknown options can suppress execution or carry secrets. Only accept
     # complete task-named test files and harmless presentation switches.
-    selectors = args[3:] if (len(args) >= 3 and args[0].startswith('python') and args[1] == '-m') else args[1:]
+    first = 0
+    if args[0] == 'uv' and len(args) > 1 and args[1] == 'run':
+        first = 2
+        if args[first:first + 2] == ['--extra', 'test']:
+            first += 2
+    if (len(args) > first + 1 and Path(args[first]).name.startswith('python') and args[first + 1] == '-m'):
+        first += 3
+    else:
+        first += 1
+    selectors = args[first:]
+    if report_path is not None:
+        report_arg = '--junitxml=' + report_path
+        if selectors.count(report_arg) != 1:
+            return False
+        selectors.remove(report_arg)
     # Project addopts can hide pytest's real summary (for example, -qq),
     # leaving only test-controlled output. Clear it for qualifying receipts.
     if selectors.count('-o') != 1:
@@ -521,6 +542,32 @@ def _review_command_matches_task(command, criteria):
     safe_flags = {'-q', '-v', '-vv', '-s', '--quiet', '--verbose', '--disable-warnings', '--tb=short'}
     return (any(arg.removeprefix('./') in paths for arg in selectors)
             and all(arg in safe_flags or arg.removeprefix('./') in paths for arg in selectors))
+
+
+def _review_junit_result(path):
+    import hashlib
+    import os
+    import stat
+    import xml.etree.ElementTree as ET
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return None
+            data = stream.read(1_000_001)
+        if len(data) > 1_000_000 or b'<!DOCTYPE' in data.upper() or b'<!ENTITY' in data.upper():
+            return None
+        root = ET.fromstring(data)
+        if root.tag not in ('testsuite', 'testsuites'):
+            return None
+        cases = root.findall('.//testcase')
+        if not cases or any(case.find('failure') is not None or case.find('error') is not None for case in cases):
+            return None
+        passed = sum(case.find('skipped') is None for case in cases)
+        return hashlib.sha256(data).hexdigest() if passed > 0 else None
+    except (OSError, ValueError, ET.ParseError):
+        return None
 
 
 def _review_tests_passed(stdout, command):
@@ -585,9 +632,14 @@ def _review_tool_result(call, block, runtime, cli_version=None):
 def _parse_claude_review_stream(output, cli_version=None):
     calls, results, verdict = {}, {}, None
     for line in output.splitlines():
-        event = json.loads(line)
+        try:
+            event = json.loads(line)
+        except ValueError:
+            verdict = None
+            break
         if not isinstance(event, dict):
-            raise ValueError('invalid stream event')
+            verdict = None
+            break
         message = event.get('message')
         blocks = message.get('content') if isinstance(message, dict) else None
         if event.get('type') == 'assistant' and isinstance(blocks, list):
@@ -666,12 +718,19 @@ def _check_review_candidate(workspace, handoff, assignee):
 
 
 def _claude_verdict(context, handoff, base):
+    import tempfile
+
+    with tempfile.TemporaryDirectory(prefix='hermes-review-') as directory:
+        return _claude_verdict_with_report(context, handoff, base, str(Path(directory) / 'results.xml'))
+
+
+def _claude_verdict_with_report(context, handoff, base, report_path):
     import os
     import subprocess
     from agent.skill_commands import build_preloaded_skills_prompt
 
     executable, config_dir = _claude_review_config(context)
-    sandbox_policy = _review_sandbox_policy(config_dir, context['workspace'])
+    sandbox_policy = _review_sandbox_policy(config_dir, context['workspace'], str(Path(report_path).parent))
     skill, loaded, missing = build_preloaded_skills_prompt(['sdlc-review'])
     if not skill or 'sdlc-review' not in loaded or missing:
         raise RuntimeStoreError('kanban_claude_review_skill_unavailable')
@@ -694,6 +753,7 @@ def _claude_verdict(context, handoff, base):
         "Use the review skill's criteria and verify every prior requested correction before approving. "
         "Run the project tests, build, or behavior checks needed to verify this exact candidate. "
         "For a qualifying pytest receipt pass -o addopts= so its actual summary is visible. "
+        f"Write a pytest JUnit report using --junitxml={report_path}. "
         "Approval requires at least one successful relevant Bash validation whose tool result the Owner can verify. "
         "Return the structured verdict for the Owner to apply. Escalate when a Human decision is required. "
         "Do not call Kanban tools, change files or use the network. "
@@ -733,7 +793,7 @@ def _claude_verdict(context, handoff, base):
             returncode = None
         envelope, executions, missing = _parse_claude_review_stream(output, cli_version)
         for item in executions:
-            item['relevant'] = _review_command_matches_task(item['command'], context['goal_text'])
+            item['relevant'] = _review_command_matches_task(item['command'], context['goal_text'], report_path)
         verdict = envelope.get('structured_output') if isinstance(envelope, dict) else None
         if (returncode == 0 and isinstance(envelope, dict)
                 and envelope.get('type') == 'result' and envelope.get('subtype') == 'success'
@@ -741,10 +801,14 @@ def _claude_verdict(context, handoff, base):
                 and set(verdict) == {'verdict', 'reason'}
                 and verdict['verdict'] in ('approved', 'changes_requested', 'escalate')
                 and isinstance(verdict['reason'], str) and 0 < len(verdict['reason'].strip()) <= 2000):
+            report_digest = _review_junit_result(report_path)
             approval_evidence_ok = not (
-                    missing or not any(item['relevant'] and item['ran_tests'] for item in executions)
+                    missing or sum(bool(item['relevant']) for item in executions) != 1 or not report_digest
                     or any(item['exit_status'] != 0 for item in executions))
-            return verdict, _review_execution_record(context, handoff, executions), approval_evidence_ok
+            record = _review_execution_record(context, handoff, executions)
+            if report_digest:
+                record['junit_sha256'] = report_digest
+            return verdict, record, approval_evidence_ok
         return None, _review_execution_record(context, handoff, executions), False
     except (OSError, subprocess.SubprocessError, ValueError, TypeError, KeyError):
         pass

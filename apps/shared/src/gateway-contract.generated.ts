@@ -4492,6 +4492,7 @@ export interface PromptReceiptParams {
   session_id: string
   admission_id: string
   include_result?: boolean | null
+  include_worker_finish?: boolean | null
 }
 /** ``result`` / ``usage``: the structured turn result committed at settlement, only with ``include_result`` on a terminal admission that saved one. */
 export interface PromptReceiptResult {
@@ -4504,10 +4505,16 @@ export interface PromptReceiptResult {
   execution_generation: number | null
   result?: unknown | null
   usage?: Record<string, unknown> | null
+  worker_finish?: WorkerFinishProjection | null
 }
 export interface CanonicalSessionRef {
   profile_id: string
   session_id: string
+}
+export interface WorkerFinishProjection {
+  receipt: 'RECORDED' | 'UNKNOWN'
+  ack: 'RECORDED' | 'UNKNOWN'
+  physical_retirement: 'UNKNOWN'
 }
 export interface PromptCancelParams {
   session_id: string

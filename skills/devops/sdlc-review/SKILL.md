@@ -117,7 +117,7 @@ kanban_complete(
 )
 ```
 
-Include the exact checks that passed and any bounded caveat that does not block acceptance.
+Include the exact checks that passed and any bounded caveat that does not block acceptance. For a `wave2_v1` publication handoff, copy the bound `published_pr` URL and `head_sha` from the implementer's native handoff and include `review_verdict: "approved"` in metadata. Verify that exact candidate; if URL, HEAD, provenance or required CI is missing or changes, do not approve. A distinct profile/Run is functional provenance, not proof of credential isolation.
 
 #### Request changes
 

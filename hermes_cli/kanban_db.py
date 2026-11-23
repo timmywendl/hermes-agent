@@ -1313,6 +1313,8 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "completion_contract": completion_contract,
+                        **({"publication_protocol": "wave2_v1", "publication_target": _json_dict(body).get("publication_target")}
+                           if created_by == "ai-colleague-stage3" and _json_dict(body).get("publication_protocol") == "wave2_v1" else {}),
                         **({"workspace_admission": workspace_creation_admission(conn, task_id, workspace_admission)} if workspace_admission is not None else {}),
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -2657,7 +2659,7 @@ def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
-    fire_lifecycle_hook: bool = True, force: bool = False,
+    expected_claim_lock: Optional[str] = None, fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2687,7 +2689,7 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     handoff_summary = summary if summary is not None else result
-    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata)
+    acceptance = prepare_acceptance(conn, task_id, expected_run_id, metadata, expected_claim_lock)
     if acceptance is False:
         return False
     with write_txn(conn):
@@ -3278,7 +3280,8 @@ def redact_review_value(value: Any) -> Any:
 def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
-    expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    expected_run_id: Optional[int] = None, expected_claim_lock: Optional[str] = None,
+    force: bool = False, with_reason: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -3307,6 +3310,12 @@ def request_review(
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
     metadata = _merge_completion_prose_artifacts(conn, task_id, metadata, summary=summary, result=None)
+    from hermes_cli.kanban_pr_acceptance_store import prepare_wave2_handoff, validate_wave2_handoff, prior_reviewer
+    wave2 = prepare_wave2_handoff(conn, task_id, expected_run_id, metadata, reviewer, expected_claim_lock)
+    if wave2 is False:
+        return _ret(False, "publication handoff requires exact claimed Run, Draft URL and candidate HEAD")
+    if wave2 is not None:
+        reviewer = wave2["reviewer"]
     now = int(time.time())
     # Staged copies live outside the txn: a rollback after staging must not
     # leave orphans that make the retry stage ``name_1.ext`` beside them.
@@ -3315,6 +3324,8 @@ def request_review(
         with write_txn(conn):
             if not _parents_satisfied(conn, task_id):
                 return _ret(False, "parent dependencies are not satisfied")
+            if wave2 is not None and not validate_wave2_handoff(conn, task_id, wave2):
+                return _ret(False, "publication handoff changed before commit")
             trow = conn.execute(
                 "SELECT assignee, status, claim_lock, current_run_id, worker_pid, "
                 "worker_started_at FROM tasks WHERE id = ?", (task_id,),
@@ -3331,7 +3342,7 @@ def request_review(
                     "override) instead of clearing the live run's claim",
                 )
             if reviewer is None:
-                reviewer = _prior_reviewer(conn, task_id)
+                reviewer = prior_reviewer(conn, task_id)
                 if reviewer is False:
                     return _ret(
                         False, "re-review has no durable reviewer provenance (the "
@@ -3379,6 +3390,9 @@ def request_review(
                 return _ret(
                     False, "task is not in running/ready (or expected_run_id did not match the current run)",
                 )
+            if wave2 is not None:
+                _append_event(conn, task_id, "wave2_handoff", {k: v for k, v in wave2.items() if k != "claim_lock"}, run_id=wave2["run_id"])
+                conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (wave2["url"], task_id))
             if isinstance(metadata, dict):
                 staged_copies = _stage_completion_artifacts(
                     conn, task_id, metadata, now, uploaded_by="kanban_request_review",
@@ -3404,28 +3418,13 @@ def request_review(
     return _ret(True)
 
 
-def _prior_reviewer(conn: sqlite3.Connection, task_id: str):
-    """Reviewer recorded by the latest ``changes_requested`` run's event.
-    ``None`` = first review (no such run); ``False`` = a run exists but its
-    provenance is missing/malformed."""
-    changes_run = conn.execute(
-        "SELECT id FROM task_runs "
-        "WHERE task_id = ? AND outcome = 'changes_requested' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if changes_run is None:
-        return None
-    changes_event = _latest_event(conn, task_id, "changes_requested", changes_run["id"])
-    reviewer = _json_dict(_row_get(changes_event, "payload")).get("reviewer")
-    return reviewer if isinstance(reviewer, str) and reviewer.strip() else False
-
-
 def _nonblank_str(value: Any) -> Optional[str]:
     return value if isinstance(value, str) and value.strip() else None
 
 
 def request_changes(
     conn: sqlite3.Connection, task_id: str, *, reason: str, expected_run_id: Optional[int] = None,
+    expected_claim_lock: Optional[str] = None,
 ) -> tuple[bool, Optional[str]]:
     """Close an active reviewer run (claimed from ``review``) and hand the task
     back to the implementer from the latest ``review_requested`` event, parent
@@ -3435,6 +3434,9 @@ def request_changes(
         return False, "reason is required"
 
     with write_txn(conn):
+        from hermes_cli.kanban_pr_acceptance_store import wave2_review_refusal
+        if refusal := wave2_review_refusal(conn, task_id, expected_run_id, expected_claim_lock):
+            return False, refusal
         task_row = conn.execute(
             "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -4037,10 +4039,8 @@ def gc_events(conn: sqlite3.Connection, *, older_than_seconds: int = 30 * 24 * 3
     """
     cutoff = int(time.time()) - _retention_seconds(older_than_seconds)
     with write_txn(conn):
-        cur = conn.execute(
-            "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed', 'workspace_bound') "
-            "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived'))", (cutoff,),
-        )
+        from hermes_cli.kanban_pr_acceptance_store import event_gc_sql
+        cur = conn.execute(event_gc_sql(), (cutoff,))
     return int(cur.rowcount or 0)
 
 

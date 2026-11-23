@@ -791,3 +791,263 @@ def test_review_transitions_preserve_consecutive_failures(conn) -> None:
         )
     assert kb.complete_task(conn, ok_id, summary="done")
     assert _failures(conn, ok_id) == 0
+
+
+def _wave2_task(conn, *, workspace_branch="topic"):
+    import json
+    task_id = kb.create_task(conn, title="wave2", body=json.dumps({"publication_protocol": "wave2_v1",
+        "publication_target": {"repo": "acme/repo", "base": "main", "branch": "topic"}}),
+        created_by="ai-colleague-stage3", assignee="builder", completion_contract="acme/repo",
+        branch_name=workspace_branch, workspace_kind="worktree")
+    task = kb.claim_task(conn, task_id, claimer="builder:test")
+    assert task is not None
+    return task_id, task
+
+
+def test_wave2_intent_is_durable_one_attempt_and_bad_creation_fails_closed(conn):
+    import json
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent, wave2_enabled
+    task_id, task = _wave2_task(conn, workspace_branch=None)
+    args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    assert not record_publication_intent(conn, task_id, **{**args, "base": "unapproved"})
+    assert not record_publication_intent(conn, task_id, **{**args, "branch": "unapproved"})
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_publication_intent'", (task_id,)).fetchone()[0] == 0
+    created = conn.execute("SELECT id,payload FROM task_events WHERE task_id=? AND kind='created'", (task_id,)).fetchone()
+    origin = json.loads(created["payload"])
+    origin.pop("publication_target")
+    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (json.dumps(origin), created["id"]))
+    assert not record_publication_intent(conn, task_id, **args)
+    conn.execute("UPDATE task_events SET payload=? WHERE id=?", (created["payload"], created["id"]))
+    assert record_publication_intent(conn, task_id, **args)
+    assert record_publication_intent(conn, task_id, **args)
+    assert not record_publication_intent(conn, task_id, **{**args, "head": "b" * 40})
+    assert record_publication_intent(conn, task_id, **args, attempt=True)
+    assert not record_publication_intent(conn, task_id, **args, attempt=True)
+    conn.execute("UPDATE task_events SET payload='{' WHERE task_id=? AND kind='wave2_publication_attempt'", (task_id,))
+    assert not record_publication_intent(conn, task_id, **args, attempt=True)
+    conn.execute("DELETE FROM task_events WHERE task_id=? AND kind='created'", (task_id,))
+    assert wave2_enabled(conn, task_id)
+    for bad_contract in ("local-only", None, "malformed"):
+        conn.execute("UPDATE tasks SET completion_contract=? WHERE id=?", (bad_contract, task_id))
+        assert not kb.complete_task(conn, task_id, result="unsafe", force=True,
+                                    metadata={"published_pr": "https://github.com/acme/repo/pull/7"})
+    ordinary = kb.create_task(conn, title="ordinary", completion_contract="local-only")
+    assert kb.complete_task(conn, ordinary, result="done")
+
+
+def test_wave2_exact_handoff_and_review_run_gate(conn, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    task_id, task = _wave2_task(conn)
+    args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    assert record_publication_intent(conn, task_id, **args)
+    assert record_publication_intent(conn, task_id, **args, attempt=True)
+    url = "https://github.com/acme/repo/pull/7"
+    state = {"head": "a" * 40, "conclusion": "success"}
+    monkeypatch.setattr(acceptance, "_assignee_profile_home", lambda assignee: None)
+    def fake_api(endpoint, **kwargs):
+        head = state["head"]
+        if endpoint == "graphql":
+            return {"data": {"repository": {"pullRequest": {"headRefOid": head, "baseRefName": "main", "state": "OPEN", "baseRef": {"branchProtectionRule": {"requiredStatusChecks": [{"context": "foundation", "app": {"databaseId": 7}}]}}}}}}
+        if "/rules/branches/" in endpoint or "/statuses" in endpoint:
+            return [[]]
+        if "/check-runs" in endpoint:
+            if state.get("flip_claim"):
+                with kbc.connect_closing(db_path) as rival:
+                    rival.execute("UPDATE tasks SET claim_lock='replaced' WHERE id=?", (task_id,))
+                    rival.execute("UPDATE task_runs SET claim_lock='replaced' WHERE id=?", (review.current_run_id,))
+                state["flip_claim"] = False
+            return [{"total_count": 1, "check_runs": [{"id": 4, "name": "foundation", "head_sha": head, "app": {"id": 7}, "status": "completed", "conclusion": state["conclusion"]}]}]
+        if "/pulls/" in endpoint:
+            return {"state": "open", "draft": True, "head": {"sha": head, "ref": "topic", "repo": {"full_name": "acme/repo"}}, "base": {"ref": "main"}}
+        raise AssertionError(endpoint)
+    monkeypatch.setattr(acceptance, "_api", fake_api)
+    assert not kb.request_review(conn, task_id, reviewer="builder", expected_run_id=task.current_run_id, expected_claim_lock=task.claim_lock,
+                                 metadata={"published_pr": url, "head_sha": "a" * 40})
+    assert not kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=task.current_run_id, expected_claim_lock=task.claim_lock,
+                                 metadata={"published_pr": url, "head_sha": "b" * 40})
+    assert kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=task.current_run_id, expected_claim_lock=task.claim_lock,
+                             metadata={"published_pr": url, "head_sha": "a" * 40})
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:test")
+    assert review is not None
+    import json
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db_path if board == "default" else db_path.parent / "foreign" / "kanban.db")
+    request = 'kanban:' + json.dumps(["default", task_id, review.current_run_id], separators=(',', ':'))
+    with kb.write_txn(conn):
+        kb._append_event(conn, task_id, "owner_admitted", {"session_id": "session", "request_id": request,
+            "db": "/owner/session.db", "pid": 123, "birth": 42.0}, run_id=review.current_run_id)
+        kb._append_event(conn, task_id, "owner_admission_bound", {"session_id": "session", "request_id": request, "admission_id": "admission"}, run_id=review.current_run_id)
+    verdict = {"published_pr": url, "head_sha": "a" * 40, "review_verdict": "approved"}
+    marker = {"session_id": "session", "request_id": request, "db": "/owner/session.db", "pid": 123, "birth": 42.0}
+    for changes in ({"request_id": 'kanban:' + json.dumps(["default", "t_foreign", review.current_run_id], separators=(',', ':'))},
+                    {"request_id": 'kanban:' + json.dumps(["default", task_id, review.current_run_id + 1], separators=(',', ':'))},
+                    {"request_id": 'kanban:' + json.dumps(["foreign", task_id, review.current_run_id], separators=(',', ':'))},
+                    {"db": "relative"}, {"pid": 0}, {"birth": 0}):
+        altered = {**marker, **changes}
+        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='owner_admitted'", (json.dumps(altered), task_id))
+        conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='owner_admission_bound'", (json.dumps({"session_id": "session", "request_id": altered["request_id"], "admission_id": "admission"}), task_id))
+        assert not kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id,
+                                    expected_claim_lock=review.claim_lock, metadata=verdict)
+    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='owner_admitted'", (json.dumps(marker), task_id))
+    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='owner_admission_bound'", (json.dumps({"session_id": "session", "request_id": request, "admission_id": "admission"}), task_id))
+    assert not kb.complete_task(conn, task_id, result="done", force=True)
+    assert not kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id, expected_claim_lock=review.claim_lock,
+                                metadata={**verdict, "head_sha": "b" * 40})
+    state["flip_claim"] = True
+    assert not kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id, expected_claim_lock=review.claim_lock, metadata=verdict)
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (task_id,)).fetchone()[0] == 0
+    conn.execute("UPDATE tasks SET claim_lock=? WHERE id=?", (review.claim_lock, task_id))
+    conn.execute("UPDATE task_runs SET claim_lock=? WHERE id=?", (review.claim_lock, review.current_run_id))
+    state["head"] = "b" * 40
+    assert not kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id, expected_claim_lock=review.claim_lock, metadata=verdict)
+    state["head"] = "a" * 40
+    state["conclusion"] = "cancelled"
+    assert not kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id, expected_claim_lock=review.claim_lock, metadata=verdict)
+    state["conclusion"] = "success"
+    assert kb.complete_task(conn, task_id, result="done", expected_run_id=review.current_run_id, expected_claim_lock=review.claim_lock, metadata=verdict)
+    conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (task_id,))
+    kb.gc_events(conn, older_than_seconds=0)
+    assert conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='wave2_verdict'", (task_id,)).fetchone()
+
+
+def test_wave2_attempt_serializes_two_independent_connections(conn):
+    import threading
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+
+    task_id, task = _wave2_task(conn)
+    args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    assert record_publication_intent(conn, task_id, **args)
+    path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    barrier = threading.Barrier(2)
+    outcomes = []
+
+    def attempt():
+        with kbc.connect_closing(path) as other:
+            barrier.wait(timeout=5)
+            outcomes.append(record_publication_intent(other, task_id, **args, attempt=True))
+
+    threads = [threading.Thread(target=attempt) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=10)
+        assert not thread.is_alive()
+    assert sorted(outcomes) == [False, True]
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_publication_attempt'", (task_id,)).fetchone()[0] == 1
+
+
+def test_wave2_intent_refuses_invalid_or_expired_claim_timestamp(conn):
+    from datetime import UTC, datetime, timedelta
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+
+    task_id, task = _wave2_task(conn)
+    args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    for invalid in ("invalid", "2000-01-01T00:00:00Z"):
+        conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (invalid, task_id))
+        assert not record_publication_intent(conn, task_id, **args)
+    future = (datetime.now(UTC) + timedelta(minutes=5)).isoformat()
+    conn.execute("UPDATE tasks SET claim_expires=? WHERE id=?", (future, task_id))
+    assert record_publication_intent(conn, task_id, **args)
+
+
+def test_wave2_first_handoff_cannot_move_attempt_to_another_run(conn, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    monkeypatch.setattr(acceptance, "verify_publication", lambda *args, **kwargs: True)
+    for new_head in ("a" * 40, "b" * 40):
+        task_id, first = _wave2_task(conn)
+        args = dict(run_id=first.current_run_id, claim_lock=first.claim_lock, repo="acme/repo",
+                    base="main", branch="topic", head="a" * 40)
+        assert record_publication_intent(conn, task_id, **args, attempt=True)
+        assert kb.block_task(conn, task_id, reason="interrupted", expected_run_id=first.current_run_id)
+        assert kb.unblock_task(conn, task_id)
+        second = kb.claim_task(conn, task_id, claimer="builder:second")
+        assert second is not None
+        assert record_publication_intent(conn, task_id, **{**args, "run_id": second.current_run_id,
+            "claim_lock": second.claim_lock, "head": new_head})
+        assert not kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=second.current_run_id,
+            expected_claim_lock=second.claim_lock, metadata={"published_pr": "https://github.com/acme/repo/pull/7", "head_sha": new_head})
+        assert kb.get_task(conn, task_id).status == "running"
+
+
+def test_wave2_gc_preserves_only_selected_task_owner_events(conn):
+    wave_task, _ = _wave2_task(conn)
+    ordinary = kb.create_task(conn, title="ordinary", completion_contract="local-only")
+    for tid in (wave_task, ordinary):
+        kb._append_event(conn, tid, "owner_admitted", {"session_id": "x"})
+        kb._append_event(conn, tid, "owner_admission_bound", {"admission_id": "x"})
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+        conn.execute("UPDATE task_events SET created_at=0 WHERE task_id=?", (tid,))
+    kb.gc_events(conn, older_than_seconds=0)
+    kinds = lambda tid: {row[0] for row in conn.execute("SELECT kind FROM task_events WHERE task_id=?", (tid,))}
+    assert {"owner_admitted", "owner_admission_bound"} <= kinds(wave_task)
+    assert not ({"owner_admitted", "owner_admission_bound"} & kinds(ordinary))
+
+
+def test_wave2_first_attempt_head_cannot_be_rewritten(conn, monkeypatch):
+    import json
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    task_id, task = _wave2_task(conn)
+    args = dict(run_id=task.current_run_id, claim_lock=task.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    assert record_publication_intent(conn, task_id, **args, attempt=True)
+    changed = {"repo": "acme/repo", "base": "main", "branch": "topic", "head": "b" * 40, "implementer": "builder"}
+    conn.execute("UPDATE task_events SET payload=? WHERE task_id=? AND kind='wave2_publication_intent'", (json.dumps(changed), task_id))
+    monkeypatch.setattr(acceptance, "verify_publication", lambda *args, **kwargs: True)
+    assert not kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=task.current_run_id,
+        expected_claim_lock=task.claim_lock, metadata={"published_pr": "https://github.com/acme/repo/pull/7", "head_sha": "b" * 40})
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_handoff'", (task_id,)).fetchone()[0] == 0
+
+
+def test_wave2_new_head_allowed_only_after_bound_original_review(conn, monkeypatch):
+    import json
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    task_id, first = _wave2_task(conn)
+    args = dict(run_id=first.current_run_id, claim_lock=first.claim_lock, repo="acme/repo",
+                base="main", branch="topic", head="a" * 40)
+    assert record_publication_intent(conn, task_id, **args, attempt=True)
+    monkeypatch.setattr(acceptance, "verify_publication", lambda *args, **kwargs: True)
+    url = "https://github.com/acme/repo/pull/7"
+    assert kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=first.current_run_id,
+        expected_claim_lock=first.claim_lock, metadata={"published_pr": url, "head_sha": "a" * 40})
+    review = kb.claim_review_task(conn, task_id, claimer="reviewer:test")
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    monkeypatch.setattr(kb, "kanban_db_path", lambda board=None: db_path)
+    request = 'kanban:' + json.dumps(["default", task_id, review.current_run_id], separators=(',', ':'))
+    kb._append_event(conn, task_id, "owner_admitted", {"session_id": "session", "request_id": request,
+        "db": "/owner/session.db", "pid": 123, "birth": 42.0}, run_id=review.current_run_id)
+    kb._append_event(conn, task_id, "owner_admission_bound", {"session_id": "session", "request_id": request,
+        "admission_id": "admission"}, run_id=review.current_run_id)
+    assert kb.request_changes(conn, task_id, reason="fix", expected_run_id=review.current_run_id,
+                              expected_claim_lock=review.claim_lock) == (True, "builder")
+    second = kb.claim_task(conn, task_id, claimer="builder:second")
+    assert record_publication_intent(conn, task_id, **{**args, "run_id": second.current_run_id,
+        "claim_lock": second.claim_lock, "head": "b" * 40})
+    assert kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=second.current_run_id,
+        expected_claim_lock=second.claim_lock, metadata={"published_pr": url, "head_sha": "b" * 40})
+
+
+def test_wave2_handoff_rechecks_claim_after_remote_read(conn, monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    task_id, task = _wave2_task(conn)
+    assert record_publication_intent(conn, task_id, run_id=task.current_run_id, claim_lock=task.claim_lock,
+        repo="acme/repo", base="main", branch="topic", head="a" * 40, attempt=True)
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    def revoke_during_remote(*args, **kwargs):
+        with kbc.connect_closing(db_path) as rival:
+            rival.execute("UPDATE tasks SET claim_lock='replaced' WHERE id=?", (task_id,))
+            rival.execute("UPDATE task_runs SET claim_lock='replaced' WHERE id=?", (task.current_run_id,))
+        return True
+    monkeypatch.setattr(acceptance, "verify_publication", revoke_during_remote)
+    assert not kb.request_review(conn, task_id, reviewer="reviewer", expected_run_id=task.current_run_id,
+        expected_claim_lock=task.claim_lock, metadata={"published_pr": "https://github.com/acme/repo/pull/7", "head_sha": "a" * 40})
+    assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_handoff'", (task_id,)).fetchone()[0] == 0
+    assert kb.get_task(conn, task_id).status == "running"

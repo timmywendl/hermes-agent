@@ -69,6 +69,41 @@ def build_kanban_policy(connection, params, config):
                    request_json=json.dumps(request, sort_keys=True), kanban_json=json.dumps(context)), private
 
 
+def _bind_owner_admission(conn, params, session_id, request_id, admission_id):
+    """Durably bind a returned admission without ever taking over a replaced claim."""
+    from hermes_cli import kanban_db as kb
+    if (any(not isinstance(v, str) or not v for v in (session_id, request_id, admission_id,
+                                                     params.get('task_id'), params.get('claim_lock')))
+            or type(params.get('run_id')) is not int or params['run_id'] < 1):
+        raise RuntimeStoreError('unknown_execution')
+    with kb.write_txn(conn):
+        task = kb.get_task(conn, params['task_id'])
+        run = conn.execute('SELECT claim_lock FROM task_runs WHERE task_id=? AND id=?',
+                           (params['task_id'], params['run_id'])).fetchone()
+        if task is None or run is None or run['claim_lock'] != params['claim_lock']:
+            raise RuntimeStoreError('unknown_execution')
+        rows = conn.execute("SELECT kind,payload FROM task_events WHERE task_id=? AND run_id=? "
+                            "AND kind IN ('owner_admitted','owner_admission_bound') ORDER BY id",
+                            (task.id, params['run_id'])).fetchall()
+        try:
+            markers = [json.loads(r['payload']) for r in rows if r['kind'] == 'owner_admitted']
+            bindings = [json.loads(r['payload']) for r in rows if r['kind'] == 'owner_admission_bound']
+        except (ValueError, TypeError, KeyError) as exc:
+            raise RuntimeStoreError('unknown_execution') from exc
+        expected = {'session_id': session_id, 'request_id': request_id, 'admission_id': admission_id}
+        if (len(markers) != 1 or not isinstance(markers[0], dict)
+                or any(markers[0].get(k) != expected[k] for k in ('session_id', 'request_id'))
+                or len(bindings) > 1 or any(not isinstance(x, dict) or x != expected for x in bindings)):
+            raise RuntimeStoreError('unknown_execution')
+        # An exact existing receipt is read-only even after this Run ended or was superseded.
+        if bindings:
+            return
+        if not (task.status == 'running' and task.current_run_id == params['run_id']
+                and task.claim_lock == params['claim_lock']):
+            raise RuntimeStoreError('unknown_execution')
+        kb._append_event(conn, task.id, 'owner_admission_bound', expected, run_id=params['run_id'])
+
+
 async def run_task(connection, params):
     if not connection.native_owner or 'session:create' not in connection.actor.capabilities:
         raise RuntimeStoreError('permission_denied')
@@ -124,10 +159,32 @@ async def run_task(connection, params):
                     raise RuntimeStoreError('stale_kanban_claim')
                 kb._append_event(conn, task.id, 'owner_admitted',
                     {'db': owner_db, 'session_id': ref.session_id,
-                     'request_id': request_id, 'pid': os.getpid(), 'birth': psutil.Process().create_time()},
+                     'request_id': request_id, 'pid': os.getpid(), 'birth': psutil.Process().create_time(),
+                     'instance_id': authority.instance_id, 'authority_epoch': authority.epoch},
                     run_id=task.current_run_id)
+            from hermes_cli.kanban_pr_acceptance_store import wave2_enabled
+            enabled = wave2_enabled(conn, params['task_id'])
+            if enabled:
+                from hermes_cli.kanban_pr_acceptance import _PR, _REPO
+                task = conn.execute('SELECT created_by,completion_contract FROM tasks WHERE id=?',
+                                    (params['task_id'],)).fetchone()
+                created = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind='created'",
+                                       (params['task_id'],)).fetchall()
+                try:
+                    origin = json.loads(created[0]['payload']) if len(created) == 1 else None
+                    repo = origin.get('completion_contract') if isinstance(origin, dict) else None
+                    contract = task['completion_contract'] if task else None
+                    match = _PR.fullmatch(contract) if isinstance(contract, str) else None
+                    valid = (task and task['created_by'] == 'ai-colleague-stage3' and isinstance(repo, str)
+                             and _REPO.fullmatch(repo) and origin.get('publication_protocol') == 'wave2_v1'
+                             and (contract == repo or (match and match[1] == repo)))
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    raise RuntimeStoreError('unknown_execution')
+            return enabled
     from gateway.session_runtime_workers import tracked_write
-    await tracked_write(authority, admit_claim)
+    wave2 = await tracked_write(authority, admit_claim)
     await connection.resume(ref, {})
     # Finite like the `chat -q` worker it replaced: nobody can answer an approval or clarify in a
     # card (approvals.single_query_mode applies). Never unattended: that is `-z`'s auto-approval.
@@ -140,6 +197,11 @@ async def run_task(connection, params):
     if committed is None or 'finite' in committed['payload']:
         payload['finite'] = True
     receipt = await authority.submit(connection.actor, Submission(request_id, ref, payload, 'queue'))
+    if wave2:
+        def bind_admission():
+            with connect_closing(Path(context['db'])) as conn:
+                _bind_owner_admission(conn, params, ref.session_id, request_id, receipt.admission_id)
+        await tracked_write(authority, bind_admission)
     return {'session_id': ref.session_id, 'receipt': asdict(receipt)}
 
 

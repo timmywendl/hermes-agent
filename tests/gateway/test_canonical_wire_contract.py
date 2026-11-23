@@ -54,3 +54,42 @@ async def test_declared_params_gate_canonical_verbs_before_their_handlers(owner)
         assert db.get_session('s')['title'] == 'Declared'
     finally:
         await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_finish_projection_is_authorized_and_requires_explicit_receipt(owner, monkeypatch):
+    from hermes_state_runtime import admit_session_input, claim_session_input, mutate_worker_execution, register_worker_execution
+
+    connection, db = owner
+    authority = connection.authority
+    import json
+    context = dict(board='owned', task_id='t_abc', run_id=1, claim_lock='private-claim')
+    request = 'kanban:' + json.dumps(['owned', 't_abc', 1], separators=(',', ':'))
+    monkeypatch.setattr('hermes_state_local.local_receipt', lambda *_: {'policy': {}})
+    monkeypatch.setattr('gateway.session_policy.restore_policy', lambda _: SimpleNamespace(source='kanban', kanban_json=json.dumps(context)))
+    admitted = admit_session_input(db, epoch=authority.epoch, principal_id=connection.actor.subject,
+        session_id='s', request_id=request, payload={'text': 'work'})
+    claimed = claim_session_input(db, epoch=authority.epoch, session_id='s')
+    scope = dict(epoch=authority.epoch, execution_id='admission-worker:' + admitted['admission_id'],
+                 session_id='s', generation=claimed['generation'])
+    register_worker_execution(db, **scope, kind='compute', adoption_secret='private-proof')
+    params = dict(session_id='s', admission_id=admitted['admission_id'], include_worker_finish=True)
+    async def query(client):
+        return await client.dispatch({'id': 2, 'method': 'prompt.receipt', 'params': params})
+    before = await query(connection)
+    assert before['result']['worker_finish'] == dict(receipt='UNKNOWN', ack='UNKNOWN', physical_retirement='UNKNOWN')
+    mutate_worker_execution(db, **scope, sequence=1, operation='execution.finish', payload={})
+    after = await query(connection)
+    assert after['result']['worker_finish'] == dict(receipt='RECORDED', ack='UNKNOWN', physical_retirement='UNKNOWN')
+    assert 'private-proof' not in str(after)
+    context['run_id'] = 2
+    assert (await query(connection))['result']['worker_finish']['receipt'] == 'UNKNOWN'
+    context['run_id'] = 1
+    monkeypatch.setattr('gateway.session_policy.restore_policy', lambda _: SimpleNamespace(source='cli', kanban_json=json.dumps(context)))
+    assert (await query(connection))['result']['worker_finish']['receipt'] == 'UNKNOWN'
+    foreign = AuthorityConnection(authority, object(), {'user_id': 'foreign', 'capabilities': ['session:submit']})
+    try:
+        denied = await query(foreign)
+        assert denied['error']['data']['reason'] == 'permission_denied'
+    finally:
+        await foreign.close()

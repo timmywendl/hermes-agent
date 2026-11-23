@@ -1,5 +1,6 @@
 """Authenticated WS projection of the gateway authority; no TUI execution fallback."""
 import asyncio
+import json
 import logging
 import re
 from dataclasses import asdict
@@ -65,6 +66,26 @@ _PROFILE_IMPLICIT = frozenset({'session.create', 'session.list', 'session.info',
                                'prompt.submit', 'prompt.receipt', 'prompt.cancel', 'prompt.resolve_unknown',
                                'session.interrupt', 'session.events.since', 'session.mutate', 'session.stats',
                                'approval.respond', 'clarify.respond'})
+
+
+def _kanban_finish_projection(db, *, admission_id, session_id, profile_home):
+    """After receipt authorization, derive the request from the Owner's frozen policy."""
+    from hermes_state_local import local_receipt
+    from hermes_state_terminal import owner_finish_projection
+    from gateway.session_policy import restore_policy
+    unknown = {'receipt': 'UNKNOWN', 'ack': 'UNKNOWN', 'physical_retirement': 'UNKNOWN'}
+    try:
+        policy = restore_policy(local_receipt(db, session_id)['policy'])
+        context = json.loads(policy.kanban_json or '{}')
+        if (policy.source != 'kanban' or not isinstance(context, dict)
+                or any(not isinstance(context.get(k), str) or not context[k] for k in ('board', 'task_id', 'claim_lock'))
+                or type(context.get('run_id')) is not int):
+            return unknown
+        request = 'kanban:' + json.dumps([context['board'], context['task_id'], context['run_id']], separators=(',', ':'))
+        return owner_finish_projection(db, admission_id=admission_id, session_id=session_id,
+                                       expected_request_id=request, profile_home=profile_home)
+    except (RuntimeStoreError, ValueError, TypeError, KeyError, AttributeError):
+        return unknown
 
 
 def display_projection(history, profile_home):
@@ -592,6 +613,10 @@ class AuthorityConnection:
     async def receipt(self, ref, params):
         receipt = await self.authority.receipt(self.actor, ref, params.get('admission_id'))
         out = asdict(receipt)
+        if params.get('include_worker_finish') is True:
+            # authority.receipt has already checked actor, target and admission principal.
+            out['worker_finish'] = await asyncio.to_thread(_kanban_finish_projection, self.authority.db,
+                admission_id=receipt.admission_id, session_id=ref.session_id, profile_home=self.authority.profile_id)
         if params.get('include_result') is True and receipt.status == 'terminal':
             # The exact structured result the turn committed with settlement (`finish_result`):
             # a finite viewer reads its ledger (tokens, cost, model, exit reason) from here, the same

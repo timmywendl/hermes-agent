@@ -148,3 +148,70 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
             store._outbox_owner.close()
     finally:
         db.close()
+
+
+def test_verified_finish_ack_requires_exact_durable_outbox(tmp_path, monkeypatch):
+    from agent.managed_worker import outbox_dir
+    from hermes_state import SessionDB
+    from hermes_state_runtime import (admit_session_input, admission_fingerprint, begin_runtime_epoch,
+                                      claim_session_input, mutate_worker_execution, register_worker_execution)
+    from hermes_state_terminal import owner_finish_projection
+
+    with SessionDB(tmp_path / 'state.db') as db:
+        db.create_session('s', source='cli')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
+        admission = admit_session_input(db, epoch=epoch, principal_id='human', session_id='s', request_id='task', payload={})
+        claimed = claim_session_input(db, epoch=epoch, session_id='s')
+        scope = dict(profile_id=str(tmp_path), session_id='s', execution_id='admission-worker:' + admission['admission_id'],
+                     generation=claimed['generation'], pid=os.getpid(), birth=1.0, secret='synthetic-private-secret', epoch=epoch)
+        claim = admission_fingerprint(canonical_target='s', payload={**{k: v for k, v in scope.items() if k != 'epoch'}, 'principal': 'human'})
+        register_worker_execution(db, epoch=epoch, execution_id=scope['execution_id'], session_id='s',
+                                  generation=scope['generation'], kind='compute', adoption_secret=claim)
+        def rpc(method, **params):
+            assert method == 'worker.persist'
+            return mutate_worker_execution(db, **{k: params[k] for k in ('epoch', 'execution_id', 'session_id', 'generation', 'sequence', 'operation', 'payload')})
+        store = RuntimeSessionStore(rpc, scope, outbox_dir(tmp_path, scope['execution_id']))
+        def projection():
+            return owner_finish_projection(db, admission_id=admission['admission_id'], session_id='s', expected_request_id='task', profile_home=tmp_path)
+        try:
+            store.finish()
+            assert projection() == dict(receipt='RECORDED', ack='RECORDED', physical_retirement='UNKNOWN')
+            original = json.loads(store.path.read_text())
+            for changed in ({**original, 'pending': [{'sequence': 1, 'operation': 'execution.finish', 'payload': {}}]},
+                            {**original, 'next_sequence': original['next_sequence'] + 1},
+                            {**original, 'scope': {**original['scope'], 'secret': 'forged-private-secret'}}):
+                store.path.write_text(json.dumps(changed))
+                assert projection()['ack'] == 'UNKNOWN'
+            store.path.write_text(json.dumps(original))
+            # A FIFO must be rejected without waiting for a writer.
+            if hasattr(os, 'mkfifo'):
+                import threading
+                store.path.unlink()
+                os.mkfifo(store.path, 0o600)
+                observed = []
+                thread = threading.Thread(target=lambda: observed.append(projection()), daemon=True)
+                thread.start()
+                thread.join(timeout=2)
+                stalled = thread.is_alive()
+                if stalled:
+                    writer = os.open(store.path, os.O_WRONLY | os.O_NONBLOCK)
+                    os.close(writer)
+                    thread.join(timeout=2)
+                assert not stalled, 'opening an untrusted FIFO blocked the Owner read'
+                assert observed[0]['ack'] == 'UNKNOWN'
+                store.path.unlink()
+                store.path.write_text(json.dumps(original))
+                store.path.chmod(0o600)
+            # Simulate an atomic replacement between fd snapshot and pathname recheck.
+            real_stat = os.stat
+            def replaced(path, *args, **kwargs):
+                if path == 'pending.json' and kwargs.get('dir_fd') is not None:
+                    replacement = store.path.with_name('replacement')
+                    replacement.write_text(json.dumps(original))
+                    replacement.chmod(0o600)
+                    os.replace(replacement, store.path)
+                return real_stat(path, *args, **kwargs)
+            monkeypatch.setattr(os, 'stat', replaced)
+            assert projection()['ack'] == 'UNKNOWN'
+        finally:
+            store.close()

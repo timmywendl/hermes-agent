@@ -32,7 +32,24 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
-from hermes_cli.kanban_parser import build_parser
+from hermes_cli.kanban_parser import build_parser as _build_parser
+
+
+def build_parser(parent_subparsers):
+    """Add the cooperative publication fence to the existing Kanban CLI."""
+    parser = _build_parser(parent_subparsers)
+    subcommands = next(a for a in parser._actions
+                       if isinstance(a, argparse._SubParsersAction) and a.dest == "kanban_action")
+    publish = subcommands.add_parser("publication-intent", help="Record a scoped cooperative publication intent")
+    publish.add_argument("task_id")
+    publish.add_argument("--repo", required=True)
+    publish.add_argument("--base", required=True)
+    publish.add_argument("--branch", required=True)
+    publish.add_argument("--head", required=True)
+    mode = publish.add_mutually_exclusive_group()
+    mode.add_argument("--attempt", action="store_true", help="Spend the single automatic PR-create attempt")
+    mode.add_argument("--reconcile", action="store_true", help="Read back an exact PR after a spent attempt")
+    return parser
 
 
 # --- Flag parsing helpers ---
@@ -177,6 +194,8 @@ def kanban_command(args: argparse.Namespace) -> int:
         board_scope = kb.scoped_current_board(normed)
 
     with board_scope:
+        if action == "publication-intent" and getattr(args, "reconcile", False):
+            return _cmd_publication_intent(args)
         # `repair` dispatches BEFORE auto-init: on a corrupt DB init_db() itself raises
         # KanbanDbCorruptError, which would turn every repair into "could not initialize database".
         if action == "repair":
@@ -210,7 +229,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "publication-intent",
     "gc",
 })
 
@@ -924,6 +943,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
+                                        expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
@@ -1035,6 +1055,122 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _publication_recovery_grant(path):
+    """Use the existing profile's Task Grant; same-UID access remains cooperative."""
+    import copy
+    from hermes_cli.managed_scope import _DEFAULT_MANAGED_DIR, _under_pytest, get_managed_dir
+    from hermes_cli.plugins_state import _plugin_settings_entry
+    from hermes_constants import get_hermes_home
+    from hermes_yaml import YAMLError, safe_load
+    managed = get_managed_dir()
+    # The effective loader writes backups. This diagnostic uses literal profile
+    # settings and refuses managed overlays, whose effective grant is unproven here.
+    if managed is None and os.environ.get('HERMES_MANAGED_DIR', '').strip():
+        return None
+    if managed is None and not _under_pytest():
+        try:
+            _DEFAULT_MANAGED_DIR.stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        else:
+            return None
+    if managed is not None:
+        try:
+            (managed / 'config.yaml').stat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return None
+        else:
+            return None
+    try:
+        with (get_hermes_home() / 'config.yaml').open(encoding='utf-8-sig') as source:
+            config = safe_load(source)
+    except (OSError, UnicodeError, YAMLError, TypeError, ValueError):
+        return None
+    plugins = config.get('plugins') if isinstance(config, dict) else None
+    if not isinstance(plugins, dict) or not isinstance(plugins.get('enabled'), list) or 'ai-colleague-k1' not in plugins['enabled']:
+        return None
+    disabled = plugins.get('disabled', [])
+    if not isinstance(disabled, list) or 'ai-colleague-k1' in disabled:
+        return None
+    entry = _plugin_settings_entry(config, 'ai-colleague-k1') or {}
+    settings = entry.get('settings', entry.get('config', {}))
+    grant = settings.get('grant') if isinstance(settings, dict) else None
+    work = grant.get('work_item') if isinstance(grant, dict) else None
+    fields = {'enabled', 'root_id', 'repo', 'objective_id', 'work_key', 'completion_contract',
+              'decision_ref', 'title', 'instructions', 'acceptance_criteria', 'publication_target'}
+    if (not isinstance(grant, dict) or grant.get('enabled') is not True or grant.get('allow_read') is not True
+            or '${' in json.dumps(grant, ensure_ascii=False)
+            or not isinstance(work, dict) or work.get('enabled') is not True
+            or not fields <= set(work) or set(work) - fields - {'workspace_admission'}
+            or not isinstance(grant.get('decision_ref'), str) or not grant['decision_ref'].strip()
+            or any(not isinstance(work.get(k), str) or not work[k].strip()
+                   for k in ('repo', 'objective_id', 'work_key', 'root_id', 'decision_ref', 'completion_contract', 'title', 'instructions', 'acceptance_criteria'))
+            or any(grant.get(k) != work.get(k) for k in ('repo', 'objective_id'))
+            or not isinstance(grant.get('profile_home'), str) or not isinstance(grant.get('db_path'), str)
+            or Path(grant['profile_home']) != get_hermes_home().resolve()
+            or Path(grant['db_path']) != path):
+        return None
+    return copy.deepcopy(grant)
+
+
+def _cmd_publication_intent(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_pr_acceptance import publication_ready, reconcile_publication
+    from hermes_cli.kanban_pr_acceptance_store import publication_recovery_snapshot, record_publication_intent
+    if args.reconcile:
+        import sqlite3
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        # This read-only operator path never adopts an old effect into a new Run.
+        if any(os.environ.get(k) for k in ('HERMES_KANBAN_TASK', 'HERMES_KANBAN_RUN_ID', 'HERMES_KANBAN_CLAIM_LOCK')):
+            return _err("publication recovery is operator-only")
+        try:
+            path = kb.kanban_db_path().resolve()
+            grant = _publication_recovery_grant(path)
+            if grant is None:
+                return _err("publication UNKNOWN; Task Grant required")
+            with contextlib.closing(connect_tracked(path.as_uri() + '?mode=ro', connect_fn=sqlite3.connect,
+                                                    uri=True, isolation_level=None)) as conn:
+                snapshot = publication_recovery_snapshot(conn, args.task_id, grant)
+                if not snapshot or snapshot[2] != {'repo': args.repo, 'base': args.base, 'branch': args.branch} or snapshot[3] != args.head:
+                    return _err("publication UNKNOWN; do not create another PR")
+                _, original_run, target, head, _profile, contract, intent_id, attempt_id = snapshot
+                # Recovery is the granted operator's GitHub read, not the old
+                # Worker's credential context or an adoption of its authority.
+                url = reconcile_publication(**target, head=head, assignee=None)
+                if (not url or (contract != target['repo'] and contract != url)
+                        or _publication_recovery_grant(path) != grant
+                        or publication_recovery_snapshot(conn, args.task_id, grant) != snapshot):
+                    return _err("publication UNKNOWN; do not create another PR")
+        except (OSError, sqlite3.Error, ValueError, TypeError, RuntimeError):
+            return _err("publication UNKNOWN; do not create another PR")
+        _print_json({'status': 'MATCHED_READ_ONLY', 'task_id': args.task_id, 'original_run_id': original_run,
+                     'intent_id': intent_id, 'attempt_id': attempt_id, **target, 'head': head, 'pr_url': url})
+        return 0
+    run_id = _worker_run_id_for(args.task_id)
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if run_id is None or not claim_lock:
+        return _err("publication intent requires the original claimed Task/Run")
+    with kbc.connect_closing() as conn:
+        values = dict(run_id=run_id, claim_lock=claim_lock, repo=args.repo, base=args.base,
+                      branch=args.branch, head=args.head)
+        if not record_publication_intent(conn, args.task_id, **values):
+            return _err("publication intent refused; reconcile the original Task/Run")
+        if args.attempt:
+            spent = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='wave2_publication_attempt'",
+                                 (args.task_id,)).fetchone()
+            task = kb.get_task(conn, args.task_id)
+            if spent or not task or not publication_ready(args.repo, args.base, args.branch, args.head,
+                                                          assignee=task.assignee):
+                return _err("publication UNKNOWN or already attempted; reconcile without creating another PR")
+            if not record_publication_intent(conn, args.task_id, **values, attempt=True):
+                return _err("publication reservation lost; reconcile without creating another PR")
+    print("Publication create attempt reserved" if args.attempt else "Publication intent recorded")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1050,7 +1186,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid), expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+            force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1063,7 +1200,8 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+                                        expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
@@ -1331,6 +1469,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "publication-intent": _cmd_publication_intent,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

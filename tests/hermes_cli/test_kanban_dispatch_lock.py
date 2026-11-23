@@ -79,3 +79,81 @@ def test_lock_is_board_scoped(conn):
             assert held_b is True, "a lock on a different board must be independent"
 
 
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_target_dispatch_does_not_touch_sibling_or_run_board_reclaim(conn, monkeypatch, lane):
+    """An explicitly selected task must not promote/reap other Board rows."""
+    target = _task_in_lane(conn, lane)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+    sibling = kb.create_task(conn, title="sibling", assignee="w", initial_status="blocked")
+    before = tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (sibling,)).fetchone())
+    events = [tuple(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=?", (sibling,))]
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _: True)
+    monkeypatch.setattr(kbd, "_run_reclaim_phase", lambda *a, **k: pytest.fail("board-wide reclaim"))
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
+    spawned = []
+    result = kbd.dispatch_once(conn, target_task_id=target,
+                               spawn_fn=lambda task, workspace: spawned.append(task.id))
+    assert spawned == [target]
+    assert [r[0] for r in result.spawned] == [target]
+    assert tuple(conn.execute("SELECT * FROM tasks WHERE id=?", (sibling,)).fetchone()) == before
+    assert [tuple(r) for r in conn.execute("SELECT * FROM task_events WHERE task_id=?", (sibling,))] == events
+
+
+@pytest.mark.parametrize("lane", ["ready", "review"])
+@pytest.mark.parametrize("change", ["assignee", "lane"])
+def test_target_dispatch_rechecks_selection_inside_claim(conn, monkeypatch, lane, change):
+    target = _task_in_lane(conn, lane)
+    monkeypatch.setattr(kbd, "review_dispatch_enabled", lambda: True)
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
+
+    def profile_exists(profile):
+        assert profile == "w"
+        with kbc.connect() as other, kb.write_txn(other):
+            assert other is not conn
+            if change == "assignee":
+                other.execute("UPDATE tasks SET assignee='other' WHERE id=?", (target,))
+            else:
+                other.execute("UPDATE tasks SET status=? WHERE id=?",
+                              ("review" if lane == "ready" else "ready", target))
+        return True
+
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: profile_exists)
+    result = kbd.dispatch_once(conn, target_task_id=target,
+                               spawn_fn=lambda *args: pytest.fail("spawned stale selection"))
+    assert not result.spawned
+    assert kb.get_task(conn, target).claim_lock is None
+    assert conn.execute("SELECT count(*) FROM task_runs WHERE task_id=?", (target,)).fetchone()[0] == 0
+
+
+def _task_in_lane(conn, lane):
+    target = kb.create_task(conn, title="target", assignee="w")
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET status=? WHERE id=?", (lane, target))
+    return target
+
+
+def test_target_dispatch_rejects_unretired_run_and_contended_lock(conn, monkeypatch):
+    target = kb.create_task(conn, title="target", assignee="w")
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda _: True)
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
+    calls = []
+    with kbc._dispatch_tick_lock(kb.kanban_db_path()) as held:
+        assert held
+        res = kbd.dispatch_once(conn, target_task_id=target, spawn_fn=lambda *a: calls.append(a))
+    assert res.skipped_locked and not calls
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET current_run_id=123 WHERE id=?", (target,))
+    res = kbd.dispatch_once(conn, target_task_id=target, spawn_fn=lambda *a: calls.append(a))
+    assert not res.spawned and not calls
+
+
+def test_target_dispatch_refuses_wrong_board_connection(conn, tmp_path):
+    import sqlite3
+    other = sqlite3.connect(tmp_path / "foreign.db")
+    try:
+        with pytest.raises(RuntimeError, match="connection does not match"):
+            kbd.dispatch_once(other, target_task_id="t_example")
+    finally:
+        other.close()

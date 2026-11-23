@@ -6,6 +6,123 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.parametrize('mode', ['approved', 'changes_requested', 'failure', 'timeout',
+                                 'invalid', 'head_drift', 'remote_drift'])
+def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
+    import os
+    import subprocess
+    import sys
+    from contextlib import closing
+
+    from gateway import session_kanban as sk
+    from hermes_cli import kanban_db as kb, kanban_pr_acceptance as acceptance
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_state_runtime import RuntimeStoreError
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    workspace = tmp_path / 'candidate'
+    workspace.mkdir()
+
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(workspace), *args], text=True).strip()
+
+    git('init')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'base')
+    base = git('rev-parse', 'HEAD')
+    (workspace / 'candidate.txt').write_text('fixture change\n')
+    git('add', 'candidate.txt')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'candidate')
+    head = git('rev-parse', 'HEAD')
+    url = 'https://github.com/test/example/pull/1'
+    calls = tmp_path / 'claude-calls'
+    cli = tmp_path / 'fake-claude'
+    cli.write_text(f'#!{sys.executable}\n'
+                   'import json, os, pathlib, subprocess, sys, time\n'
+                   f'assert os.getcwd() == {str(workspace)!r}\n'
+                   f'assert os.environ["CLAUDE_CONFIG_DIR"] == {str(tmp_path)!r}\n'
+                   'prompt = sys.stdin.read()\n'
+                   f'assert {head!r} in prompt and {url!r} in prompt\n'
+                   'assert "+fixture change" in prompt\n'
+                   f'with open({str(calls)!r}, "a") as f: f.write("call\\n")\n'
+                   f'mode = {mode!r}\n'
+                   'if mode == "failure": sys.exit(2)\n'
+                   'if mode == "timeout": time.sleep(10)\n'
+                   'if mode == "head_drift":\n'
+                   '    subprocess.run(["git","-c","user.name=Fake","-c","user.email=f@example.invalid",'
+                   '"commit","--allow-empty","-m","drift"], stdout=subprocess.DEVNULL, check=True)\n'
+                   'verdict = {"verdict": "changes_requested" if mode == "changes_requested" else '
+                   '"unexpected" if mode == "invalid" else "approved", "reason": "review evidence"}\n'
+                   'print(json.dumps(dict(type="result", subtype="success", is_error=False, '
+                   'structured_output=verdict)))\n')
+    cli.chmod(0o700)
+    kb.init_db()
+    with closing(connect()) as conn:
+        task = kb.create_task(conn, title='review target', assignee='dev')
+        dev = kb.claim_task(conn, task)
+        assert kb.request_review(conn, task, reviewer='reviewer', summary='candidate',
+                                 expected_run_id=dev.current_run_id)
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET created_by='ai-colleague-stage3', completion_contract=? WHERE id=?",
+                         ('test/example', task))
+        claimed = kb.claim_review_task(conn, task)
+        run_id, lock = claimed.current_run_id, claimed.claim_lock
+        request_id = 'kanban:' + json.dumps(['default', task, run_id], separators=(',', ':'))
+        with kb.write_txn(conn):
+            kb._append_event(conn, task, 'owner_admitted', {
+                'db': str(tmp_path / 'session.db'), 'pid': os.getpid(), 'birth': 1,
+                'request_id': request_id, 'session_id': 'native-review',
+            }, run_id=run_id)
+            kb._append_event(conn, task, 'worker_bound', {
+                'pid': os.getpid(), 'claim_lock': lock,
+            }, run_id=run_id)
+            kb._append_event(conn, task, 'wave2_handoff', {
+                'url': url, 'head': head, 'base': 'main', 'branch': 'candidate',
+                'reviewer': 'reviewer', 'implementer': 'dev',
+            }, run_id=dev.current_run_id)
+        sk._bind_owner_admission(conn, {'task_id': task, 'run_id': run_id, 'claim_lock': lock},
+                                 'native-review', request_id, 'admission')
+        monkeypatch.setattr(acceptance, '_assignee_profile_home', lambda _: None)
+        def fake_api(endpoint, **kwargs):
+            if endpoint == 'graphql':
+                protection = {'requiredStatusChecks': [{'context': 'foundation', 'app': {'databaseId': 7}}]}
+                pr = {'headRefOid': head, 'baseRefName': 'main', 'state': 'OPEN',
+                      'baseRef': {'branchProtectionRule': protection}}
+                return {'data': {'repository': {'pullRequest': pr}}}
+            if '/rules/branches/' in endpoint or '/statuses' in endpoint:
+                return [[]]
+            if '/check-runs' in endpoint:
+                return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
+                         'head_sha': head, 'app': {'id': 7}, 'status': 'completed', 'conclusion': 'success'}]}]
+            assert endpoint == 'repos/test/example/pulls/1'
+            return {
+                'state': 'open', 'draft': True,
+                'head': {'sha': base if mode == 'remote_drift' and calls.exists() else head,
+                         'ref': 'candidate', 'repo': {'full_name': 'test/example'}},
+                'base': {'sha': base, 'ref': 'main', 'repo': {'full_name': 'test/example'}},
+            }
+        monkeypatch.setattr(acceptance, '_api', fake_api)
+        context = dict(task_id=task, run_id=run_id, claim_lock=lock, db=str(kb.kanban_db_path()),
+                       workspace=str(workspace), profile='reviewer', goal_text='Inspect fixture',
+                       max_runtime_seconds=1 if mode == 'timeout' else 15,
+                       claude_review={'executable': str(cli), 'config_dir': str(tmp_path)})
+        if mode in {'approved', 'changes_requested'}:
+            result = sk._run_task_turns(None, {}, [], context)
+            assert result['final_response'] == 'review evidence'
+            task_state = kb.get_task(conn, task)
+            assert task_state.status == ('done' if mode == 'approved' else 'ready')
+            if mode == 'changes_requested':
+                assert task_state.assignee == 'dev'
+        else:
+            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed)'):
+                sk._run_task_turns(None, {}, [], context)
+            assert kb.get_task(conn, task).status == 'running'
+        assert calls.read_text() == 'call\n'
+
+
 def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     from hermes_cli import kanban_db as kb
     from hermes_cli.kanban_db_connect import connect

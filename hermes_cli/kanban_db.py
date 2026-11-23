@@ -2190,9 +2190,30 @@ def _claim_and_open_run(
     return run_id
 
 
+def _strict_dispatch_clear(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Refuse implicit recovery when a specifically selected task may have a worker."""
+    task = conn.execute(
+        "SELECT current_run_id, worker_pid FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if task is None or task["current_run_id"] is not None or task["worker_pid"] is not None:
+        return False
+    return conn.execute(
+        "SELECT 1 FROM task_runs WHERE task_id = ? "
+        "AND (ended_at IS NULL OR worker_pid IS NOT NULL) LIMIT 1", (task_id,),
+    ).fetchone() is None
+
+
+def _strict_claim_matches(conn, task_id, lane, expected_assignee):
+    return bool(expected_assignee and conn.execute(
+        "SELECT 1 FROM tasks WHERE id=? AND status=? AND assignee=? AND claim_lock IS NULL",
+        (task_id, lane, expected_assignee),
+    ).fetchone() and _strict_dispatch_clear(conn, task_id))
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, strict_dispatch: bool = False,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2203,6 +2224,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if strict_dispatch and not _strict_claim_matches(conn, task_id, "ready", expected_assignee):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2221,13 +2244,15 @@ def claim_task(
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
-    _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
+    if not strict_dispatch:
+        _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
     return claimed
 
 
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
-    claimer: Optional[str] = None,
+    claimer: Optional[str] = None, strict_dispatch: bool = False,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2236,6 +2261,8 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if strict_dispatch and not _strict_claim_matches(conn, task_id, "review", expected_assignee):
+            return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -3940,46 +3967,6 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
 # --- Stats + SLA helpers ---
 
-def board_stats(conn: sqlite3.Connection) -> dict:
-    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
-    by_status: dict[str, int] = {}
-    for row in conn.execute(
-        "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
-    ):
-        by_status[row["status"]] = int(row["n"])
-
-    by_assignee = _counts_by_assignee(conn)
-
-    oldest_row = conn.execute(
-        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
-    ).fetchone()
-    now = int(time.time())
-    oldest_ready_age = (
-        (now - int(oldest_row["ts"]))
-        if oldest_row and oldest_row["ts"] is not None else None
-    )
-
-    return {
-        "by_status": by_status,
-        "by_assignee": by_assignee,
-        "oldest_ready_age_seconds": oldest_ready_age,
-        "now": now,
-    }
-
-
-def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
-    """``{assignee: {status: n}}`` over non-archived tasks."""
-    counts: dict[str, dict[str, int]] = {}
-    for row in conn.execute(
-        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
-        "GROUP BY assignee, status"
-    ):
-        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
-    return counts
-
-
 def _to_epoch(val) -> Optional[int]:
     """Epoch seconds from int/float/numeric string/ISO-8601; None for empty/invalid."""
     if val is None:
@@ -4233,6 +4220,8 @@ from hermes_cli.kanban_db_boards import (
 )
 from hermes_cli.kanban_db_connect import (
     _INITIALIZED_PATHS,
+    _counts_by_assignee,
+    board_stats,
     init_db,
     write_txn,
 )

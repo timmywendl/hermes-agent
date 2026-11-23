@@ -1901,60 +1901,6 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
-def count_running_tasks(conn: sqlite3.Connection) -> int:
-    """Number of tasks in ``status='running'``.
-
-    Used by the multi-board sweep to count OTHER boards' workers against the
-    host-level budget — the memory-derived cap bounds the machine, not the
-    board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
-    """
-    try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
-    except Exception:
-        return 0
-
-
-def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
-    """Total ``running`` tasks across every board EXCEPT ``board``.
-
-    Caps bound the HOST, but each board's tick only sees its own DB; without
-    this a derived cap of N gets multiplied by the number of active boards.
-    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
-    board to one file) yields 0. Fails open per board.
-    """
-    try:
-        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
-    except Exception:
-        current_path = None
-    try:
-        boards = _kb.list_boards(include_archived=False)
-    except Exception:
-        return 0
-    total = 0
-    for meta in boards:
-        slug = meta.get("slug") or _kb.DEFAULT_BOARD
-        try:
-            path = _kb.kanban_db_path(board=slug).expanduser()
-            resolved = str(path.resolve())
-            if current_path is not None and resolved == current_path:
-                continue
-            if not path.exists():
-                continue
-            other = _kbc.connect(board=slug)
-            try:
-                total += count_running_tasks(other)
-            finally:
-                with contextlib.suppress(Exception):
-                    other.close()
-        except Exception:
-            continue
-    return total
-
-
 def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
@@ -1988,6 +1934,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    target_task_id: Optional[str] = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1998,6 +1945,12 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
+        if target_task_id is not None:
+            return _dispatch_one_target(conn, target_task_id, spawn_fn=spawn_fn,
+                                        dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+                                        failure_limit=failure_limit, max_spawn=max_spawn,
+                                        max_in_progress=max_in_progress,
+                                        max_in_progress_per_profile=max_in_progress_per_profile)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2016,20 +1969,58 @@ def dispatch_once(
     try:
         db_path = _kb.kanban_db_path(board=board)
     except Exception:
+        if target_task_id is not None:
+            raise RuntimeError("target dispatch requires a verified board path")
         # Must not lose the tick — fall through to an unguarded dispatch.
         result = _locked_tick()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
+    if target_task_id is not None:
+        db = conn.execute("PRAGMA database_list").fetchone()
+        if db is None or not db[2] or Path(db[2]).resolve() != db_path.resolve():
+            raise RuntimeError("target dispatch connection does not match board")
+    with _kbc._dispatch_tick_lock(db_path, required=True) if target_task_id is not None else _kbc._dispatch_tick_lock(db_path) as held:
         if not held:
             result = DispatchResult(skipped_locked=True)
         else:
             result = _locked_tick()
             # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            if target_task_id is None:
+                _kbc._maybe_checkpoint_wal(conn, db_path)
+    if target_task_id is not None:
+        return result
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+    return result
+
+
+def _dispatch_one_target(conn, task_id, *, spawn_fn, dry_run, ttl_seconds, board,
+                         failure_limit, max_spawn, max_in_progress, max_in_progress_per_profile):
+    """Dispatch an explicitly ready task without Board-wide reclaim or promotion."""
+    result = DispatchResult()
+    row = conn.execute(
+        "SELECT id, status, assignee FROM tasks WHERE id = ? AND claim_lock IS NULL", (task_id,),
+    ).fetchone()
+    if (row is None or row["status"] not in ("ready", "review") or not row["assignee"]
+            or not _kb._strict_dispatch_clear(conn, task_id)):
+        return result
+    if row["status"] == "review" and not review_dispatch_enabled():
+        return result
+    may_spawn, _ = _tick_spawn_budget(conn, result, max_spawn=max_spawn,
+                                      max_in_progress=max_in_progress, board=board, read_only=True)
+    if not may_spawn:
+        return result
+    cap = max_in_progress_per_profile if isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0 else None
+    running = {}
+    if cap is not None:
+        running[row["assignee"]] = conn.execute(
+            "SELECT count(*) FROM tasks WHERE status = 'running' AND assignee = ?", (row["assignee"],),
+        ).fetchone()[0]
+    _dispatch_lane_task(conn, row, row["assignee"], result, lane=row["status"],
+                        dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+                        failure_limit=failure_limit, spawn_fn=spawn_fn,
+                        per_profile_cap=cap, per_profile_running=running, strict_dispatch=True)
     return result
 
 
@@ -2060,6 +2051,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    strict_dispatch: bool = False,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2119,7 +2111,8 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claim_options = {"strict_dispatch": True, "expected_assignee": assignee} if strict_dispatch else {}
+    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds, **claim_options)
     if claimed is None:
         return False
     try:
@@ -2145,7 +2138,8 @@ def _dispatch_lane_task(
                 _set_worker_pid(conn, claimed.id, int(pid), run_id=claimed.current_run_id, claim_lock=claimed.claim_lock)
         _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
-        _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        if not strict_dispatch:
+            _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
         # spawn would let a task that keeps timing out loop forever. Cleared
         # only on successful completion (complete_task).
@@ -2233,6 +2227,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    read_only: bool = False,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -2257,7 +2252,9 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        other_running = (count_running_tasks_other_boards(board, read_only=True)
+                         if read_only else count_running_tasks_other_boards(board))
+        total_running = running_count + other_running
         if total_running >= max_in_progress:
             return False, None
         remaining = max_in_progress - total_running
@@ -3007,4 +3004,5 @@ def run_daemon(
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb
 from hermes_cli import kanban_db_connect as _kbc
+from hermes_cli.kanban_db_connect import count_running_tasks, count_running_tasks_other_boards
 from hermes_cli import kanban_db_workspace as _kbw

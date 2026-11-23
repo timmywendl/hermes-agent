@@ -85,6 +85,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
+            target_task_id=getattr(args, "task", None),
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),

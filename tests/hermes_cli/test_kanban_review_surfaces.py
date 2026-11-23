@@ -408,3 +408,121 @@ def test_cli_and_dashboard_receive_graph_aware_deadlock_diagnostic(
         dashboard = _compute_task_diagnostics(conn, task_ids=[parent_id])
     assert dashboard[parent_id][0]["kind"] == "review_dependency_deadlock"
     assert dashboard[parent_id][0]["data"]["waiting_child_ids"] == [child_id]
+
+
+def test_wave2_publication_cli_requires_remote_read_and_never_retries(monkeypatch, tmp_path, capsys):
+    import argparse
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="publish", body=json.dumps({"publication_protocol": "wave2_v1"}),
+            created_by="ai-colleague-stage3", assignee="builder", workspace_kind="worktree",
+            branch_name="topic", completion_contract="acme/repo")
+        task = kb.claim_task(conn, tid, claimer="builder:test")
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(task.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", task.claim_lock)
+    monkeypatch.setattr(acceptance, "_assignee_profile_home", lambda assignee: None)
+    reads = []
+    state = {"created": False}
+
+    def fake_api(endpoint, **kwargs):
+        reads.append(endpoint)
+        if "/git/ref/" in endpoint:
+            return {"object": {"sha": "a" * 40}}
+        if not state["created"]:
+            return [[]]
+        return [[{"html_url": "https://github.com/acme/repo/pull/7", "state": "open", "draft": True,
+                  "head": {"sha": "a" * 40, "ref": "topic", "repo": {"full_name": "acme/repo"}},
+                  "base": {"ref": "main"}}]]
+
+    monkeypatch.setattr(acceptance, "_api", fake_api)
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="top"))
+    argv = ["kanban", "publication-intent", tid, "--repo", "acme/repo", "--base", "main",
+            "--branch", "topic", "--head", "a" * 40]
+    assert kc.kanban_command(parser.parse_args(argv)) == 0
+    assert reads == []
+    assert kc.kanban_command(parser.parse_args(argv + ["--attempt"])) == 0
+    assert len(reads) == 2
+    assert kc.kanban_command(parser.parse_args(argv + ["--attempt"])) == 1
+    assert len(reads) == 2
+    assert "already attempted" in capsys.readouterr().err
+    # A response lost after remote success is resolved only by readback.
+    state["created"] = True
+    assert kc.kanban_command(parser.parse_args(argv + ["--reconcile"])) == 0
+    assert "https://github.com/acme/repo/pull/7" in capsys.readouterr().out
+    assert len(reads) == 4
+    assert kc.kanban_command(parser.parse_args(argv + ["--attempt"])) == 1
+
+
+def test_wave2_stale_claim_token_rejected_by_cli_and_worker_tools(monkeypatch, tmp_path):
+    import argparse
+    from hermes_cli import kanban_pr_acceptance as acceptance
+    from hermes_cli import kanban_pr_acceptance_store as store
+    from hermes_cli import profiles
+    from tools import kanban_tools as tools
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_PROFILE", "builder")
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: True)
+    monkeypatch.setattr(acceptance, "verify_publication", lambda *args, **kwargs: True)
+    monkeypatch.setattr(store, "collect_acceptance", lambda *args, **kwargs: {
+        "ok": True, "classification": "success", "head_sha": "a" * 40, "base_ref": "main", "recovery": ""})
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="publish", body=json.dumps({"publication_protocol": "wave2_v1"}),
+            created_by="ai-colleague-stage3", assignee="builder", workspace_kind="worktree",
+            branch_name="topic", completion_contract="acme/repo")
+        implementer = kb.claim_task(conn, tid, claimer="old-builder")
+        args = dict(run_id=implementer.current_run_id, claim_lock=implementer.claim_lock,
+                    repo="acme/repo", base="main", branch="topic", head="a" * 40)
+        assert store.record_publication_intent(conn, tid, **args, attempt=True)
+        conn.execute("UPDATE tasks SET claim_lock='new-builder' WHERE id=?", (tid,))
+        conn.execute("UPDATE task_runs SET claim_lock='new-builder' WHERE id=?", (implementer.current_run_id,))
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(implementer.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", implementer.claim_lock)
+    parser = argparse.ArgumentParser()
+    kc.build_parser(parser.add_subparsers(dest="top"))
+    url = "https://github.com/acme/repo/pull/7"
+    handoff = {"published_pr": url, "head_sha": "a" * 40}
+    cli_review = ["kanban", "request-review", tid, "--reviewer", "reviewer", "--metadata", json.dumps(handoff)]
+    assert kc.kanban_command(parser.parse_args(cli_review)) == 1
+    assert json.loads(tools._handle_request_review({"summary": "ready", "reviewer": "reviewer", "metadata": handoff})).get("ok") is not True
+    with kbc.connect() as conn:
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='wave2_handoff'", (tid,)).fetchone()[0] == 0
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "new-builder")
+    assert json.loads(tools._handle_request_review({"summary": "ready", "reviewer": "reviewer", "metadata": handoff}))["ok"] is True
+    with kbc.connect() as conn:
+        review = kb.claim_review_task(conn, tid, claimer="old-reviewer")
+        request = 'kanban:' + json.dumps(["default", tid, review.current_run_id], separators=(',', ':'))
+        kb._append_event(conn, tid, "owner_admitted", {"session_id": "session", "request_id": request,
+            "db": "/owner/session.db", "pid": 123, "birth": 42.0}, run_id=review.current_run_id)
+        kb._append_event(conn, tid, "owner_admission_bound", {"session_id": "session", "request_id": request,
+            "admission_id": "admission"}, run_id=review.current_run_id)
+        conn.execute("UPDATE tasks SET claim_lock='new-reviewer' WHERE id=?", (tid,))
+        conn.execute("UPDATE task_runs SET claim_lock='new-reviewer' WHERE id=?", (review.current_run_id,))
+    monkeypatch.setenv("HERMES_PROFILE", "reviewer")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review.current_run_id))
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", review.claim_lock)
+    verdict = {**handoff, "review_verdict": "approved"}
+    cli_complete = ["kanban", "complete", tid, "--result", "done", "--metadata", json.dumps(verdict)]
+    assert kc.kanban_command(parser.parse_args(cli_complete)) == 1
+    assert json.loads(tools._handle_complete({"result": "done", "metadata": verdict})).get("ok") is not True
+    with kbc.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'", (tid,)).fetchone()[0] == 0
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "new-reviewer")
+    assert json.loads(tools._handle_complete({"result": "done", "metadata": verdict}))["ok"] is True

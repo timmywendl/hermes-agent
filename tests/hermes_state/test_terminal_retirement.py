@@ -1,4 +1,5 @@
 """Deletion removes history but retains exact, scoped terminal evidence."""
+import json
 import sqlite3
 from types import SimpleNamespace
 
@@ -371,3 +372,52 @@ def test_tombstones_past_the_retry_horizon_are_reclaimed_by_the_prune_pass(tmp_p
         replay = rt.admit_session_input(db, epoch=epoch, **young)
         assert replay['admission_id'] == young_id and replay['status'] == 'terminal'
         assert admission_result(db, young_id)['result']['final_response'] == 'reply young'
+
+
+def test_owner_finish_projection_never_infers_finish_from_terminal(tmp_path):
+    from hermes_state_terminal import owner_finish_projection
+    from hermes_state_mutation_retirement import retire_terminal_receipts
+
+    with SessionDB(tmp_path / 'state.db') as db:
+        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        for sid in ('finished', 'settled'):
+            db.create_session(sid, source='cli')
+            admission = rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=sid,
+                                               request_id=sid, payload={'text': 'work'})
+            row = rt.claim_session_input(db, epoch=epoch, session_id=sid)
+            scope = dict(epoch=epoch, execution_id='admission-worker:' + admission['admission_id'],
+                         session_id=sid, generation=row['generation'])
+            rt.register_worker_execution(db, **scope, kind='compute', adoption_secret='private-proof')
+            if sid == 'finished':
+                rt.mutate_worker_execution(db, **scope, sequence=1, operation='execution.finish', payload={})
+            rt.settle_session_input(db, epoch=epoch, admission_id=admission['admission_id'],
+                                    generation=row['generation'], outcome='completed')
+            result = owner_finish_projection(db, admission_id=admission['admission_id'], session_id=sid, expected_request_id=sid, profile_home=tmp_path)
+            assert result == dict(receipt='RECORDED' if sid == 'finished' else 'UNKNOWN',
+                                  ack='UNKNOWN', physical_retirement='UNKNOWN')
+            if sid == 'finished':
+                project = lambda: owner_finish_projection(db, admission_id=admission['admission_id'], session_id=sid, expected_request_id=sid, profile_home=tmp_path)
+                db._execute_write(lambda conn: conn.execute('UPDATE session_admissions SET lineage_json=? WHERE admission_id=?', ('"s"', admission['admission_id'])))
+                assert project()['receipt'] == 'UNKNOWN'
+                db._execute_write(lambda conn: conn.execute('UPDATE session_admissions SET lineage_json=? WHERE admission_id=?', (json.dumps([sid]), admission['admission_id'])))
+                db._execute_write(lambda conn: conn.execute("UPDATE worker_executions SET status='running' WHERE execution_id=?", (scope['execution_id'],)))
+                assert project()['receipt'] == 'UNKNOWN'
+                db._execute_write(lambda conn: conn.execute("UPDATE worker_executions SET status='terminal' WHERE execution_id=?", (scope['execution_id'],)))
+                db._execute_write(lambda conn: conn.execute('UPDATE worker_executions SET last_sequence=2 WHERE execution_id=?', (scope['execution_id'],)))
+                assert project()['receipt'] == 'UNKNOWN'
+                db._execute_write(lambda conn: conn.execute('UPDATE worker_executions SET last_sequence=1 WHERE execution_id=?', (scope['execution_id'],)))
+                assert project() == result
+            db._execute_write(lambda conn: retire_terminal_receipts(conn, [sid]))
+            assert owner_finish_projection(db, admission_id=admission['admission_id'], session_id=sid, expected_request_id=sid, profile_home=tmp_path) == result
+            assert owner_finish_projection(db, admission_id=admission['admission_id'], session_id='foreign', expected_request_id=sid, profile_home=tmp_path)['receipt'] == 'UNKNOWN'
+            if sid == 'finished':
+                from hermes_state_terminal import WORKER_PREFIX
+                key = WORKER_PREFIX + scope['execution_id']
+                raw = db._read_one('SELECT value FROM state_meta WHERE key=?', (key,))[0]
+                broken = json.loads(raw)
+                for field, bad in (('execution_id', 'foreign'), ('status', 'running'), ('generation', True), ('owner_epoch', True)):
+                    copy = dict(broken, **{field: bad})
+                    db._execute_write(lambda conn: conn.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(copy), key)))
+                    assert project()['receipt'] == 'UNKNOWN'
+                db._execute_write(lambda conn: conn.execute('UPDATE state_meta SET value=? WHERE key=?', (raw, key)))
+                assert project() == result

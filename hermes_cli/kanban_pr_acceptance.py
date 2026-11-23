@@ -129,6 +129,7 @@ def collect_acceptance(contract: str, published_pr: str | None,
         pr = repository["pullRequest"]
         sha, branch = pr["headRefOid"], pr["baseRefName"]
         receipt["head_sha"] = sha
+        receipt["base_ref"] = branch
         if not re.fullmatch(r"[0-9a-f]{40}", sha) or pr["state"] not in {"OPEN", "MERGED"}:
             raise ValueError("PR is closed or current head is unavailable")
         protection = (pr.get("baseRef") or {}).get("branchProtectionRule") or {}
@@ -196,3 +197,70 @@ def _classify(check: dict, sha: str, outcome: str | None, is_run: bool) -> str:
     if is_run and check.get("status") != "completed":
         return "pending"
     return {"success": "success", "failure": "failure", "error": "infra", "pending": "pending"}.get(outcome, "infra")
+
+
+def verify_publication(url: str, intent: dict, *, assignee: str | None) -> bool:
+    """Verify the first/revised Draft PR identity before handoff; no writes."""
+    match = _PR.fullmatch(url)
+    if not match or match[1] != intent.get('repo'):
+        return False
+    try:
+        home = _assignee_profile_home(assignee)
+        pr = _api(f'repos/{match[1]}/pulls/{match[2]}', profile_home=home)
+        return bool(pr['state'] == 'open' and pr['draft'] is True
+                    and pr['head']['sha'] == intent['head']
+                    and pr['head']['ref'] == intent['branch']
+                    and pr['head']['repo']['full_name'] == match[1]
+                    and pr['base']['ref'] == intent['base'])
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, _GateAuthError):
+        return False
+
+
+def publication_ready(repo: str, base: str, branch: str, head: str, *, assignee: str | None) -> bool:
+    """Read the exact pushed ref and all PRs for this head before spending the attempt."""
+    if not _REPO.fullmatch(repo):
+        return False
+    try:
+        home = _assignee_profile_home(assignee)
+        ref = _api(f'repos/{repo}/git/ref/heads/{quote(branch, safe="")}', profile_home=home)
+        if ref['object']['sha'] != head:
+            return False
+        owner = repo.split('/')[0]
+        pages = _api(f'repos/{repo}/pulls?state=all&head={quote(owner + ":" + branch, safe="")}&per_page=100',
+                     paginate=True, profile_home=home)
+        if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+            return False
+        # Any existing PR for this branch, even for a different base or already
+        # closed, must be reconciled explicitly; never create a sibling blindly.
+        return not any(page for page in pages)
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, _GateAuthError):
+        return False
+
+
+def reconcile_publication(repo: str, base: str, branch: str, head: str, *, assignee: str | None) -> str | None:
+    """Read back one exact Draft PR after a spent attempt; ambiguity stays unknown."""
+    if not _REPO.fullmatch(repo):
+        return None
+    try:
+        home = _assignee_profile_home(assignee)
+        ref = _api(f'repos/{repo}/git/ref/heads/{quote(branch, safe="")}', profile_home=home)
+        if ref['object']['sha'] != head:
+            return None
+        owner = repo.split('/')[0]
+        pages = _api(f'repos/{repo}/pulls?state=all&head={quote(owner + ":" + branch, safe="")}&per_page=100',
+                     paginate=True, profile_home=home)
+        if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+            return None
+        prs = [pr for page in pages for pr in page]
+        if len(prs) != 1:
+            return None
+        pr = prs[0]
+        url = pr['html_url']
+        match = _PR.fullmatch(url) if isinstance(url, str) else None
+        if (match and match[1] == repo and pr['state'] == 'open' and pr['draft'] is True
+                and pr['head']['sha'] == head and pr['head']['ref'] == branch
+                and pr['head']['repo']['full_name'] == repo and pr['base']['ref'] == base):
+            return url
+    except (OSError, subprocess.SubprocessError, ValueError, KeyError, TypeError, _GateAuthError):
+        return None
+    return None

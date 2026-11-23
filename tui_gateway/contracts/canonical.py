@@ -41,6 +41,13 @@ class PromptReceiptParams(Params):
     session_id: str
     admission_id: str
     include_result: bool | None = None
+    include_worker_finish: bool | None = None
+
+
+class WorkerFinishProjection(Result):
+    receipt: Literal["RECORDED", "UNKNOWN"]
+    ack: Literal["RECORDED", "UNKNOWN"]
+    physical_retirement: Literal["UNKNOWN"]
 
 
 class PromptReceiptResult(AdmissionStatus):
@@ -49,6 +56,7 @@ class PromptReceiptResult(AdmissionStatus):
 
     result: JsonValue | None = None
     usage: dict[str, JsonValue] | None = None
+    worker_finish: WorkerFinishProjection | None = None
 
 
 canonical_method("prompt.receipt", params=PromptReceiptParams, result=PromptReceiptResult,

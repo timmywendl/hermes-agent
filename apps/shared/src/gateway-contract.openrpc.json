@@ -31100,6 +31100,18 @@
             ],
             "default": null,
             "title": "Include Result"
+          },
+          "include_worker_finish": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Include Worker Finish"
           }
         },
         "required": [
@@ -31182,6 +31194,17 @@
             ],
             "default": null,
             "title": "Usage"
+          },
+          "worker_finish": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkerFinishProjection"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
           }
         },
         "required": [
@@ -46110,6 +46133,39 @@
           "last_sequence"
         ],
         "title": "WorkerExecution",
+        "type": "object"
+      },
+      "WorkerFinishProjection": {
+        "additionalProperties": false,
+        "properties": {
+          "receipt": {
+            "enum": [
+              "RECORDED",
+              "UNKNOWN"
+            ],
+            "title": "Receipt",
+            "type": "string"
+          },
+          "ack": {
+            "enum": [
+              "RECORDED",
+              "UNKNOWN"
+            ],
+            "title": "Ack",
+            "type": "string"
+          },
+          "physical_retirement": {
+            "const": "UNKNOWN",
+            "title": "Physical Retirement",
+            "type": "string"
+          }
+        },
+        "required": [
+          "receipt",
+          "ack",
+          "physical_retirement"
+        ],
+        "title": "WorkerFinishProjection",
         "type": "object"
       },
       "WorkerPersistParams": {

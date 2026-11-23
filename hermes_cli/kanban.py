@@ -32,7 +32,24 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
-from hermes_cli.kanban_parser import build_parser
+from hermes_cli.kanban_parser import build_parser as _build_parser
+
+
+def build_parser(parent_subparsers):
+    """Add the cooperative publication fence to the existing Kanban CLI."""
+    parser = _build_parser(parent_subparsers)
+    subcommands = next(a for a in parser._actions
+                       if isinstance(a, argparse._SubParsersAction) and a.dest == "kanban_action")
+    publish = subcommands.add_parser("publication-intent", help="Record a scoped cooperative publication intent")
+    publish.add_argument("task_id")
+    publish.add_argument("--repo", required=True)
+    publish.add_argument("--base", required=True)
+    publish.add_argument("--branch", required=True)
+    publish.add_argument("--head", required=True)
+    mode = publish.add_mutually_exclusive_group()
+    mode.add_argument("--attempt", action="store_true", help="Spend the single automatic PR-create attempt")
+    mode.add_argument("--reconcile", action="store_true", help="Read back an exact PR after a spent attempt")
+    return parser
 
 
 # --- Flag parsing helpers ---
@@ -210,7 +227,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
-    "request-review", "request-changes", "reopen-review",
+    "request-review", "request-changes", "reopen-review", "publication-intent",
     "gc",
 })
 
@@ -924,6 +941,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),
+                                        expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
                 fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
@@ -1035,6 +1053,37 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                            lambda tid: f"cannot unblock {tid} (not blocked/scheduled?)")
 
 
+def _cmd_publication_intent(args: argparse.Namespace) -> int:
+    from hermes_cli.kanban_pr_acceptance import publication_ready, reconcile_publication
+    from hermes_cli.kanban_pr_acceptance_store import record_publication_intent
+    run_id = _worker_run_id_for(args.task_id)
+    claim_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    if run_id is None or not claim_lock:
+        return _err("publication intent requires the original claimed Task/Run")
+    with kbc.connect_closing() as conn:
+        values = dict(run_id=run_id, claim_lock=claim_lock, repo=args.repo, base=args.base,
+                      branch=args.branch, head=args.head)
+        if not record_publication_intent(conn, args.task_id, **values):
+            return _err("publication intent refused; reconcile the original Task/Run")
+        if args.attempt or args.reconcile:
+            spent = conn.execute("SELECT 1 FROM task_events WHERE task_id=? AND kind='wave2_publication_attempt'",
+                                 (args.task_id,)).fetchone()
+            task = kb.get_task(conn, args.task_id)
+            if args.reconcile:
+                url = reconcile_publication(args.repo, args.base, args.branch, args.head, assignee=task.assignee) if spent and task else None
+                if url is None:
+                    return _err("publication UNKNOWN; do not create another PR")
+                print(url)
+                return 0
+            if spent or not task or not publication_ready(args.repo, args.base, args.branch, args.head,
+                                                          assignee=task.assignee):
+                return _err("publication UNKNOWN or already attempted; reconcile without creating another PR")
+            if not record_publication_intent(conn, args.task_id, **values, attempt=True):
+                return _err("publication reservation lost; reconcile without creating another PR")
+    print("Publication create attempt reserved" if args.attempt else "Publication intent recorded")
+    return 0
+
+
 def _cmd_request_review(args: argparse.Namespace) -> int:
     tid = args.task_id
     summary = _stripped_or_none(getattr(args, "summary", None))
@@ -1050,7 +1099,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_worker_run_id_for(tid), expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"),
+            force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
@@ -1063,7 +1113,8 @@ def _cmd_request_changes(args: argparse.Namespace) -> int:
     tid = args.task_id
     reason = " ".join(args.reason).strip()
     with kbc.connect_closing() as conn:
-        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid))
+        ok, detail = kb.request_changes(conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid),
+                                        expected_claim_lock=os.environ.get("HERMES_KANBAN_CLAIM_LOCK"))
         if not ok:
             return _err(f"cannot request changes for {tid}: {detail or 'invalid review state'}")
         print(f"Requested changes for {tid}" + (f"; routed to {detail}" if detail else ""))
@@ -1331,6 +1382,7 @@ _HANDLERS = {
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
+    "publication-intent": _cmd_publication_intent,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,
     "archive": _cmd_archive, "tail": _cmd_tail, "dispatch": _cmd_dispatch,

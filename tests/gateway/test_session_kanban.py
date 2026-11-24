@@ -484,7 +484,7 @@ def test_pilot_review_receipt_uses_real_check_and_matching_events(tmp_path, monk
         assert check['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
 
 
-@pytest.mark.parametrize('mode', ['success', 'failed', 'interrupted', 'missing', 'unrelated_task', 'wrong_path'])
+@pytest.mark.parametrize('mode', ['success', 'root_success', 'failed', 'interrupted', 'missing', 'unrelated_task', 'wrong_path'])
 def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monkeypatch, mode):
     import subprocess
     import sys
@@ -498,13 +498,15 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
     git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
         'commit', '--allow-empty', '-m', 'base')
     base = git('rev-parse', 'HEAD')
-    (workspace / 'src' / 'calc.py').write_text('def increment(value):\n    return value + 1\n')
-    git('add', 'src/calc.py')
+    source = 'calc.py' if mode == 'root_success' else 'src/calc.py'
+    (workspace / source).write_text('def increment(value):\n    return value + 1\n')
+    git('add', source)
     git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'candidate')
     head = git('rev-parse', 'HEAD')
-    target = 'src/other.py' if mode == 'wrong_path' else 'src/calc.py'
+    target = 'src/other.py' if mode == 'wrong_path' else source
     expected = 9 if mode in {'failed', 'interrupted'} else 3
-    script = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\n"
+    import_root = '.' if mode == 'root_success' else 'src'
+    script = (f"import sys\nfrom pathlib import Path\nsys.path.insert(0, {import_root!r})\n"
               "from calc import increment\n"
               f"assert Path(increment.__code__.co_filename).resolve() == Path({target!r}).resolve()\n"
               "assert increment(1) == 2\n"
@@ -531,8 +533,8 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
     cli.chmod(0o700)
     monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt',
                         lambda *_: ('skill', ['sdlc-review'], []))
-    spec = {'title': 'Fix increment', 'instructions': 'Update src/calc.py',
-            'acceptance_criteria': 'increment returns the next integer\nVerify src/calc.py::increment'}
+    spec = {'title': 'Fix increment', 'instructions': f'Update {source}',
+            'acceptance_criteria': f'increment returns the next integer\nVerify {source}::increment'}
     if mode == 'unrelated_task':
         spec['acceptance_criteria'] = 'Do not verify src/calc.py::increment'
     body = {'repo': 'example/project', 'work_key': 'generic/v1', 'task_spec': spec}
@@ -543,10 +545,10 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
     handoff = {'url': 'https://github.com/example/project/pull/1', 'head': head, 'base': 'main'}
     verdict, receipt, accepted = sk._claude_verdict(context, handoff, base)
     assert verdict['verdict'] == 'approved'
-    assert accepted is (mode == 'success')
+    assert accepted is (mode in {'success', 'root_success'})
     if accepted:
         check = receipt['commands'][0]
-        assert check['python_check'] == {'source': 'src/calc.py', 'symbol': 'increment', 'cases': 2,
+        assert check['python_check'] == {'source': source, 'symbol': 'increment', 'cases': 2,
                                          'assertion_failed': False}
         assert check['exit_status'] == 0 and 'increment(1)' not in json.dumps(receipt)
     elif mode == 'failed':
@@ -572,6 +574,7 @@ def test_generic_python_review_rejects_unrelated_or_unexecuted_checks():
     assert validate(script, []) is None
     assert validate(script.replace('assert increment(2) == 3\n', '')) is None
     assert validate(script.replace('increment(2)', 'increment(1)')) is None
+    assert validate(script.replace('increment(2)', 'increment(value=1)')) is None
     assert validate(script.replace('assert increment(2) == 3', 'assert True')) is None
     assert validate(script + "print('1 passed')\n") is None
     assert validate(script.replace('increment(2)', 'increment(open("secret"))')) is None
@@ -639,7 +642,7 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result', 'timeout_after_result',
     'malformed_after_result', 'ci_failure', 'ci_pending', 'ci_stale', 'ci_failure_prior',
     'changes_limit', 'changes_limit_drift', 'changes_limit_count_drift', 'generic_changes', 'generic_limit',
-    'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
+    'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_budget',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
@@ -691,6 +694,9 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         offset = 1 if mode in {'generic_approved', 'generic_ci_unknown'} else 2
         (workspace / 'src' / 'calc.py').write_text(f'def increment(value):\n    return value + {offset}\n')
         git('add', 'src/calc.py')
+    if mode == 'generic_root_approved':
+        (workspace / 'calc.py').write_text('def increment(value):\n    return value + 1\n')
+        git('add', 'calc.py')
     if mode == 'forged_junit':
         (workspace / 'tests').mkdir()
         (workspace / 'tests' / 'test_candidate.py').write_text(
@@ -712,6 +718,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                        "sys.path.insert(0, 'src')\nfrom calc import increment\n"
                        "assert Path(increment.__code__.co_filename).resolve() == Path('src/calc.py').resolve()\n"
                        "assert increment(1) == 2\nassert increment(2) == 3\nHERMES_REVIEW")
+    root_command = generic_command.replace("sys.path.insert(0, 'src')", "sys.path.insert(0, '.')").replace(
+        "Path('src/calc.py')", "Path('calc.py')")
     calls = tmp_path / 'claude-calls'
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
@@ -743,7 +751,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"commit","--allow-empty","-m","drift"], stdout=subprocess.DEVNULL, check=True)\n'
                    'if mode == "workspace_dirty": pathlib.Path("candidate.txt").write_text("modified by review\\n")\n'
                    'assert "Review Lenses" in prompt and "Fixture acceptance criterion" in prompt\n'
-                   'if mode in {"generic_changes", "generic_limit", "generic_budget", "generic_approved", '
+                   'if mode in {"generic_changes", "generic_limit", "generic_budget", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
                    '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
                    '    assert "Execute the Task\'s relevant verification commands" in prompt\n'
@@ -751,11 +759,12 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'if mode in {"round2", "ci_failure_prior", "changes_limit", "changes_limit_drift", "changes_limit_count_drift"}:\n'
                    '    assert "Prior attempts on this task" in prompt and "Round 2 handoff" in prompt\n'
                    '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
-                   'if mode in {"approved", "approved_real_format", "round2", "body_drift", "generic_approved", '
+                   'if mode in {"approved", "approved_real_format", "round2", "body_drift", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
                    '"generic_ci_event_drift", "generic_ci_body_drift", '
                    '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior"}:\n'
-                   f'    command = {generic_command!r} if mode.startswith("generic_") else {pilot_command!r}\n'
+                   f'    command = {root_command!r} if mode == "generic_root_approved" else '
+                   f'{generic_command!r} if mode.startswith("generic_") else {pilot_command!r}\n'
                    '    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n'
                    '    run = subprocess.run(command, shell=True, capture_output=True, text=True, env=env, check=False)\n'
                    '    assert (run.returncode != 0) == (mode in {"generic_ci_failure", "generic_ci_drift", "generic_ci_limit", '
@@ -787,7 +796,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"interrupted": False, "exitCode": result.returncode}}))\n'
                    'if mode not in {"no_execution", "changes_requested", "changes_limit", "changes_limit_drift", "changes_limit_count_drift", "generic_changes", "generic_limit", "generic_budget", "escalate", "forged_junit", '
                    '"approved", "approved_real_format", "round2", "body_drift", '
-                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", '
+                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
                    '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
@@ -797,7 +806,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '    print(json.dumps(call))\n'
                    'if mode not in {"no_execution", "changes_requested", "changes_limit", "changes_limit_drift", "changes_limit_count_drift", "generic_changes", "generic_limit", "generic_budget", "escalate", "missing_result", '
                    '"forged_junit", "approved", "approved_real_format", "round2", "body_drift", '
-                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", '
+                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
                    '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
@@ -844,7 +853,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     with closing(connect()) as conn:
         root = kb.create_task(conn, title='Root', assignee='dev')
         body = json.loads(goal.split('\n\n', 1)[1])
-        if mode in {'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_ci_failure',
+        if mode in {'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved', 'generic_ci_failure',
                     'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift', 'generic_ci_body_drift'}:
             body['work_key'] = 'independent-generic-task/v1'
         if mode == 'generic_budget':
@@ -853,6 +862,9 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                     'generic_ci_event_drift', 'generic_ci_body_drift'}:
             body['task_spec']['instructions'] = 'Fixture acceptance criterion: update src/calc.py'
             body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify src/calc.py::increment'
+        if mode == 'generic_root_approved':
+            body['task_spec']['instructions'] = 'Fixture acceptance criterion: update calc.py'
+            body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify calc.py::increment'
         body['root_id'] = root
         body['objective_id'] = 'cloud-test-status-next-legal-step/v1'
         body['publication_protocol'] = 'wave2_v1'
@@ -977,7 +989,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             monkeypatch.setattr(kb, 'request_changes', drift_before_handoff)
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
         if mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
-                    'changes_limit', 'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved',
+                    'changes_limit', 'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved',
                     'generic_ci_failure', 'generic_ci_limit',
                     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result'}:
             result = sk._run_task_turns(None, {}, [], context)
@@ -1033,12 +1045,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 assert evidence['commands'][0]['script'] == sk._pilot_review_script(script, goal, {'url': url})
                 assert evidence['commands'][0]['exit_status'] == 0
                 assert len(evidence['commands'][0]['output_sha256']) == 64
-            if mode == 'generic_approved':
+            if mode in {'generic_approved', 'generic_root_approved'}:
                 evidence = kb.get_run(conn, run_id).metadata['review_execution']
                 assert evidence['task_id'] == task and evidence['run_id'] == run_id
                 assert evidence['published_pr'] == url and evidence['head_sha'] == head
                 assert evidence['commands'][0]['python_check'] == {
-                    'source': 'src/calc.py', 'symbol': 'increment', 'cases': 2, 'assertion_failed': False}
+                    'source': 'calc.py' if mode == 'generic_root_approved' else 'src/calc.py',
+                    'symbol': 'increment', 'cases': 2, 'assertion_failed': False}
         else:
             with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)'):
                 sk._run_task_turns(None, {}, [], context)

@@ -425,8 +425,28 @@ def wave2_review_refusal(conn, task_id, run_id, expected_claim_lock=None):
         return None
     if wave2_review_claim(conn, task_id, run_id, expected_claim_lock) is None:
         return 'review Run or Owner provenance is missing'
+    # A configured Task retry budget is also an upper bound on review repair
+    # handoffs. Never let the older global limit silently expand that grant.
+    import json
+    task = conn.execute('SELECT body,max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
+    if task is None:
+        return 'review Task provenance is missing'
+    try:
+        body = json.loads(task[0]) if task[0] else {}
+    except (TypeError, ValueError):
+        return 'review Task provenance is missing'
+    if not isinstance(body, dict):
+        return 'review Task provenance is missing'
+    spec = body.get('task_spec')
+    configured = task[1]
+    if isinstance(spec, dict) and 'max_retries' in spec:
+        if type(spec['max_retries']) is not int or spec['max_retries'] != configured:
+            return 'review Task repair budget is inconsistent'
+    if configured is not None and (type(configured) is not int or configured < 0):
+        return 'review Task repair budget is inconsistent'
+    limit = min(3, configured) if configured is not None else 3
     count = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='changes_requested'", (task_id,)).fetchone()[0]
-    if count >= 3:
+    if count >= limit:
         return 'review repair limit reached; preserve evidence and request a decision'
     return None
 

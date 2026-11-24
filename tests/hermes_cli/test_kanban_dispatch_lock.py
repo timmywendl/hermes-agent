@@ -157,3 +157,28 @@ def test_target_dispatch_refuses_wrong_board_connection(conn, tmp_path):
             kbd.dispatch_once(other, target_task_id="t_example")
     finally:
         other.close()
+
+
+def test_review_handoff_does_not_authorize_successor_before_owner_retirement(conn, monkeypatch):
+    target = _task_in_lane(conn, "ready")
+    sibling = _task_in_lane(conn, "ready")
+    assert kb.request_review(conn, target, reviewer="reviewer")
+    review = kb.claim_review_task(conn, target)
+    assert review is not None
+    assert kb.request_changes(conn, target, reason="fixture finding",
+                              expected_run_id=review.current_run_id,
+                              expected_claim_lock=review.claim_lock)[0]
+    def profile_exists(_profile):
+        # Commit the Owner marker after selection, before the claim transaction.
+        with kbc.connect() as owner, kb.write_txn(owner):
+            kb._append_event(owner, target, "owner_admitted", {}, run_id=review.current_run_id)
+        return True
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: profile_exists)
+    monkeypatch.setattr(kbd, "_memory_pressure_level", lambda: "normal")
+    calls = []
+    result = kbd.dispatch_once(conn, target_task_id=target,
+                               spawn_fn=lambda *args: calls.append(args))
+    assert not result.spawned and not calls
+    assert kb.claim_task(conn, target) is None
+    assert kb.get_task(conn, target).status == "ready"
+    assert kb.claim_task(conn, sibling) is not None

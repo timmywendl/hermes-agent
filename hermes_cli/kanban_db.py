@@ -2210,6 +2210,16 @@ def _strict_claim_matches(conn, task_id, lane, expected_assignee):
     ).fetchone() and _strict_dispatch_clear(conn, task_id))
 
 
+def _review_owner_retirement_unknown(conn, task_id):
+    """An Owner admission is not retired by a review handoff or a cleared PID."""
+    return conn.execute(
+        "SELECT 1 FROM task_events c JOIN task_events a "
+        "ON a.task_id=c.task_id AND a.run_id=c.run_id "
+        "WHERE c.task_id=? AND c.kind='changes_requested' AND a.kind='owner_admitted' LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None, strict_dispatch: bool = False,
@@ -2224,6 +2234,8 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if _review_owner_retirement_unknown(conn, task_id):
+            return None
         if strict_dispatch and not _strict_claim_matches(conn, task_id, "ready", expected_assignee):
             return None
         # Single enforcement point: never ready -> running with an undone

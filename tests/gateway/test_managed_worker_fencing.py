@@ -83,3 +83,72 @@ async def test_late_bootstrap_handshake_cannot_rearm_a_recovered_admission(tmp_p
             if child.poll() is None:
                 child.kill()
             child.wait(timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_board_pause_direct_managed_policy_and_acquisition_refuse(owner, paused_session, monkeypatch):
+    from dataclasses import replace
+    from gateway import session_managed_worker as managed
+    from hermes_state_runtime import RuntimeStoreError
+    _actor, ref, policy = paused_session()
+    calls = []
+    def spawn(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('product Worker reached')
+    monkeypatch.setattr(managed.subprocess, 'Popen', spawn)
+    monkeypatch.setattr(managed, '_worker_env', spawn)
+    with pytest.raises(RuntimeStoreError, match='board_execution_paused'):
+        managed.managed_policy(owner, ref)
+    # A caller cannot replace the passed source and context to erase the original receipt.
+    forged = replace(policy, source='cli', kanban_json=None, request_json='{}')
+    with pytest.raises(RuntimeStoreError, match='board_execution_paused'):
+        await managed.execute_managed(owner, ref, {'payload': {'text': 'held'}}, forged)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_board_pause_final_acquisition_rechecks_after_environment_preparation(owner, paused_session, monkeypatch):
+    import json
+    from gateway import session_managed_worker as managed
+    from hermes_state_local import POLICY_PREFIX
+    from hermes_state_runtime import RuntimeStoreError
+    _actor, ref, policy = paused_session(board=False)
+    calls = []
+    def prepare(authority):
+        def bind(conn):
+            key = POLICY_PREFIX + ref.session_id
+            saved = json.loads(conn.execute('SELECT value FROM state_meta WHERE key=?', (key,)).fetchone()[0])
+            saved['policy']['kanban_json'] = '{}'
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?', (json.dumps(saved), key))
+        authority.db._execute_write(bind)
+        return {}
+    def spawn(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('product Worker reached')
+    monkeypatch.setattr(managed, '_worker_env', prepare)
+    monkeypatch.setattr(managed.subprocess, 'Popen', spawn)
+    with pytest.raises(RuntimeStoreError, match='board_execution_paused'):
+        await managed.execute_managed(owner, ref, {'payload': {'text': 'held'}}, policy)
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_board_pause_non_board_managed_reaches_original_acquisition(owner, paused_session, monkeypatch):
+    from dataclasses import replace
+    from gateway import session_managed_worker as managed
+    _actor, ref, policy = paused_session(board=False)
+    opted = replace(policy, ignore_user_config=True)
+    monkeypatch.setattr('gateway.session_policy.policy_for_source', lambda runner, source: opted)
+    assert managed.managed_policy(owner, ref) is opted
+    calls = []
+    class AcquisitionReached(Exception):
+        pass
+    def spawn(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AcquisitionReached
+    monkeypatch.setattr(managed, '_worker_env', lambda authority: {})
+    monkeypatch.setattr(managed.subprocess, 'Popen', spawn)
+    with pytest.raises(AcquisitionReached):
+        await managed.execute_managed(owner, ref, {'payload': {'text': 'ordinary'}}, opted)
+    assert len(calls) == 1
+    assert calls[0][1]['start_new_session'] is True

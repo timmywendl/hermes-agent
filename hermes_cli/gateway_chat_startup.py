@@ -31,6 +31,10 @@ def ensure_launch_provider(args) -> bool:
 
 
 def launch_gateway_chat(args) -> int:
+    if os.environ.get('HERMES_KANBAN_TASK'):
+        from hermes_cli.kanban_db_dispatch import BOARD_EXECUTION_ENABLED, BOARD_EXECUTION_PAUSE_REASON
+        if not BOARD_EXECUTION_ENABLED:
+            raise SystemExit(BOARD_EXECUTION_PAUSE_REASON)
     try:
         from hermes_cli.main import _confirm_startup_expensive_model_override
         from hermes_cli.gateway_chat import launch_from_args, bypass_launch

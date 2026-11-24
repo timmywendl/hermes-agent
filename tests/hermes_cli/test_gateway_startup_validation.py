@@ -20,3 +20,15 @@ def test_invalid_options_are_reported_before_reading_profile(monkeypatch, capsys
     monkeypatch.setattr("hermes_cli.gateway_chat.connect_gateway", refused)
     assert launch_gateway_chat(Namespace(safe_mode=True, model="explicit", provider="custom", query="x")) == 1
     assert "transport reached" in capsys.readouterr().err
+
+
+def test_board_pause_refuses_gateway_chat_before_launch(monkeypatch):
+    import pytest
+    from argparse import Namespace
+    from hermes_cli.gateway_chat_startup import launch_gateway_chat
+
+    monkeypatch.setenv('HERMES_KANBAN_TASK', 'fixture-task')
+    monkeypatch.setattr('hermes_cli.kanban_db_dispatch.BOARD_EXECUTION_ENABLED', False)
+    monkeypatch.setattr('hermes_cli.gateway_chat.launch_from_args', lambda *_: pytest.fail('gateway launch reached'))
+    with pytest.raises(SystemExit, match='Board Local/Managed execution paused'):
+        launch_gateway_chat(Namespace())

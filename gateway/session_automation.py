@@ -238,13 +238,16 @@ async def admit_automation(authority, adapter, event, identity):
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
+    from gateway.session_kanban import check_board_execution
+    # Exact replays skip the NEW-write authorization callback; refuse them before scheduling too.
+    check_board_execution(authority, ref)
     authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
     from functools import partial
     from gateway.session_runtime_workers import tracked_write
     return await tracked_write(authority, partial(
         admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
         session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate()), then=partial(authority._admitted, ref, event), ordered=True,
+        _authorize_write=authority._board_admission_gate(ref)), then=partial(authority._admitted, ref, event), ordered=True,
         after=partial(authority._schedule_admitted, ref))
 
 
@@ -272,6 +275,9 @@ async def move_route_wakes(runner, session_key, old_session_id):
     new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
     if old.session_id not in authority.sessions or old == new:
         return
+    from gateway.session_kanban import check_board_execution
+    check_board_execution(authority, old)
+    check_board_execution(authority, new)
     rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=old.session_id)
     if any(row['status'] == 'unknown' for row in rows):
         return
@@ -282,6 +288,8 @@ async def move_route_wakes(runner, session_key, old_session_id):
         if (row['status'] != 'queued' or row['principal_id'] != 'automation:' + session_key
                 or not isinstance(identity, list) or identity[:1] not in ([p] for p in _ROUTE_WAKE_PRODUCERS)):
             continue
+        check_board_execution(authority, old)
+        check_board_execution(authority, new)
         try:
             await authority.cancel_queued(actor, old, row['admission_id'])
         except RuntimeStoreError:
@@ -292,7 +300,7 @@ async def move_route_wakes(runner, session_key, old_session_id):
         await tracked_write(authority, partial(
             admit_session_input, authority.db, epoch=authority.epoch, principal_id=row['principal_id'],
             session_id=new.session_id, request_id=row['request_id'], payload=payload,
-            _authorize_write=authority._admission_gate()), then=partial(authority._admitted, new, None),
+            _authorize_write=authority._board_admission_gate(new)), then=partial(authority._admitted, new, None),
             ordered=True, after=partial(authority._schedule_admitted, new))
 
 

@@ -157,3 +157,86 @@ def test_target_dispatch_refuses_wrong_board_connection(conn, tmp_path):
             kbd.dispatch_once(other, target_task_id="t_example")
     finally:
         other.close()
+
+
+@pytest.mark.parametrize("journal", ["WAL", "DELETE"])
+@pytest.mark.parametrize("lane", ["ready", "review"])
+def test_board_pause_target_dispatch_leaves_both_lanes_untouched(conn, journal, lane):
+    """The current --task path cannot bypass the shipped Board pause."""
+    conn.execute("PRAGMA journal_mode=" + journal)
+    target = _task_in_lane(conn, lane)
+    sibling = _task_in_lane(conn, "ready")
+    with kbc.connect() as observer:
+        before = [tuple(row) for row in observer.execute("SELECT * FROM tasks ORDER BY id")]
+        events = [tuple(row) for row in observer.execute("SELECT * FROM task_events ORDER BY id")]
+        runs = [tuple(row) for row in observer.execute("SELECT * FROM task_runs ORDER BY id")]
+        result = kbd.dispatch_once(conn, target_task_id=target,
+                                   spawn_fn=lambda *args: pytest.fail("paused spawn"))
+        assert result.disabled == kbd.BOARD_EXECUTION_PAUSE_REASON
+        assert not result.spawned
+        assert [tuple(row) for row in observer.execute("SELECT * FROM tasks ORDER BY id")] == before
+        assert [tuple(row) for row in observer.execute("SELECT * FROM task_events ORDER BY id")] == events
+        assert [tuple(row) for row in observer.execute("SELECT * FROM task_runs ORDER BY id")] == runs
+        assert kb.get_task(observer, sibling).status == "ready"
+
+
+@pytest.mark.parametrize('journal', ['WAL', 'DELETE'])
+@pytest.mark.parametrize('dry_run', [False, True])
+def test_board_pause_preserves_all_rows_before_any_tick_work(conn, journal, dry_run, monkeypatch):
+    """Real Board storage is unchanged even with expired work and UNKNOWN history."""
+    import json
+    import sqlite3
+    conn.execute('PRAGMA journal_mode=' + journal)
+    monkeypatch.setattr('hermes_cli.profiles.profile_exists', lambda name: True)
+    review = kb.create_task(conn, title='review work', assignee='w')
+    conn.execute("UPDATE tasks SET status='review' WHERE id=?", (review,))
+    ready = kb.create_task(conn, title='future work', assignee='w')
+    held = kb.create_task(conn, title='uncertain work', assignee='w')
+    kb.recompute_ready(conn)
+    task = kb.claim_task(conn, held, ttl_seconds=1)
+    marker = json.dumps({'local_launch_v1': {'phase': 'STOP_UNCERTAIN'},
+                         'vz_custody_v1': {'phase': 'STOP_UNCERTAIN'},
+                         'managed_launch_v1': {'phase': 'STOP_UNCERTAIN'}})
+    conn.execute('UPDATE task_runs SET metadata=?,worker_pid=424242 WHERE id=?', (marker, task.current_run_id))
+    conn.execute('UPDATE tasks SET claim_expires=1 WHERE id=?', (held,))
+    conn.commit()
+    before = list(conn.iterdump())
+    changes = conn.total_changes
+    calls = []
+    def spawn(*args, **kwargs):
+        calls.append(args)
+        raise AssertionError('Board spawn reached')
+    def readonly(action, *_args):
+        return sqlite3.SQLITE_DENY if action in {sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE} else sqlite3.SQLITE_OK
+    def forbidden_reclaim(*args, **kwargs):
+        raise AssertionError('paused dispatcher entered reclaim phase')
+    monkeypatch.setattr(kbd, '_run_reclaim_phase', forbidden_reclaim)
+    monkeypatch.setattr(kbc, '_dispatch_tick_lock', forbidden_reclaim)
+    conn.set_authorizer(readonly)
+    try:
+        for entry in (kbd.dispatch_once, kbd._dispatch_once_locked):
+            result = entry(conn, spawn_fn=spawn, dry_run=dry_run, default_assignee='w', stale_timeout_seconds=1)
+            assert result.disabled == kbd.BOARD_EXECUTION_PAUSE_REASON
+            assert result.spawned == [] and result.reclaimed == result.promoted == 0
+            assert kbd.BOARD_EXECUTION_PAUSE_REASON in kbd.describe_suppression([result])
+        assert not kbd.has_spawnable_ready(conn)
+        assert not kbd.has_spawnable_review(conn)
+    finally:
+        conn.set_authorizer(None)
+    assert calls == [] and conn.total_changes == changes
+    assert list(conn.iterdump()) == before
+    assert kb.get_task(conn, ready).status == 'ready'
+    with pytest.raises(RuntimeError, match='execution paused'):
+        kbd._default_spawn(None, '')
+
+
+def test_board_pause_standalone_never_opens_board(monkeypatch):
+    results = []
+    def forbidden(*args, **kwargs):
+        raise AssertionError('paused standalone opened storage')
+    monkeypatch.setattr(kbc, 'connect', forbidden)
+    import threading
+    stopped = threading.Event()
+    stopped.set()
+    kbd.run_daemon(on_tick=results.append, stop_event=stopped)
+    assert len(results) == 1 and results[0].disabled == kbd.BOARD_EXECUTION_PAUSE_REASON

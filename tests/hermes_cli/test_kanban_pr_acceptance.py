@@ -11,6 +11,84 @@ from hermes_cli import kanban_db as kb
 from hermes_cli.kanban_db_connect import connect
 
 
+@pytest.mark.parametrize('overrun', [False, True])
+def test_acceptance_deadline_bounds_each_gh_call_and_stops_further_reads(monkeypatch, overrun):
+    import subprocess
+    from types import SimpleNamespace
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    now = [100.0]
+    timeouts = []
+    monkeypatch.setattr(acceptance.time, 'monotonic', lambda: now[0])
+    def run(command, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        if len(timeouts) == 1:
+            now[0] += 4
+            data = {'data': {'repository': {'pullRequest': {'headRefOid': 'a' * 40,
+                    'baseRefName': 'main', 'state': 'OPEN', 'baseRef': {'branchProtectionRule': {
+                        'requiredStatusChecks': [{'context': 'unit', 'app': {'databaseId': 1}}]}}}}}}
+            return SimpleNamespace(stdout=json.dumps(data))
+        if len(timeouts) == 2:
+            now[0] += 7 if overrun else 4
+            return SimpleNamespace(stdout=json.dumps([[]]))
+        raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+    monkeypatch.setattr(acceptance.subprocess, 'run', run)
+    result = acceptance.collect_acceptance('acme/repo', 'https://github.com/acme/repo/pull/7', deadline=110.0)
+    assert result['classification'] == 'infra' and result['ok'] is False
+    assert timeouts == ([10.0, 6.0] if overrun else [10.0, 6.0, 2.0])
+
+
+def test_acceptance_api_keeps_default_timeout_without_deadline(monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    calls = []
+    def run(_command, **kwargs):
+        calls.append(kwargs['timeout'])
+        return SimpleNamespace(stdout='{}')
+    monkeypatch.setattr(acceptance.subprocess, 'run', run)
+    assert acceptance._api('graphql') == {}
+    assert calls == [30.0]
+
+
+def test_acceptance_deadline_rejects_success_read_after_expiry(monkeypatch):
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    now = [100.0]
+    head = 'a' * 40
+    monkeypatch.setattr(acceptance.time, 'monotonic', lambda: now[0])
+    def api(endpoint, **_kwargs):
+        if endpoint == 'graphql':
+            return {'data': {'repository': {'pullRequest': {'headRefOid': head, 'baseRefName': 'main',
+                    'state': 'OPEN', 'baseRef': {'branchProtectionRule': {'requiredStatusChecks': [
+                        {'context': 'unit', 'app': {'databaseId': 1}}]}}}}}}
+        if '/rules/branches/' in endpoint or '/statuses' in endpoint:
+            return [[]]
+        if '/check-runs' in endpoint:
+            return [{'total_count': 1, 'check_runs': [{'id': 1, 'name': 'unit', 'head_sha': head,
+                    'app': {'id': 1}, 'status': 'completed', 'conclusion': 'success'}]}]
+        now[0] = 110.0
+        return {'head': {'sha': head}, 'base': {'ref': 'main'}, 'state': 'open'}
+    monkeypatch.setattr(acceptance, '_api', api)
+    receipt = acceptance.collect_acceptance('acme/repo', 'https://github.com/acme/repo/pull/7', deadline=110.0)
+    assert receipt['ok'] is False and receipt['classification'] == 'infra'
+
+
+def test_acceptance_api_deadline_stops_inert_gh_process(tmp_path, monkeypatch):
+    import subprocess
+    import time
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    gh = tmp_path / 'gh'
+    gh.write_text(f'#!{sys.executable}\nimport time\ntime.sleep(5)\nprint("{{}}")\n')
+    gh.chmod(0o755)
+    monkeypatch.setattr(acceptance, '_gh_env', lambda _home: {'PATH': str(tmp_path), 'HOME': str(tmp_path)})
+    start = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        acceptance._api('graphql', deadline=start + .25)
+    assert time.monotonic() - start < 3
+
+
 @pytest.fixture
 def github(tmp_path, monkeypatch):
     state = {"conclusion": "success", "head": "a" * 40, "reads": 0, "requests": []}

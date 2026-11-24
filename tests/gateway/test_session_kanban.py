@@ -991,6 +991,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 return [[]]
             if '/check-runs' in endpoint:
                 check_reads.append(1)
+                if mode in {'generic_ci_failure', 'generic_ci_pending_failure'} and len(check_reads) <= 2:
+                    assert isinstance(kwargs.get('deadline'), float)
                 pending = (mode == 'ci_pending' or (mode == 'generic_ci_drift' and len(check_reads) > 1)
                            or (variant == 'generic_ci_late_pending_success' and len(check_reads) == 2)
                            or (variant == 'generic_ci_late_pending_timeout' and len(check_reads) > 1)

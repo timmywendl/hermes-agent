@@ -1185,13 +1185,13 @@ def _check_review_candidate(workspace, handoff, assignee):
     return base
 
 
-def _required_failed_ci(context, handoff, *, receipt=None):
+def _required_failed_ci(context, handoff, *, receipt=None, deadline=None):
     """Read exact-HEAD required-check facts; ambiguous or changing CI is unknown."""
     from hermes_cli.kanban_db import redact_review_value
     from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
     if receipt is None:
-        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
+        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'], deadline=deadline)
     checks = receipt.get('checks')
     if (receipt.get('classification') != 'failure' or receipt.get('ok') is not False
             or receipt.get('pr_url') != handoff['url'] or receipt.get('head_sha') != handoff['head']
@@ -1259,7 +1259,7 @@ def _wait_review_ci(conn, context, handoff_id, handoff, *, deadline=None):
             raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
         if not _bound_claim_is_live(context) or _review_handoff(conn, context) != (handoff_id, handoff):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
-        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
+        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'], deadline=deadline)
         if not _bound_claim_is_live(context) or _review_handoff(conn, context) != (handoff_id, handoff):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
         if (receipt.get('pr_url') != handoff['url'] or receipt.get('head_sha') != handoff['head']
@@ -1518,7 +1518,7 @@ def _run_claude_review(context):
                               if command.get('exit_status') == 1
                               and isinstance(command.get('python_check'), dict)
                               and command['python_check'].get('assertion_failed') is True]
-                if len(reproduced) != 1 or _required_failed_ci(context, handoff) != review_ci:
+                if len(reproduced) != 1 or _required_failed_ci(context, handoff, deadline=review_deadline) != review_ci:
                     raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
                 failed_checks = [check for check in review_ci['checks'] if check['classification'] == 'failure']
                 names = json.dumps([{'name': check['name'], 'id': check['id']}

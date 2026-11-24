@@ -1414,6 +1414,12 @@ def _run_claude_review(context):
         if (current is None or current.title != context['review_task_title']
                 or current.body != context['review_task_body']):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
+        if verdict and verdict['verdict'] == 'approved' and approval_evidence_ok:
+            # This is an observation of the Reviewer, not an acceptance or a
+            # grant to complete: CI and the original Owner remain authoritative.
+            execution['provisional_verdict'] = {
+                'verdict': 'approved', 'reason': kb.redact_review_value(verdict['reason'].strip()),
+            }
         if execution['commands']:
             with kb.write_txn(conn):
                 current = kb.get_task(conn, task_id)
@@ -1421,7 +1427,8 @@ def _run_claude_review(context):
                         or current.claim_lock != context['claim_lock']
                         or current.title != context['review_task_title']
                         or current.body != context['review_task_body']
-                        or not _bound_worker_matches(conn, context)):
+                        or not _bound_worker_matches(conn, context)
+                        or _review_handoff(conn, context) != (handoff_id, handoff)):
                     raise RuntimeStoreError('kanban_claude_review_stale_claim')
                 kb._append_event(conn, task_id, 'review_execution', execution, run_id=context['run_id'])
         if verdict is None:

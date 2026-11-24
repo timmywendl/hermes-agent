@@ -644,7 +644,7 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'changes_limit', 'changes_limit_drift', 'changes_limit_count_drift', 'generic_changes', 'generic_limit',
     'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure', 'generic_budget',
-    'generic_ci_late_pending_success', 'generic_ci_late_failure',
+    'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout',
     'changes_transition_body_drift', 'changes_transition_handoff_drift',
     'escalate_transition_body_drift', 'escalate_transition_handoff_drift', 'escalate_triage_handoff_drift',
 ])
@@ -661,7 +661,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     from hermes_state_runtime import RuntimeStoreError
 
     variant = mode
-    if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure'}:
+    if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout'}:
         mode = 'generic_approved'
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -945,6 +945,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 check_reads.append(1)
                 pending = (mode == 'ci_pending' or (mode == 'generic_ci_drift' and len(check_reads) > 1)
                            or (variant == 'generic_ci_late_pending_success' and len(check_reads) == 2)
+                           or (variant == 'generic_ci_late_pending_timeout' and len(check_reads) > 1)
                            or (mode == 'generic_ci_pending_failure' and len(check_reads) == 1))
                 late_failure = variant == 'generic_ci_late_failure' and len(check_reads) > 1
                 return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
@@ -974,6 +975,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         policy, _ = sk.build_kanban_policy(connection, params, config)
         context = json.loads(policy.kanban_json)
         context['max_runtime_seconds'] = 1 if mode in {'timeout', 'timeout_after_result'} else 15
+        if variant == 'generic_ci_late_pending_timeout':
+            context['max_runtime_seconds'] = 4
         if mode == 'task_mismatch':
             context['task_id'] = sibling
         elif mode == 'run_mismatch':
@@ -1028,7 +1031,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 return original(*args, **kwargs)
             monkeypatch.setattr(kb, method, drift_before_transition)
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
-        if variant != 'generic_ci_late_failure' and mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
+        if variant not in {'generic_ci_late_failure', 'generic_ci_late_pending_timeout'} and mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
                     'changes_limit', 'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved',
                     'generic_ci_failure', 'generic_ci_limit', 'generic_ci_pending_failure',
                     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result'}:
@@ -1095,7 +1098,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         else:
             race = (mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_'))
                     or mode == 'generic_ci_handoff_drift')
-            error = ('review_ci_uncertain' if variant == 'generic_ci_late_failure' else
+            error = ('review_ci_uncertain' if variant in {'generic_ci_late_failure', 'generic_ci_late_pending_timeout'} else
                      'review_(stale_claim|acceptance_refused)' if mode == 'changes_transition_body_drift' else
                      'review_stale_claim' if race else
                      'review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)')
@@ -1109,6 +1112,17 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",
                                     (task,)).fetchone()[0] == 0
                 assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                                    (task,)).fetchone()[0] == 0
+            if variant == 'generic_ci_late_pending_timeout':
+                row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                   "AND kind='review_execution'", (task, run_id)).fetchone()
+                evidence = json.loads(row['payload'])
+                assert evidence['task_id'] == task and evidence['run_id'] == run_id
+                assert evidence['published_pr'] == url and evidence['head_sha'] == head
+                assert evidence['claim_digest'] == hashlib.sha256(lock.encode()).hexdigest()
+                assert evidence['provisional_verdict'] == {'verdict': 'approved', 'reason': 'review evidence'}
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? "
+                                    "AND kind IN ('wave2_verdict', 'completed', 'changes_requested')",
                                     (task,)).fetchone()[0] == 0
             if mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_')):
                 assert kb.get_task(conn, task).current_run_id == run_id

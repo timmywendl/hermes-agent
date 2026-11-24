@@ -1430,6 +1430,12 @@ def _run_claude_review(context):
         if verdict['verdict'] == 'approved' and not approval_evidence_ok:
             raise RuntimeStoreError('kanban_claude_review_failed')
         if verdict['verdict'] == 'approved':
+            if not _is_pilot_review(context):
+                # CI can enter a new pending state while Claude is running. Wait
+                # in this same Run; a newly failed check is not proof that the
+                # successful local verification reproduced its failure.
+                if _wait_review_ci(conn, context, handoff_id, handoff) is not None:
+                    raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
             origin = _review_task_origin(conn, context)
             if origin is None:
                 raise RuntimeStoreError('kanban_claude_review_stale_claim')

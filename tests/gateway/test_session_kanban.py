@@ -644,6 +644,7 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'changes_limit', 'changes_limit_drift', 'changes_limit_count_drift', 'generic_changes', 'generic_limit',
     'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure', 'generic_budget',
+    'generic_ci_late_pending_success', 'generic_ci_late_failure',
     'changes_transition_body_drift', 'changes_transition_handoff_drift',
     'escalate_transition_body_drift', 'escalate_transition_handoff_drift', 'escalate_triage_handoff_drift',
 ])
@@ -658,6 +659,10 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     from hermes_cli import kanban_db as kb, kanban_pr_acceptance as acceptance
     from hermes_cli.kanban_db_connect import connect
     from hermes_state_runtime import RuntimeStoreError
+
+    variant = mode
+    if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure'}:
+        mode = 'generic_approved'
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
@@ -939,11 +944,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             if '/check-runs' in endpoint:
                 check_reads.append(1)
                 pending = (mode == 'ci_pending' or (mode == 'generic_ci_drift' and len(check_reads) > 1)
+                           or (variant == 'generic_ci_late_pending_success' and len(check_reads) == 2)
                            or (mode == 'generic_ci_pending_failure' and len(check_reads) == 1))
+                late_failure = variant == 'generic_ci_late_failure' and len(check_reads) > 1
                 return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
                          'head_sha': base if mode == 'ci_stale' else head, 'app': {'id': 7},
                          'status': 'in_progress' if pending else 'completed',
-                         'conclusion': (None if pending else 'failure' if mode in {
+                         'conclusion': (None if pending else 'failure' if late_failure or mode in {
                              'ci_failure', 'ci_failure_prior', 'generic_ci_failure', 'generic_ci_drift',
                              'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift',
                              'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure'} else 'success')}]}]
@@ -955,7 +962,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 'base': {'sha': base, 'ref': 'main',
                          'repo': {'full_name': 'DesignLibro/petlibro-cloud-test-platform'}},
             }
-        if mode == 'generic_ci_pending_failure':
+        if mode == 'generic_ci_pending_failure' or variant == 'generic_ci_late_pending_success':
             monkeypatch.setattr('time.sleep', lambda _seconds: None)
         monkeypatch.setattr(acceptance, '_api', fake_api)
         monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path / name))
@@ -1021,7 +1028,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 return original(*args, **kwargs)
             monkeypatch.setattr(kb, method, drift_before_transition)
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
-        if mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
+        if variant != 'generic_ci_late_failure' and mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
                     'changes_limit', 'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved',
                     'generic_ci_failure', 'generic_ci_limit', 'generic_ci_pending_failure',
                     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result'}:
@@ -1088,12 +1095,21 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         else:
             race = (mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_'))
                     or mode == 'generic_ci_handoff_drift')
-            error = ('review_(stale_claim|acceptance_refused)' if mode == 'changes_transition_body_drift' else
+            error = ('review_ci_uncertain' if variant == 'generic_ci_late_failure' else
+                     'review_(stale_claim|acceptance_refused)' if mode == 'changes_transition_body_drift' else
                      'review_stale_claim' if race else
                      'review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)')
             with pytest.raises(RuntimeStoreError, match=error):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
+            if variant == 'generic_ci_late_failure':
+                assert len(check_reads) == 2
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='review_execution'",
+                                    (task,)).fetchone()[0] == 1
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='changes_requested'",
+                                    (task,)).fetchone()[0] == 0
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",
+                                    (task,)).fetchone()[0] == 0
             if mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_')):
                 assert kb.get_task(conn, task).current_run_id == run_id
                 assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
@@ -1127,6 +1143,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             assert not calls.exists()
         else:
             assert calls.read_text() == 'call\n'
+        if variant == 'generic_ci_late_pending_success':
+            assert len(check_reads) >= 4
 
 
 @pytest.mark.parametrize('outcome', ['failure', 'success', 'timeout', 'head_drift', 'claim_drift', 'handoff_drift'])

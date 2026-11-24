@@ -112,6 +112,31 @@ def begin_runtime_epoch(db, *, instance_id: str) -> int:
 
 # Main's busy-queue cap (GatewayRunner._BUSY_QUEUE_MAX_PENDING): queued inputs one session holds.
 ADMISSION_QUEUE_MAX = 32
+ROUTE_MOVE_PREFIX = 'gateway.route_move.v1:'
+
+
+def _admit_input_on_conn(conn, *, epoch, principal_id, session_id, request_id, encoded, digest,
+                         intent, authorize_write):
+    _epoch(conn, epoch)
+    _session(conn, session_id)
+    old = conn.execute('''SELECT * FROM session_admissions
+        WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
+    if old is not None:
+        if old['payload_digest'] != digest:
+            raise RuntimeStoreError('admission_conflict')
+        return _row(old)
+    queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
+        AND status='queued' ''', (session_id,)).fetchone()[0]
+    if queued >= ADMISSION_QUEUE_MAX:
+        raise RuntimeStoreError('queue_full')
+    if authorize_write is not None:
+        authorize_write(conn)
+    admission_id = uuid.uuid4().hex
+    conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
+        target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
+        VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
+        (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
+    return _row(_admission(conn, admission_id))
 
 
 def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
@@ -135,28 +160,9 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         return retired
     digest = admission_fingerprint(canonical_target=session_id, payload={'input': json.loads(encoded), 'intent': intent})
     def write(conn):
-        _epoch(conn, epoch)
-        _session(conn, session_id)
-        old = conn.execute('''SELECT * FROM session_admissions
-            WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
-        if old is not None:
-            if old['payload_digest'] != digest:
-                raise RuntimeStoreError('admission_conflict')
-            return _row(old)
-        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
-            AND status='queued' ''', (session_id,)).fetchone()[0]
-        # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
-        # input after Discard, so it must not grow without bound while nobody resolves it.
-        if queued >= ADMISSION_QUEUE_MAX:
-            raise RuntimeStoreError('queue_full')
-        if _authorize_write is not None:
-            _authorize_write(conn)
-        admission_id = uuid.uuid4().hex
-        conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
-            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
-            VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
-            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
-        return _row(_admission(conn, admission_id))
+        return _admit_input_on_conn(conn, epoch=epoch, principal_id=principal_id, session_id=session_id,
+                                    request_id=request_id, encoded=encoded, digest=digest, intent=intent,
+                                    authorize_write=_authorize_write)
     return db._execute_write(write)
 
 
@@ -257,6 +263,124 @@ def cancel_session_input(db, *, epoch: int, admission_id: str) -> dict:
         if row['status'] == 'queued':
             conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE admission_id=?", (admission_id,))
         return _row(_admission(conn, admission_id))
+    return db._execute_write(write)
+
+
+def move_queued_route_input(db, *, epoch, admission_id, old_session_id, new_session_id,
+                            principal_id, request_id, payload, guard):
+    """Move one queued route wake, with both provenance checks in the same writer."""
+    encoded = _json(payload)
+    digest = admission_fingerprint(canonical_target=new_session_id,
+                                   payload={'input': json.loads(encoded), 'intent': 'queue'})
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if (row['target_session_id'] != old_session_id or row['principal_id'] != principal_id
+                or row['request_id'] != request_id):
+            raise RuntimeStoreError('stale_generation')
+        if (row['status'], row['outcome']) == ('terminal', 'cancelled'):
+            existing = conn.execute('SELECT * FROM session_admissions WHERE principal_id=? '
+                                    'AND target_session_id=? AND request_id=?',
+                                    (principal_id, new_session_id, request_id)).fetchone()
+            if existing is not None and existing['payload_digest'] == digest:
+                guard(conn)
+                return _row(existing)
+            raise RuntimeStoreError('stale_generation')
+        if row['status'] != 'queued':
+            raise RuntimeStoreError('stale_generation')
+        guard(conn)
+        if conn.execute("SELECT 1 FROM session_admissions WHERE target_session_id=? AND status='unknown' LIMIT 1",
+                        (old_session_id,)).fetchone():
+            raise RuntimeStoreError('unknown_execution')
+        from hermes_state_mutation_retirement import RETIRED_PREFIX
+        if conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + new_session_id,)).fetchone():
+            raise RuntimeStoreError('not_found')
+        conn.execute("UPDATE session_admissions SET status='terminal',outcome='cancelled' WHERE admission_id=?",
+                     (admission_id,))
+        guard(conn)
+        result = _admit_input_on_conn(conn, epoch=epoch, principal_id=principal_id,
+                                      session_id=new_session_id, request_id=request_id, encoded=encoded,
+                                      digest=digest, intent='queue', authorize_write=None)
+        receipt = {'old': admission_id, 'new': result['admission_id'], 'old_session': old_session_id,
+                   'new_session': new_session_id, 'principal': principal_id, 'request': request_id, 'digest': digest,
+                   'notified': False}
+        conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)', (ROUTE_MOVE_PREFIX + admission_id, _json(receipt)))
+        return result
+    return db._execute_write(write)
+
+
+def _validated_route_move(conn, admission_id):
+    saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (ROUTE_MOVE_PREFIX + admission_id,)).fetchone()
+    if saved is None:
+        return None
+    try:
+        receipt = json.loads(saved[0])
+        old = _admission(conn, admission_id)
+        new = _admission(conn, receipt['new'])
+        if (receipt['old'] != admission_id or old['target_session_id'] != receipt['old_session']
+                or new['target_session_id'] != receipt['new_session']
+                or old['principal_id'] != receipt['principal'] or new['principal_id'] != receipt['principal']
+                or old['request_id'] != receipt['request'] or new['request_id'] != receipt['request']
+                or new['payload_digest'] != receipt['digest']
+                or (old['status'], old['outcome']) != ('terminal', 'cancelled')):
+            raise ValueError('route move identity mismatch')
+        return receipt
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeStoreError('storage_unavailable') from exc
+
+
+def route_move_receipts(db):
+    import logging
+    with db._read_ctx() as conn:
+        ids = [row[0][len(ROUTE_MOVE_PREFIX):] for row in conn.execute(
+            'SELECT key FROM state_meta WHERE key GLOB ?', (ROUTE_MOVE_PREFIX + '*',))]
+        receipts = []
+        for admission_id in ids:
+            try:
+                receipt = _validated_route_move(conn, admission_id)
+                if receipt is not None:
+                    receipts.append(receipt)
+            except RuntimeStoreError:
+                logging.getLogger(__name__).warning('Invalid route move receipt left untouched: %s', admission_id)
+        return receipts
+
+
+def clear_route_move_receipt(db, *, epoch, admission_id):
+    """Clear a cleanup receipt only while its exact moved rows still match."""
+    def write(conn):
+        _epoch(conn, epoch)
+        receipt = _validated_route_move(conn, admission_id)
+        if receipt is None:
+            return
+        if receipt.get('notified') is not True:
+            raise RuntimeStoreError('storage_unavailable')
+        key = ROUTE_MOVE_PREFIX + admission_id
+        # Keep a completed edge while an earlier move still needs it to find
+        # its way back from the current route after a restart.
+        for item in conn.execute('SELECT key FROM state_meta WHERE key GLOB ?', (ROUTE_MOVE_PREFIX + '*',)):
+            predecessor_id = item[0][len(ROUTE_MOVE_PREFIX):]
+            if predecessor_id == admission_id:
+                continue
+            try:
+                predecessor = _validated_route_move(conn, predecessor_id)
+            except RuntimeStoreError:
+                continue  # Preserve corrupt receipts without blocking unrelated routes.
+            if predecessor is not None and predecessor['new'] == admission_id:
+                receipt['settled'] = True
+                conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(receipt), key))
+                return
+        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+    return db._execute_write(write)
+
+
+def mark_route_move_notified(db, *, epoch, admission_id):
+    def write(conn):
+        _epoch(conn, epoch)
+        receipt = _validated_route_move(conn, admission_id)
+        if receipt is not None and (receipt.get('notified') is not True or receipt.get('notice_epoch') != epoch):
+            receipt['notified'] = True
+            receipt['notice_epoch'] = epoch
+            conn.execute('UPDATE state_meta SET value=? WHERE key=?', (_json(receipt), ROUTE_MOVE_PREFIX + admission_id))
     return db._execute_write(write)
 
 

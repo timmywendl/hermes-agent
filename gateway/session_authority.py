@@ -423,6 +423,25 @@ class SessionAuthority:
                             self, SessionRef(self.profile_id, sid), row, source=source)
                 self._require_admission_open()
                 self.sessions.setdefault(sid, LiveSession(source, route))
+                from gateway.session_automation import recover_route_move_settlements
+                from hermes_state_runtime import route_move_receipts
+                moves = await asyncio.to_thread(route_move_receipts, self.db)
+                queue, seen, ancestors = [sid], {sid}, []
+                while queue:
+                    target = queue.pop()
+                    for moved in moves:
+                        if moved['new_session'] != target or moved['principal'] != 'automation:' + route:
+                            continue
+                        old_sid = moved['old_session']
+                        if old_sid in seen:
+                            continue
+                        seen.add(old_sid)
+                        queue.append(old_sid)
+                        ancestors.append(old_sid)
+                for old_sid in reversed(ancestors):
+                    self.sessions.setdefault(old_sid, LiveSession(source, route))
+                    await recover_route_move_settlements(self, SessionRef(self.profile_id, old_sid))
+                await recover_route_move_settlements(self, SessionRef(self.profile_id, sid))
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
                 self._schedule(SessionRef(self.profile_id, sid))
@@ -519,12 +538,14 @@ class SessionAuthority:
             row = live.settling.get(admission_id, row)
         return self._receipt(row)
 
-    async def cancel_queued(self, actor, ref, admission_id):
+    async def cancel_queued(self, actor, ref, admission_id, *, _before_media=None):
         before = await self.receipt(actor, ref, admission_id)
         from gateway.session_runtime_workers import track_mutation
         # Write off the shared loop; commit and observer settlement are one tracked task the
         # caller cannot cancel between (an exact retry still pays a left-over obligation).
         row = await asyncio.shield(track_mutation(self, self._commit_cancel(ref, admission_id, before)))
+        if _before_media is not None:
+            await asyncio.to_thread(_before_media)
         # Media collection is its own write txn after the committed, settled cancellation: its
         # failure surfaces to the caller, and an exact retry collects again without re-settling.
         from gateway.session_ingress_media import release_admission_media
@@ -576,8 +597,20 @@ class SessionAuthority:
             # completion is not attributed to the turn currently running ahead of it.
             live.event_stream.execution = {'authority_epoch': self.epoch, 'admission_id': admission_id}
             try:
-                live.event_stream.publish(ref.session_id, {
-                    'text': '', 'content': '', 'admission_id': admission_id, 'outcome': 'cancelled'})
+                watermark = live.event_stream.watermark()
+                try:
+                    live.event_stream.publish(ref.session_id, {
+                        'text': '', 'content': '', 'admission_id': admission_id, 'outcome': 'cancelled'})
+                except Exception:
+                    # Fanout can fail after the frame was committed to the
+                    # replay ring. Do not publish the same cancellation twice.
+                    replay = live.event_stream.since(*watermark)
+                    if replay['truncated'] or not any(
+                            event.get('type') == 'message.complete'
+                            and event.get('payload', {}).get('admission_id') == admission_id
+                            and event.get('payload', {}).get('outcome') == 'cancelled'
+                            for event in replay['events']):
+                        raise
             finally:
                 live.event_stream.execution = running
         # Published once: a later exact retry re-collects media but never repeats the completion.
@@ -1108,4 +1141,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     epochs[db_key] = epoch
     from gateway.session_local_recovery import recover_local_sessions
     recover_local_sessions(authority)
+    from gateway.session_automation import recover_route_move_settlements
+    for sid in tuple(authority.sessions):
+        await recover_route_move_settlements(authority, SessionRef(authority.profile_id, sid))
     return authority

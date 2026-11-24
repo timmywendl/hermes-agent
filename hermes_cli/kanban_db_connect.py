@@ -158,7 +158,7 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, required: bool = False):
     """Non-blocking single-writer guard around one dispatcher tick; yields
     ``True`` if this process holds the board's ``.dispatch.lock``, else
     ``False`` (caller skips the tick).
@@ -190,7 +190,7 @@ def _dispatch_tick_lock(db_path: Path):
     except OSError:
         # Can't even open the lock file (permissions, read-only FS): degrade to
         # a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        acquired = not required
         handle = None
     try:
         yield acquired
@@ -1294,4 +1294,99 @@ def write_txn(conn: sqlite3.Connection, *, allow_nested: bool = False):
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
+def board_stats(conn: sqlite3.Connection) -> dict:
+    """Per-status + per-assignee counts and the oldest ``ready`` age (staleness signal)."""
+    by_status: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT status, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' GROUP BY status"
+    ):
+        by_status[row["status"]] = int(row["n"])
+
+    by_assignee = _counts_by_assignee(conn)
+
+    oldest_row = conn.execute(
+        "SELECT MIN(created_at) AS ts FROM tasks WHERE status = 'ready'"
+    ).fetchone()
+    now = int(time.time())
+    oldest_ready_age = (
+        (now - int(oldest_row["ts"]))
+        if oldest_row and oldest_row["ts"] is not None else None
+    )
+
+    return {
+        "by_status": by_status,
+        "by_assignee": by_assignee,
+        "oldest_ready_age_seconds": oldest_ready_age,
+        "now": now,
+    }
+
+
+def _counts_by_assignee(conn: sqlite3.Connection) -> dict[str, dict[str, int]]:
+    """``{assignee: {status: n}}`` over non-archived tasks."""
+    counts: dict[str, dict[str, int]] = {}
+    for row in conn.execute(
+        "SELECT assignee, status, COUNT(*) AS n FROM tasks "
+        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "GROUP BY assignee, status"
+    ):
+        counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
+    return counts
+
+
+def count_running_tasks(conn: sqlite3.Connection) -> int:
+    """Number of tasks in ``status='running'``.
+
+    Used by the multi-board sweep to count OTHER boards' workers against the
+    host-level budget — the memory-derived cap bounds the machine, not the
+    board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    """
+    try:
+        return int(
+            conn.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+            ).fetchone()[0]
+        )
+    except Exception:
+        return 0
+
+
+def count_running_tasks_other_boards(board: Optional[str] = None, *, read_only: bool = False) -> int:
+    """Total ``running`` tasks across every board EXCEPT ``board``.
+
+    Caps bound the HOST, but each board's tick only sees its own DB; without
+    this a derived cap of N gets multiplied by the number of active boards.
+    Boards are matched by resolved DB path, so ``HERMES_KANBAN_DB`` (pins every
+    board to one file) yields 0. Fails open per board.
+    """
+    try:
+        current_path = str(_kb.kanban_db_path(board=board).expanduser().resolve())
+    except Exception:
+        current_path = None
+    try:
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return 0
+    total = 0
+    for meta in boards:
+        slug = meta.get("slug") or _kb.DEFAULT_BOARD
+        try:
+            path = _kb.kanban_db_path(board=slug).expanduser()
+            resolved = str(path.resolve())
+            if current_path is not None and resolved == current_path:
+                continue
+            if not path.exists():
+                continue
+            other = (sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+                     if read_only else connect(board=slug))
+            try:
+                total += count_running_tasks(other)
+            finally:
+                with contextlib.suppress(Exception):
+                    other.close()
+        except Exception:
+            continue
+    return total
+
+
 from hermes_cli import kanban_db as _kb

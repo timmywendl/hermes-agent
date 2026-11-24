@@ -682,7 +682,7 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure', 'generic_budget',
     'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout',
-    'generic_ci_late_long_success',
+    'generic_ci_late_long_success', 'generic_ci_method_failure',
     'changes_transition_body_drift', 'changes_transition_handoff_drift',
     'escalate_transition_body_drift', 'escalate_transition_handoff_drift', 'escalate_triage_handoff_drift',
 ])
@@ -702,6 +702,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout',
                 'generic_ci_late_long_success'}:
         mode = 'generic_approved'
+    if mode == 'generic_ci_method_failure':
+        mode = 'generic_ci_failure'
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
@@ -738,7 +740,9 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure'}:
         (workspace / 'src').mkdir()
         offset = 1 if mode in {'generic_approved', 'generic_ci_unknown'} else 2
-        (workspace / 'src' / 'calc.py').write_text(f'def increment(value):\n    return value + {offset}\n')
+        (workspace / 'src' / 'calc.py').write_text(
+            'class Calculator:\n    def increment(self, value):\n        return value + 2\n'
+            if variant == 'generic_ci_method_failure' else f'def increment(value):\n    return value + {offset}\n')
         git('add', 'src/calc.py')
     if mode == 'generic_root_approved':
         (workspace / 'calc.py').write_text('def increment(value):\n    return value + 1\n')
@@ -764,6 +768,9 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                        "sys.path.insert(0, 'src')\nfrom calc import increment\n"
                        "assert Path(increment.__code__.co_filename).resolve() == Path('src/calc.py').resolve()\n"
                        "assert increment(1) == 2\nassert increment(2) == 3\nHERMES_REVIEW")
+    if variant == 'generic_ci_method_failure':
+        generic_command = generic_command.replace('from calc import increment', 'from calc import Calculator').replace(
+            'increment.__code__', 'Calculator.increment.__code__').replace('assert increment(', 'assert Calculator().increment(')
     root_command = generic_command.replace("sys.path.insert(0, 'src')", "sys.path.insert(0, '.')").replace(
         "Path('src/calc.py')", "Path('calc.py')")
     calls = tmp_path / 'claude-calls'
@@ -911,7 +918,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         if mode in {'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
                     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure'}:
             body['task_spec']['instructions'] = 'Fixture acceptance criterion: update src/calc.py'
-            body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify src/calc.py::increment'
+            target = 'Calculator.increment' if variant == 'generic_ci_method_failure' else 'increment'
+            body['task_spec']['acceptance_criteria'] = f'increment returns the next integer\nVerify src/calc.py::{target}'
         if mode == 'generic_root_approved':
             body['task_spec']['instructions'] = 'Fixture acceptance criterion: update calc.py'
             body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify calc.py::increment'
@@ -1103,11 +1111,15 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 payload = json.loads(event['payload'])
                 assert payload['ci']['head'] == head and payload['ci']['pr_url'] == url
                 assert payload['verification']['python_check']['assertion_failed'] is True
+                if variant == 'generic_ci_method_failure':
+                    assert payload['verification']['python_check']['symbol'] == 'Calculator.increment'
+                    assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
                 if mode in {'generic_ci_failure', 'generic_ci_pending_failure'}:
                     assert task_state.assignee == 'dev' and kb.get_run(conn, run_id).outcome == 'changes_requested'
                     developer_context = kb.build_worker_context(conn, task)
                     assert url in developer_context and head in developer_context
-                    assert 'foundation' in developer_context and 'src/calc.py::increment' in developer_context
+                    target = 'Calculator.increment' if variant == 'generic_ci_method_failure' else 'increment'
+                    assert 'foundation' in developer_context and f'src/calc.py::{target}' in developer_context
                 else:
                     assert task_state.block_kind == 'needs_input' and kb.get_run(conn, run_id).outcome == 'blocked'
             if mode in {'changes_limit', 'generic_limit', 'generic_budget'}:

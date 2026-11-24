@@ -643,7 +643,9 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'malformed_after_result', 'ci_failure', 'ci_pending', 'ci_stale', 'ci_failure_prior',
     'changes_limit', 'changes_limit_drift', 'changes_limit_count_drift', 'generic_changes', 'generic_limit',
     'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
-    'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_budget',
+    'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_budget',
+    'changes_transition_body_drift', 'changes_transition_handoff_drift',
+    'escalate_transition_body_drift', 'escalate_transition_handoff_drift', 'escalate_triage_handoff_drift',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import hashlib
@@ -689,7 +691,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             "            and all(row['id'] != plan_id for row in rows))\n")
         git('add', 'src/cloud_test/domains/feeding_plan_resources.py')
     if mode in {'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
-                'generic_ci_event_drift', 'generic_ci_body_drift'}:
+                'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift'}:
         (workspace / 'src').mkdir()
         offset = 1 if mode in {'generic_approved', 'generic_ci_unknown'} else 2
         (workspace / 'src' / 'calc.py').write_text(f'def increment(value):\n    return value + {offset}\n')
@@ -753,7 +755,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'assert "Review Lenses" in prompt and "Fixture acceptance criterion" in prompt\n'
                    'if mode in {"generic_changes", "generic_limit", "generic_budget", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
-                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
+                   '"generic_ci_event_drift", "generic_ci_body_drift", "generic_ci_handoff_drift"}:\n'
                    '    assert "Execute the Task\'s relevant verification commands" in prompt\n'
                    '    assert "For the authorized feeding-plan Pilot" not in prompt\n'
                    'if mode in {"round2", "ci_failure_prior", "changes_limit", "changes_limit_drift", "changes_limit_count_drift"}:\n'
@@ -761,14 +763,14 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
                    'if mode in {"approved", "approved_real_format", "round2", "body_drift", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
-                   '"generic_ci_event_drift", "generic_ci_body_drift", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift", "generic_ci_handoff_drift", '
                    '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior"}:\n'
                    f'    command = {root_command!r} if mode == "generic_root_approved" else '
                    f'{generic_command!r} if mode.startswith("generic_") else {pilot_command!r}\n'
                    '    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n'
                    '    run = subprocess.run(command, shell=True, capture_output=True, text=True, env=env, check=False)\n'
                    '    assert (run.returncode != 0) == (mode in {"generic_ci_failure", "generic_ci_drift", "generic_ci_limit", '
-                   '"generic_ci_event_drift", "generic_ci_body_drift"}), run.stderr\n'
+                   '"generic_ci_event_drift", "generic_ci_body_drift", "generic_ci_handoff_drift"}), run.stderr\n'
                    '    use = {"type":"tool_use", "name":"Bash", "id":"tool-1", '
                    '"input":{"command":command}}\n'
                    '    print(json.dumps({"type":"assistant", "message":{"content":[use]}}))\n'
@@ -798,7 +800,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"approved", "approved_real_format", "round2", "body_drift", '
                    '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
-                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
+                   '"generic_ci_event_drift", "generic_ci_body_drift", "generic_ci_handoff_drift"} and not mode.startswith('
+                   '("changes_transition_", "escalate_transition_", "escalate_triage_")):\n'
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
                    '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
                    '"id": "tool-1", "name": "Bash", "input": {"command": '
@@ -808,7 +811,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"forged_junit", "approved", "approved_real_format", "round2", "body_drift", '
                    '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", "generic_root_approved", '
                    '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
-                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
+                   '"generic_ci_event_drift", "generic_ci_body_drift", "generic_ci_handoff_drift"} and not mode.startswith('
+                   '("changes_transition_", "escalate_transition_", "escalate_triage_")):\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
                    '    block = {"type": "tool_result", "tool_use_id": "tool-1", '
                    '"content": "Exit code 7\\nfailed" if failed else "1 passed", "is_error": failed}\n'
@@ -838,12 +842,14 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"generic_budget": "changes_requested", '
                    '"generic_ci_failure": "changes_requested", "generic_ci_drift": "changes_requested", '
                    '"generic_ci_unknown": "changes_requested", "generic_ci_limit": "changes_requested", '
-                   '"generic_ci_event_drift": "changes_requested", "generic_ci_body_drift": "changes_requested", '
+                   '"generic_ci_event_drift": "changes_requested", "generic_ci_body_drift": "changes_requested", "generic_ci_handoff_drift": "changes_requested", '
                    '"changes_limit": "changes_requested", "changes_limit_drift": "changes_requested", '
                    '"changes_limit_count_drift": "changes_requested", '
                    '"changes_unknown_result": "changes_requested", '
                    '"changes_failed_result": "changes_requested", '
                    '"escalate_unknown_result": "escalate"}.get(mode, mode)\n'
+                   'if mode.startswith("changes_transition_"): verdict_mode = "changes_requested"\n'
+                   'if mode.startswith(("escalate_transition_", "escalate_triage_")): verdict_mode = "escalate"\n'
                    'verdict = {"verdict": verdict_mode if verdict_mode in {"changes_requested", "escalate"} else '
                    '"unexpected" if mode == "invalid" else "approved", "reason": "review evidence"}\n'
                    'print(json.dumps(dict(type="result", subtype="success", is_error=False, '
@@ -854,12 +860,12 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         root = kb.create_task(conn, title='Root', assignee='dev')
         body = json.loads(goal.split('\n\n', 1)[1])
         if mode in {'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved', 'generic_ci_failure',
-                    'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift', 'generic_ci_body_drift'}:
+                    'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift'}:
             body['work_key'] = 'independent-generic-task/v1'
         if mode == 'generic_budget':
             body['task_spec']['max_retries'] = 1
         if mode in {'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
-                    'generic_ci_event_drift', 'generic_ci_body_drift'}:
+                    'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift'}:
             body['task_spec']['instructions'] = 'Fixture acceptance criterion: update src/calc.py'
             body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify src/calc.py::increment'
         if mode == 'generic_root_approved':
@@ -939,7 +945,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                          'conclusion': (None if pending else 'failure' if mode in {
                              'ci_failure', 'ci_failure_prior', 'generic_ci_failure', 'generic_ci_drift',
                              'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift',
-                             'generic_ci_body_drift'} else 'success')}]}]
+                             'generic_ci_body_drift', 'generic_ci_handoff_drift'} else 'success')}]}]
             assert endpoint == 'repos/DesignLibro/petlibro-cloud-test-platform/pulls/1'
             return {
                 'state': 'open', 'draft': True,
@@ -976,17 +982,41 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                                       "WHERE task_id=? AND kind='changes_requested' LIMIT 1)", (task,))
                 return result
             monkeypatch.setattr(kb, 'request_changes', drift_after_refusal)
-        if mode in {'generic_ci_event_drift', 'generic_ci_body_drift'}:
+        if mode in {'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift'}:
             request_changes = kb.request_changes
             def drift_before_handoff(*args, **kwargs):
                 with closing(connect()) as other, kb.write_txn(other):
                     if mode == 'generic_ci_body_drift':
                         other.execute('UPDATE tasks SET body=? WHERE id=?', ('changed before handoff', task))
+                    elif mode == 'generic_ci_handoff_drift':
+                        row = other.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                                            "AND kind='wave2_handoff' ORDER BY id DESC LIMIT 1", (task,)).fetchone()
+                        payload = json.loads(row['payload'])
+                        payload['branch'] = 'changed-branch'
+                        other.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
                     else:
                         other.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND run_id=? "
                                       "AND kind='review_ci_failure'", (task, run_id))
                 return request_changes(*args, **kwargs)
             monkeypatch.setattr(kb, 'request_changes', drift_before_handoff)
+        if mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_')):
+            if mode.startswith('escalate_triage_'):
+                with kb.write_txn(conn):
+                    conn.execute("UPDATE tasks SET block_kind='needs_input', block_recurrences=1 WHERE id=?", (task,))
+            method = 'request_changes' if mode.startswith('changes_') else 'block_task'
+            original = getattr(kb, method)
+            def drift_before_transition(*args, **kwargs):
+                with closing(connect()) as other, kb.write_txn(other):
+                    if mode.endswith('body_drift'):
+                        other.execute('UPDATE tasks SET body=? WHERE id=?', ('changed before transition', task))
+                    else:
+                        row = other.execute("SELECT id,payload FROM task_events WHERE task_id=? "
+                                            "AND kind='wave2_handoff' ORDER BY id DESC LIMIT 1", (task,)).fetchone()
+                        payload = json.loads(row['payload'])
+                        payload['branch'] = 'changed-branch'
+                        other.execute('UPDATE task_events SET payload=? WHERE id=?', (json.dumps(payload), row['id']))
+                return original(*args, **kwargs)
+            monkeypatch.setattr(kb, method, drift_before_transition)
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
         if mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
                     'changes_limit', 'generic_changes', 'generic_limit', 'generic_budget', 'generic_approved', 'generic_root_approved',
@@ -1053,9 +1083,17 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                     'source': 'calc.py' if mode == 'generic_root_approved' else 'src/calc.py',
                     'symbol': 'increment', 'cases': 2, 'assertion_failed': False}
         else:
-            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)'):
+            race = (mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_'))
+                    or mode == 'generic_ci_handoff_drift')
+            error = ('review_(stale_claim|acceptance_refused)' if mode == 'changes_transition_body_drift' else
+                     'review_stale_claim' if race else
+                     'review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)')
+            with pytest.raises(RuntimeStoreError, match=error):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
+            if mode.startswith(('changes_transition_', 'escalate_transition_', 'escalate_triage_')):
+                assert kb.get_task(conn, task).current_run_id == run_id
+                assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
             if mode in {'generic_ci_drift', 'generic_ci_unknown'}:
                 assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='review_ci_failure'",
                                     (task,)).fetchone()[0] == 0

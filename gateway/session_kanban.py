@@ -764,7 +764,9 @@ def _review_completion_guard(conn, context, origin, *, status='done'):
                    and count == 1 and (created_by, key, event_id, event_payload) == origin)
     if status not in ('done', 'blocked', 'handoff'):
         raise ValueError('invalid review transition')
-    status_sql = "NEW.status IN ('ready', 'todo')" if status == 'handoff' else f"NEW.status = '{status}'"
+    status_sql = {"handoff": "NEW.status IN ('ready', 'todo')",
+                  "blocked": "NEW.status IN ('blocked', 'triage')",
+                  "done": "NEW.status = 'done'"}[status]
     conn.create_function(name, 10, unchanged)
     try:
         conn.execute(f'''CREATE TEMP TRIGGER "{name}" BEFORE UPDATE OF status ON main.tasks
@@ -794,7 +796,7 @@ def _review_completion_guard(conn, context, origin, *, status='done'):
 
 
 @contextmanager
-def _review_limit_guard(conn, context, handoff_id):
+def _review_limit_guard(conn, context, handoff_id, handoff):
     """Recheck the repair limit and Owner binding under block_task's writer lock."""
     import logging
     import secrets
@@ -809,14 +811,14 @@ def _review_limit_guard(conn, context, handoff_id):
                 wave2_review_refusal(conn, context['task_id'], context['run_id'], context['claim_lock'])
                 == 'review repair limit reached; preserve evidence and request a decision'
                 and _bound_worker_matches(conn, context)
-                and _review_handoff(conn, context)[0] == handoff_id
+                and _review_handoff(conn, context) == (handoff_id, handoff)
             )
         except (RuntimeStoreError, sqlite3.Error, TypeError, ValueError, KeyError):
             return 0
     conn.create_function(name, 1, still_exhausted)
     try:
         conn.execute(f'''CREATE TEMP TRIGGER "{name}" BEFORE UPDATE OF status ON main.tasks
-                         WHEN NEW.status = 'blocked'
+                         WHEN NEW.status IN ('blocked', 'triage')
                          BEGIN SELECT CASE WHEN "{name}"(OLD.id) = 0
                               THEN RAISE(ABORT, 'review limit changed') END; END''')
         try:
@@ -834,30 +836,35 @@ def _review_limit_guard(conn, context, handoff_id):
 
 
 @contextmanager
-def _review_ci_handoff_guard(conn, context, handoff_id, event_id, event_payload):
-    """Keep the exact CI and execution receipt bound inside request_changes."""
+def _review_transition_guard(conn, context, handoff_id, handoff, *, status, event_id=None, event_payload=None):
+    """Keep Owner, handoff and optional CI evidence bound during a native transition."""
     import logging
     import secrets
 
     name = 'hermes_review_ci_' + secrets.token_hex(12)
+    status_sql = {"handoff": "NEW.status IN ('ready', 'todo')",
+                  "blocked": "NEW.status IN ('blocked', 'triage')",
+                  "done": "NEW.status = 'done'"}[status]
     def unchanged(task_id):
         if task_id != context['task_id']:
             return 1
         try:
-            row = conn.execute(
-                "SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? "
-                "AND kind='review_ci_failure' ORDER BY id DESC LIMIT 1",
-                (task_id, context['run_id']),
-            ).fetchone()
-            return int(row is not None and row[0] == event_id and json.loads(row[1]) == event_payload
-                       and _bound_worker_matches(conn, context)
-                       and _review_handoff(conn, context)[0] == handoff_id)
+            if event_id is not None:
+                row = conn.execute(
+                    "SELECT id,payload FROM task_events WHERE task_id=? AND run_id=? "
+                    "AND kind='review_ci_failure' ORDER BY id DESC LIMIT 1",
+                    (task_id, context['run_id']),
+                ).fetchone()
+                if row is None or row[0] != event_id or json.loads(row[1]) != event_payload:
+                    return 0
+            return int(_bound_worker_matches(conn, context)
+                       and _review_handoff(conn, context) == (handoff_id, handoff))
         except (RuntimeStoreError, sqlite3.Error, TypeError, ValueError, KeyError):
             return 0
     conn.create_function(name, 1, unchanged)
     try:
         conn.execute(f'''CREATE TEMP TRIGGER "{name}" BEFORE UPDATE OF status ON main.tasks
-                         WHEN NEW.status IN ('ready', 'todo')
+                         WHEN {status_sql}
                          BEGIN SELECT CASE WHEN "{name}"(OLD.id) = 0
                               THEN RAISE(ABORT, 'review CI evidence changed') END; END''')
         try:
@@ -1397,10 +1404,11 @@ def _run_claude_review(context):
                 raise RuntimeStoreError('kanban_claude_review_stale_claim')
             try:
                 with _review_completion_guard(conn, context, origin):
-                    ok = kb.complete_task(conn, task_id, result=reason, metadata={
-                        'published_pr': handoff['url'], 'head_sha': handoff['head'], 'review_verdict': 'approved',
-                        'review_execution': execution,
-                    }, **claim)
+                    with _review_transition_guard(conn, context, handoff_id, handoff, status='done'):
+                        ok = kb.complete_task(conn, task_id, result=reason, metadata={
+                            'published_pr': handoff['url'], 'head_sha': handoff['head'], 'review_verdict': 'approved',
+                            'review_execution': execution,
+                        }, **claim)
             except sqlite3.IntegrityError as exc:
                 raise RuntimeStoreError('kanban_claude_review_stale_claim') from exc
         elif verdict['verdict'] == 'changes_requested':
@@ -1439,25 +1447,42 @@ def _run_claude_review(context):
                     event_id = conn.execute('SELECT last_insert_rowid()').fetchone()[0]
                 try:
                     with _review_completion_guard(conn, context, origin, status='handoff'):
-                        with _review_ci_handoff_guard(conn, context, handoff_id, event_id, payload):
+                        with _review_transition_guard(conn, context, handoff_id, handoff,
+                                                      status='handoff', event_id=event_id, event_payload=payload):
                             ok, refusal = kb.request_changes(conn, task_id, reason=reason, **claim)
                 except sqlite3.IntegrityError as exc:
                     raise RuntimeStoreError('kanban_claude_review_stale_claim') from exc
             else:
-                ok, refusal = kb.request_changes(conn, task_id, reason=reason, **claim)
+                origin = _review_task_origin(conn, context)
+                if origin is None:
+                    raise RuntimeStoreError('kanban_claude_review_stale_claim')
+                try:
+                    with _review_completion_guard(conn, context, origin, status='handoff'):
+                        with _review_transition_guard(conn, context, handoff_id, handoff, status='handoff'):
+                            ok, refusal = kb.request_changes(conn, task_id, reason=reason, **claim)
+                except sqlite3.IntegrityError as exc:
+                    raise RuntimeStoreError('kanban_claude_review_stale_claim') from exc
             if not ok and refusal == 'review repair limit reached; preserve evidence and request a decision':
                 origin = _review_task_origin(conn, context)
                 if origin is None:
                     raise RuntimeStoreError('kanban_claude_review_stale_claim')
                 try:
                     with _review_completion_guard(conn, context, origin, status='blocked'):
-                        with _review_limit_guard(conn, context, handoff_id):
+                        with _review_limit_guard(conn, context, handoff_id, handoff):
                             ok = kb.block_task(conn, task_id, reason=f'{refusal}: {reason}',
                                                kind='needs_input', **claim)
                 except sqlite3.IntegrityError as exc:
                     raise RuntimeStoreError('kanban_claude_review_stale_claim') from exc
         else:
-            ok = kb.block_task(conn, task_id, reason=reason, kind='needs_input', **claim)
+            origin = _review_task_origin(conn, context)
+            if origin is None:
+                raise RuntimeStoreError('kanban_claude_review_stale_claim')
+            try:
+                with _review_completion_guard(conn, context, origin, status='blocked'):
+                    with _review_transition_guard(conn, context, handoff_id, handoff, status='blocked'):
+                        ok = kb.block_task(conn, task_id, reason=reason, kind='needs_input', **claim)
+            except sqlite3.IntegrityError as exc:
+                raise RuntimeStoreError('kanban_claude_review_stale_claim') from exc
         if not ok:
             raise RuntimeStoreError('kanban_claude_review_acceptance_refused')
     return {'final_response': reason, 'completed': True}

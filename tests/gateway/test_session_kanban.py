@@ -645,6 +645,7 @@ def test_review_repair_budget_never_exceeds_frozen_task_grant(monkeypatch, budge
     'generic_approved', 'generic_root_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
     'generic_ci_event_drift', 'generic_ci_body_drift', 'generic_ci_handoff_drift', 'generic_ci_pending_failure', 'generic_budget',
     'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout',
+    'generic_ci_late_long_success',
     'changes_transition_body_drift', 'changes_transition_handoff_drift',
     'escalate_transition_body_drift', 'escalate_transition_handoff_drift', 'escalate_triage_handoff_drift',
 ])
@@ -661,7 +662,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     from hermes_state_runtime import RuntimeStoreError
 
     variant = mode
-    if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout'}:
+    if mode in {'generic_ci_late_pending_success', 'generic_ci_late_failure', 'generic_ci_late_pending_timeout',
+                'generic_ci_late_long_success'}:
         mode = 'generic_approved'
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -929,6 +931,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                                  'native-review', request_id, 'admission')
         monkeypatch.setattr(acceptance, '_assignee_profile_home', lambda _: None)
         check_reads = []
+        elapsed = [0.0]
         def fake_api(endpoint, **kwargs):
             if endpoint == 'graphql':
                 if mode == 'body_drift':
@@ -946,6 +949,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 pending = (mode == 'ci_pending' or (mode == 'generic_ci_drift' and len(check_reads) > 1)
                            or (variant == 'generic_ci_late_pending_success' and len(check_reads) == 2)
                            or (variant == 'generic_ci_late_pending_timeout' and len(check_reads) > 1)
+                           or (variant == 'generic_ci_late_long_success' and len(check_reads) > 1 and elapsed[0] < 45)
                            or (mode == 'generic_ci_pending_failure' and len(check_reads) == 1))
                 late_failure = variant == 'generic_ci_late_failure' and len(check_reads) > 1
                 return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
@@ -965,6 +969,11 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             }
         if mode == 'generic_ci_pending_failure' or variant == 'generic_ci_late_pending_success':
             monkeypatch.setattr('time.sleep', lambda _seconds: None)
+        if variant == 'generic_ci_late_long_success':
+            import time
+            base_time = time.monotonic()
+            monkeypatch.setattr(time, 'monotonic', lambda: base_time + elapsed[0])
+            monkeypatch.setattr(time, 'sleep', lambda seconds: elapsed.__setitem__(0, elapsed[0] + seconds))
         monkeypatch.setattr(acceptance, '_api', fake_api)
         monkeypatch.setattr('hermes_cli.profiles.resolve_profile_env', lambda name: str(tmp_path / name))
         params = dict(task_id=task, run_id=run_id, claim_lock=lock, board='default')
@@ -977,6 +986,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         context['max_runtime_seconds'] = 1 if mode in {'timeout', 'timeout_after_result'} else 15
         if variant == 'generic_ci_late_pending_timeout':
             context['max_runtime_seconds'] = 4
+        if variant == 'generic_ci_late_long_success':
+            context['max_runtime_seconds'] = 120
         if mode == 'task_mismatch':
             context['task_id'] = sibling
         elif mode == 'run_mismatch':
@@ -1159,6 +1170,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             assert calls.read_text() == 'call\n'
         if variant == 'generic_ci_late_pending_success':
             assert len(check_reads) >= 4
+        if variant == 'generic_ci_late_long_success':
+            assert elapsed[0] >= 45 and len(check_reads) > 10
 
 
 @pytest.mark.parametrize('outcome', ['failure', 'success', 'timeout', 'head_drift', 'claim_drift', 'handoff_drift'])
@@ -1194,7 +1207,60 @@ def test_review_waits_for_pending_ci_before_one_review(monkeypatch, outcome):
         assert (result is not None) == (outcome == 'failure')
         if result:
             assert result['checks'][0]['classification'] == 'failure'
-    assert len(calls) == (1 if outcome in {'claim_drift', 'handoff_drift'} else 2)
+    if outcome == 'timeout':
+        assert len(calls) >= 2
+    else:
+        assert len(calls) == (1 if outcome in {'claim_drift', 'handoff_drift'} else 2)
+
+
+def test_review_ci_wait_can_use_remaining_run_budget_without_second_review(monkeypatch):
+    import sqlite3
+    import time
+    from gateway import session_kanban as sk
+    from hermes_cli import kanban_pr_acceptance as acceptance
+
+    now = [1000.0]
+    monkeypatch.setattr(time, 'time', lambda: now[0])
+    monkeypatch.setattr(time, 'monotonic', lambda: now[0] - 1000)
+    monkeypatch.setattr(time, 'sleep', lambda seconds: now.__setitem__(0, now[0] + seconds))
+    monkeypatch.setattr(sk, '_bound_claim_is_live', lambda _: True)
+    handoff = {'url': 'https://github.com/owner/repo/pull/1', 'head': 'a' * 40, 'base': 'main'}
+    monkeypatch.setattr(sk, '_review_handoff', lambda *_: (5, handoff))
+    context = {'task_id': 'task', 'run_id': 7, 'claim_lock': 'claim', 'profile': 'reviewer',
+               'max_runtime_seconds': 90}
+    with sqlite3.connect(':memory:') as conn:
+        conn.execute('CREATE TABLE task_runs (id, task_id, started_at, max_runtime_seconds, claim_lock, status)')
+        conn.execute("INSERT INTO task_runs VALUES (7, 'task', 990, 80, 'claim', 'running')")
+        deadline = sk._review_run_deadline(conn, context)
+        assert deadline == 66.0  # 80-second Run, 10 seconds used, 4-second margin.
+        def collect(*_args, **_kwargs):
+            state = 'success' if now[0] >= 1045 else 'pending'
+            return {'ok': state == 'success', 'classification': state, 'pr_url': handoff['url'],
+                    'head_sha': handoff['head'], 'base_ref': handoff['base'], 'checks': []}
+        monkeypatch.setattr(acceptance, 'collect_acceptance', collect)
+        assert sk._wait_review_ci(conn, context, 5, handoff, deadline=deadline) is None
+        assert now[0] >= 1045 and now[0] < 1066
+
+
+def test_review_ci_deadline_rejects_foreign_or_expired_run(monkeypatch):
+    import sqlite3
+    import time
+    from gateway import session_kanban as sk
+    from hermes_state_runtime import RuntimeStoreError
+
+    monkeypatch.setattr(time, 'time', lambda: 1000.0)
+    monkeypatch.setattr(time, 'monotonic', lambda: 100.0)
+    context = {'task_id': 'task', 'run_id': 7, 'claim_lock': 'claim', 'max_runtime_seconds': 30}
+    with sqlite3.connect(':memory:') as conn:
+        conn.execute('CREATE TABLE task_runs (id, task_id, started_at, max_runtime_seconds, claim_lock, status)')
+        conn.execute("INSERT INTO task_runs VALUES (7, 'task', 900, 30, 'claim', 'running')")
+        assert sk._review_run_deadline(conn, context) == 100.0
+        conn.execute("UPDATE task_runs SET claim_lock='foreign'")
+        with pytest.raises(RuntimeStoreError, match='review_stale_claim'):
+            sk._review_run_deadline(conn, context)
+        conn.execute("UPDATE task_runs SET claim_lock='claim', started_at=1005")
+        with pytest.raises(RuntimeStoreError, match='review_ci_uncertain'):
+            sk._review_run_deadline(conn, context)
 
 
 def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):

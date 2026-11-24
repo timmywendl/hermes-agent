@@ -1195,8 +1195,35 @@ def _required_failed_ci(context, handoff, *, receipt=None):
     return {'pr_url': handoff['url'], 'head': handoff['head'], 'base': handoff['base'], 'checks': result}
 
 
-def _wait_review_ci(conn, context, handoff_id, handoff):
-    """Wait briefly for pending required CI before asking the one Reviewer.
+def _review_run_deadline(conn, context):
+    """Bound CI waiting by the original native Run, including time already spent."""
+    import time
+    from hermes_cli.kanban_db import _to_epoch
+
+    row = conn.execute("SELECT started_at,max_runtime_seconds,claim_lock,status FROM task_runs "
+                       "WHERE id=? AND task_id=?", (context['run_id'], context['task_id'])).fetchone()
+    if not row or row[2] != context['claim_lock'] or row[3] != 'running':
+        raise RuntimeStoreError('kanban_claude_review_stale_claim')
+    try:
+        started = _to_epoch(row[0])
+    except (OverflowError, TypeError, ValueError):
+        raise RuntimeStoreError('kanban_claude_review_ci_uncertain') from None
+    configured = context.get('max_runtime_seconds')
+    if configured is None:
+        configured = 900
+    if (started is None or type(configured) is not int or configured <= 0
+            or (row[1] is not None and (type(row[1]) is not int or row[1] <= 0))):
+        raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
+    now = time.time()
+    if started > now + 1:
+        raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
+    limit = min(configured, row[1] if row[1] is not None else configured, 900)
+    remaining = limit - max(0.0, now - started) - min(5.0, limit * .05)
+    return time.monotonic() + max(0.0, remaining)
+
+
+def _wait_review_ci(conn, context, handoff_id, handoff, *, deadline=None):
+    """Wait for pending required CI within the supplied Run deadline.
 
     This keeps the original Run and claim; it does not retry a Worker or turn an
     unavailable check into a code failure. Unknown, stale, and timeout remain
@@ -1207,8 +1234,10 @@ def _wait_review_ci(conn, context, handoff_id, handoff):
 
     runtime = context.get('max_runtime_seconds')
     budget = min(30.0, max(0.0, float(runtime) / 4)) if type(runtime) in (int, float) else 30.0
-    deadline = time.monotonic() + budget
+    deadline = time.monotonic() + budget if deadline is None else deadline
     while True:
+        if time.monotonic() >= deadline:
+            raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
         if not _bound_claim_is_live(context) or _review_handoff(conn, context) != (handoff_id, handoff):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
         receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
@@ -1217,12 +1246,14 @@ def _wait_review_ci(conn, context, handoff_id, handoff):
         if (receipt.get('pr_url') != handoff['url'] or receipt.get('head_sha') != handoff['head']
                 or receipt.get('base_ref') != handoff['base']):
             raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
+        if time.monotonic() >= deadline:
+            raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
         if receipt.get('classification') != 'pending':
             return _required_failed_ci(context, handoff, receipt=receipt)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
-        time.sleep(min(2.0, remaining))
+        time.sleep(min(5.0, max(.01, remaining / 2)))
 
 
 def _claude_verdict(context, handoff, base):
@@ -1400,7 +1431,12 @@ def _run_claude_review(context):
         base = _check_review_candidate(context['workspace'], handoff, context['profile'])
         if not _bound_claim_is_live(context):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
-        review_ci = None if _is_pilot_review(context) else _wait_review_ci(conn, context, handoff_id, handoff)
+        review_deadline = None if _is_pilot_review(context) else _review_run_deadline(conn, context)
+        now = time.monotonic()
+        before_review = (now + min(30, max(0.0, review_deadline - now) / 4)
+                         if review_deadline is not None else None)
+        review_ci = None if review_deadline is None else _wait_review_ci(
+            conn, context, handoff_id, handoff, deadline=before_review)
         context = dict(context, review_ci=review_ci)
         verdict, execution, approval_evidence_ok = _claude_verdict(context, handoff, base)
         if _check_review_candidate(context['workspace'], handoff, context['profile']) != base:
@@ -1441,7 +1477,7 @@ def _run_claude_review(context):
                 # CI can enter a new pending state while Claude is running. Wait
                 # in this same Run; a newly failed check is not proof that the
                 # successful local verification reproduced its failure.
-                if _wait_review_ci(conn, context, handoff_id, handoff) is not None:
+                if _wait_review_ci(conn, context, handoff_id, handoff, deadline=review_deadline) is not None:
                     raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
             origin = _review_task_origin(conn, context)
             if origin is None:

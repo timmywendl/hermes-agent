@@ -484,7 +484,8 @@ def test_pilot_review_receipt_uses_real_check_and_matching_events(tmp_path, monk
         assert check['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
 
 
-@pytest.mark.parametrize('mode', ['success', 'root_success', 'failed', 'interrupted', 'missing', 'unrelated_task', 'wrong_path'])
+@pytest.mark.parametrize('mode', ['success', 'root_success', 'reordered_inputs', 'method_success', 'method_failed',
+                                  'failed', 'interrupted', 'missing', 'unrelated_task', 'wrong_path'])
 def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monkeypatch, mode):
     import subprocess
     import sys
@@ -499,7 +500,11 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
         'commit', '--allow-empty', '-m', 'base')
     base = git('rev-parse', 'HEAD')
     source = 'calc.py' if mode == 'root_success' else 'src/calc.py'
-    (workspace / source).write_text('def increment(value):\n    return value + 1\n')
+    (workspace / source).write_text(
+        'def increment(left, right):\n    return left - right\n' if mode == 'reordered_inputs' else
+        f'class Calculator:\n    def increment(self, value):\n        return value + {2 if mode == "method_failed" else 1}\n'
+        if mode in {'method_success', 'method_failed'} else
+        'def increment(value):\n    return value + 1\n')
     git('add', source)
     git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'candidate')
     head = git('rev-parse', 'HEAD')
@@ -511,6 +516,12 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
               f"assert Path(increment.__code__.co_filename).resolve() == Path({target!r}).resolve()\n"
               "assert increment(1) == 2\n"
               f"assert increment(2) == {expected}\n")
+    if mode == 'reordered_inputs':
+        script = script.replace('assert increment(1) == 2\nassert increment(2) == 3',
+                                'assert increment(3, 1) == 2\nassert increment(1, 3) == -2')
+    if mode in {'method_success', 'method_failed'}:
+        script = script.replace('from calc import increment', 'from calc import Calculator').replace(
+            'increment.__code__', 'Calculator.increment.__code__').replace('assert increment(', 'assert Calculator().increment(')
     command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
@@ -534,7 +545,8 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
     monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt',
                         lambda *_: ('skill', ['sdlc-review'], []))
     spec = {'title': 'Fix increment', 'instructions': f'Update {source}',
-            'acceptance_criteria': f'increment returns the next integer\nVerify {source}::increment'}
+            'acceptance_criteria': f'increment returns the next integer\nVerify {source}::'
+                                   + ('Calculator.increment' if mode in {'method_success', 'method_failed'} else 'increment')}
     if mode == 'unrelated_task':
         spec['acceptance_criteria'] = 'Do not verify src/calc.py::increment'
     body = {'repo': 'example/project', 'work_key': 'generic/v1', 'task_spec': spec}
@@ -545,13 +557,13 @@ def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monk
     handoff = {'url': 'https://github.com/example/project/pull/1', 'head': head, 'base': 'main'}
     verdict, receipt, accepted = sk._claude_verdict(context, handoff, base)
     assert verdict['verdict'] == 'approved'
-    assert accepted is (mode in {'success', 'root_success'})
+    assert accepted is (mode in {'success', 'root_success', 'reordered_inputs', 'method_success'})
     if accepted:
         check = receipt['commands'][0]
-        assert check['python_check'] == {'source': source, 'symbol': 'increment', 'cases': 2,
+        assert check['python_check'] == {'source': source, 'symbol': 'Calculator.increment' if mode == 'method_success' else 'increment', 'cases': 2,
                                          'assertion_failed': False}
         assert check['exit_status'] == 0 and 'increment(1)' not in json.dumps(receipt)
-    elif mode == 'failed':
+    elif mode in {'failed', 'method_failed'}:
         assert receipt['commands'][0]['python_check']['assertion_failed'] is True
     elif mode == 'interrupted':
         assert receipt['commands'][0]['python_check']['assertion_failed'] is False
@@ -575,10 +587,35 @@ def test_generic_python_review_rejects_unrelated_or_unexecuted_checks():
     assert validate(script.replace('assert increment(2) == 3\n', '')) is None
     assert validate(script.replace('increment(2)', 'increment(1)')) is None
     assert validate(script.replace('increment(2)', 'increment(value=1)')) is None
+    swapped = script.replace('increment(1) == 2', 'increment(3, 1) == 2').replace(
+        'increment(2) == 3', 'increment(1, 3) == -2')
+    assert validate(swapped)['cases'] == 2
+    assert validate(swapped.replace('increment(1, 3)', 'increment(left=3, right=1)')) is None
+    assert validate(swapped.replace('increment(3, 1)', 'increment(left=3, right=1)').replace(
+        'increment(1, 3)', 'increment(right=1, left=3)')) is None
     assert validate(script.replace('assert increment(2) == 3', 'assert True')) is None
     assert validate(script + "print('1 passed')\n") is None
     assert validate(script.replace('increment(2)', 'increment(open("secret"))')) is None
     assert validate(script.replace("Path('src/calc.py')", "Path('src/other.py')")) is None
+
+
+def test_generic_method_review_rejects_unbound_or_unsafe_calls():
+    from gateway.session_kanban import _generic_python_review_script
+
+    body = {'task_spec': {'acceptance_criteria': 'Verify src/calc.py::Calculator.increment'}}
+    goal = 'Task\n\n' + json.dumps(body)
+    script = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\n"
+              "from calc import Calculator\n"
+              "assert Path(Calculator.increment.__code__.co_filename).resolve() == Path('src/calc.py').resolve()\n"
+              "assert Calculator().increment(1) == 2\nassert Calculator().increment(2) == 3\n")
+    def validate(value, criteria=goal):
+        return _generic_python_review_script(value, criteria, ['src/calc.py'])
+    assert validate(script)['symbol'] == 'Calculator.increment'
+    assert validate(script.replace('Calculator().increment(2)', 'Calculator(0).increment(2)')) is None
+    assert validate(script.replace('Calculator().increment(2)', 'Calculator().other(2)')) is None
+    assert validate(script.replace('Calculator.increment.__code__', 'Calculator.other.__code__')) is None
+    assert validate(script, goal.replace('Verify ', 'Do not verify ')) is None
+    assert validate(script, goal.replace('Calculator.increment', 'Calculator.other')) is None
 
 
 def test_native_ci_review_history_survives_gc(tmp_path, monkeypatch):

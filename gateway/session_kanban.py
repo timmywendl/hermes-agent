@@ -1166,12 +1166,13 @@ def _check_review_candidate(workspace, handoff, assignee):
     return base
 
 
-def _required_failed_ci(context, handoff):
+def _required_failed_ci(context, handoff, *, receipt=None):
     """Read exact-HEAD required-check facts; ambiguous or changing CI is unknown."""
     from hermes_cli.kanban_db import redact_review_value
     from hermes_cli.kanban_pr_acceptance import collect_acceptance
 
-    receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
+    if receipt is None:
+        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
     checks = receipt.get('checks')
     if (receipt.get('classification') != 'failure' or receipt.get('ok') is not False
             or receipt.get('pr_url') != handoff['url'] or receipt.get('head_sha') != handoff['head']
@@ -1192,6 +1193,36 @@ def _required_failed_ci(context, handoff):
     if not any(check['classification'] == 'failure' for check in result):
         return None
     return {'pr_url': handoff['url'], 'head': handoff['head'], 'base': handoff['base'], 'checks': result}
+
+
+def _wait_review_ci(conn, context, handoff_id, handoff):
+    """Wait briefly for pending required CI before asking the one Reviewer.
+
+    This keeps the original Run and claim; it does not retry a Worker or turn an
+    unavailable check into a code failure. Unknown, stale, and timeout remain
+    non-authorizing. The terminal write independently rechecks acceptance.
+    """
+    import time
+    from hermes_cli.kanban_pr_acceptance import collect_acceptance
+
+    runtime = context.get('max_runtime_seconds')
+    budget = min(30.0, max(0.0, float(runtime) / 4)) if type(runtime) in (int, float) else 30.0
+    deadline = time.monotonic() + budget
+    while True:
+        if not _bound_claim_is_live(context) or _review_handoff(conn, context) != (handoff_id, handoff):
+            raise RuntimeStoreError('kanban_claude_review_stale_claim')
+        receipt = collect_acceptance(handoff['url'], handoff['url'], assignee=context['profile'])
+        if not _bound_claim_is_live(context) or _review_handoff(conn, context) != (handoff_id, handoff):
+            raise RuntimeStoreError('kanban_claude_review_stale_claim')
+        if (receipt.get('pr_url') != handoff['url'] or receipt.get('head_sha') != handoff['head']
+                or receipt.get('base_ref') != handoff['base']):
+            raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
+        if receipt.get('classification') != 'pending':
+            return _required_failed_ci(context, handoff, receipt=receipt)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeStoreError('kanban_claude_review_ci_uncertain')
+        time.sleep(min(2.0, remaining))
 
 
 def _claude_verdict(context, handoff, base):
@@ -1369,7 +1400,7 @@ def _run_claude_review(context):
         base = _check_review_candidate(context['workspace'], handoff, context['profile'])
         if not _bound_claim_is_live(context):
             raise RuntimeStoreError('kanban_claude_review_stale_claim')
-        review_ci = None if _is_pilot_review(context) else _required_failed_ci(context, handoff)
+        review_ci = None if _is_pilot_review(context) else _wait_review_ci(conn, context, handoff_id, handoff)
         context = dict(context, review_ci=review_ci)
         verdict, execution, approval_evidence_ok = _claude_verdict(context, handoff, base)
         if _check_review_candidate(context['workspace'], handoff, context['profile']) != base:

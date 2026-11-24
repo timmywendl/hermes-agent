@@ -425,8 +425,28 @@ def wave2_review_refusal(conn, task_id, run_id, expected_claim_lock=None):
         return None
     if wave2_review_claim(conn, task_id, run_id, expected_claim_lock) is None:
         return 'review Run or Owner provenance is missing'
+    # A configured Task retry budget is also an upper bound on review repair
+    # handoffs. Never let the older global limit silently expand that grant.
+    import json
+    task = conn.execute('SELECT body,max_retries FROM tasks WHERE id=?', (task_id,)).fetchone()
+    if task is None:
+        return 'review Task provenance is missing'
+    try:
+        body = json.loads(task[0]) if task[0] else {}
+    except (TypeError, ValueError):
+        return 'review Task provenance is missing'
+    if not isinstance(body, dict):
+        return 'review Task provenance is missing'
+    spec = body.get('task_spec')
+    configured = task[1]
+    if isinstance(spec, dict) and 'max_retries' in spec:
+        if type(spec['max_retries']) is not int or spec['max_retries'] != configured:
+            return 'review Task repair budget is inconsistent'
+    if configured is not None and (type(configured) is not int or configured < 0):
+        return 'review Task repair budget is inconsistent'
+    limit = min(3, configured) if configured is not None else 3
     count = conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='changes_requested'", (task_id,)).fetchone()[0]
-    if count >= 3:
+    if count >= limit:
         return 'review repair limit reached; preserve evidence and request a decision'
     return None
 
@@ -436,7 +456,7 @@ def event_gc_sql():
     return (
         "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed', 'workspace_bound') "
         "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
-        "AND (kind NOT IN ('owner_admitted', 'owner_admission_bound', 'wave2_publication_intent', 'wave2_publication_attempt', 'wave2_handoff', 'wave2_verdict') "
+        "AND (kind NOT IN ('owner_admitted', 'owner_admission_bound', 'wave2_publication_intent', 'wave2_publication_attempt', 'wave2_handoff', 'wave2_verdict', 'review_execution', 'review_ci_failure', 'changes_requested') "
         "OR task_id NOT IN (SELECT id FROM tasks WHERE created_by='ai-colleague-stage3' UNION "
         "SELECT task_id FROM task_events WHERE kind='created' AND CASE WHEN json_valid(payload) "
         "THEN json_extract(payload, '$.publication_protocol')='wave2_v1' ELSE 0 END))"

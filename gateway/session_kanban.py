@@ -492,7 +492,7 @@ def _pilot_review_script(script, goal_text, handoff):
         spec = body['task_spec']
         description = ' '.join(spec[key] for key in ('title', 'instructions', 'acceptance_criteria')).lower()
         if (body['repo'] != 'DesignLibro/petlibro-cloud-test-platform'
-                or body['work_key'] != 'cloud-confirm-feeding-plan-absent-bool-id/v1'
+                or body['work_key'] != 'confirm-feeding-plan-absent-bool-id/v1'
                 or not handoff['url'].startswith('https://github.com/DesignLibro/petlibro-cloud-test-platform/pull/')
                 or 'confirm_feeding_plan_absent' not in description
                 or 'bool' not in description or 'id' not in description):
@@ -614,7 +614,7 @@ def _pilot_task_origin(conn, context):
                             (context['task_id'],)).fetchall()
         if (not task or task[0] != 'ai-colleague-stage3' or task[1] != key or len(rows) != 1
                 or body['repo'] != 'DesignLibro/petlibro-cloud-test-platform'
-                or body['work_key'] != 'cloud-confirm-feeding-plan-absent-bool-id/v1'
+                or body['work_key'] != 'confirm-feeding-plan-absent-bool-id/v1'
                 or body['task_spec_digest'] != hashlib.sha256(spec_bytes).hexdigest()
                 or body['publication_protocol'] != 'wave2_v1'):
             return None

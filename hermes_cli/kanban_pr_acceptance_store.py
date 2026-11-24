@@ -436,7 +436,7 @@ def event_gc_sql():
     return (
         "DELETE FROM task_events WHERE created_at < ? AND kind NOT IN ('created', 'decomposed', 'workspace_bound') "
         "AND task_id IN (SELECT id FROM tasks WHERE status IN ('done', 'archived')) "
-        "AND (kind NOT IN ('owner_admitted', 'owner_admission_bound', 'wave2_publication_intent', 'wave2_publication_attempt', 'wave2_handoff', 'wave2_verdict') "
+        "AND (kind NOT IN ('owner_admitted', 'owner_admission_bound', 'wave2_publication_intent', 'wave2_publication_attempt', 'wave2_handoff', 'wave2_verdict', 'review_execution', 'review_ci_failure', 'changes_requested') "
         "OR task_id NOT IN (SELECT id FROM tasks WHERE created_by='ai-colleague-stage3' UNION "
         "SELECT task_id FROM task_events WHERE kind='created' AND CASE WHEN json_valid(payload) "
         "THEN json_extract(payload, '$.publication_protocol')='wave2_v1' ELSE 0 END))"

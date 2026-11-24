@@ -484,6 +484,127 @@ def test_pilot_review_receipt_uses_real_check_and_matching_events(tmp_path, monk
         assert check['script_sha256'] == hashlib.sha256(script.encode()).hexdigest()
 
 
+@pytest.mark.parametrize('mode', ['success', 'failed', 'interrupted', 'missing', 'unrelated_task', 'wrong_path'])
+def test_generic_python_review_requires_real_bound_behavior_check(tmp_path, monkeypatch, mode):
+    import subprocess
+    import sys
+    from gateway import session_kanban as sk
+
+    workspace = tmp_path / 'candidate'
+    (workspace / 'src').mkdir(parents=True)
+    def git(*args):
+        return subprocess.check_output(['git', '-C', str(workspace), *args], text=True).strip()
+    git('init')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+        'commit', '--allow-empty', '-m', 'base')
+    base = git('rev-parse', 'HEAD')
+    (workspace / 'src' / 'calc.py').write_text('def increment(value):\n    return value + 1\n')
+    git('add', 'src/calc.py')
+    git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-m', 'candidate')
+    head = git('rev-parse', 'HEAD')
+    target = 'src/other.py' if mode == 'wrong_path' else 'src/calc.py'
+    expected = 9 if mode in {'failed', 'interrupted'} else 3
+    script = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\n"
+              "from calc import increment\n"
+              f"assert Path(increment.__code__.co_filename).resolve() == Path({target!r}).resolve()\n"
+              "assert increment(1) == 2\n"
+              f"assert increment(2) == {expected}\n")
+    command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
+    cli = tmp_path / 'fake-claude'
+    cli.write_text(f'#!{sys.executable}\n'
+                   'import json, subprocess, sys\n'
+                   'if "--version" in sys.argv:\n'
+                   '    print("2.1.323 (Claude Code)"); sys.exit(0)\n'
+                   'sys.stdin.read()\n'
+                   f'command = {command!r}\n'
+                   'run = subprocess.run(command, shell=True, capture_output=True, text=True, check=False)\n'
+                   'use = {"type":"tool_use", "name":"Bash", "id":"tool-1", "input":{"command":command}}\n'
+                   'print(json.dumps({"type":"assistant", "message":{"content":[use]}}))\n'
+                   f'if {mode != "missing"!r}:\n'
+                   '    result = {"type":"tool_result", "tool_use_id":"tool-1", "is_error":bool(run.returncode), '
+                   '"content":("Exit code " + str(run.returncode) + "\\nfailed") if run.returncode else run.stdout}\n'
+                   f'    runtime = {{"stdout":run.stdout, "stderr":run.stderr, "interrupted":{mode == "interrupted"!r}, '
+                   '"exitCode":run.returncode}\n'
+                   '    print(json.dumps({"type":"user", "message":{"content":[result]}, "tool_use_result":runtime}))\n'
+                   'print(json.dumps({"type":"result", "subtype":"success", "is_error":False, '
+                   '"structured_output":{"verdict":"approved", "reason":"fixture"}}))\n')
+    cli.chmod(0o700)
+    monkeypatch.setattr('agent.skill_commands.build_preloaded_skills_prompt',
+                        lambda *_: ('skill', ['sdlc-review'], []))
+    spec = {'title': 'Fix increment', 'instructions': 'Update src/calc.py',
+            'acceptance_criteria': 'increment returns the next integer\nVerify src/calc.py::increment'}
+    if mode == 'unrelated_task':
+        spec['acceptance_criteria'] = 'Do not verify src/calc.py::increment'
+    body = {'repo': 'example/project', 'work_key': 'generic/v1', 'task_spec': spec}
+    context = {'claude_review': {'executable': str(cli), 'config_dir': str(tmp_path)},
+               'workspace': str(workspace), 'task_id': 'task', 'run_id': 7, 'claim_lock': 'private-claim',
+               'review_task_body': json.dumps(body), 'goal_text': 'Generic\n\n' + json.dumps(body),
+               'context': 'fixture', 'review_findings': []}
+    handoff = {'url': 'https://github.com/example/project/pull/1', 'head': head, 'base': 'main'}
+    verdict, receipt, accepted = sk._claude_verdict(context, handoff, base)
+    assert verdict['verdict'] == 'approved'
+    assert accepted is (mode == 'success')
+    if accepted:
+        check = receipt['commands'][0]
+        assert check['python_check'] == {'source': 'src/calc.py', 'symbol': 'increment', 'cases': 2,
+                                         'assertion_failed': False}
+        assert check['exit_status'] == 0 and 'increment(1)' not in json.dumps(receipt)
+    elif mode == 'failed':
+        assert receipt['commands'][0]['python_check']['assertion_failed'] is True
+    elif mode == 'interrupted':
+        assert receipt['commands'][0]['python_check']['assertion_failed'] is False
+
+
+def test_generic_python_review_rejects_unrelated_or_unexecuted_checks():
+    from gateway.session_kanban import _generic_python_review_script
+
+    body = {'task_spec': {'title': 'Fix increment', 'instructions': 'Update src/calc.py',
+                          'acceptance_criteria': 'Verify src/calc.py::increment'}}
+    goal = 'Task\n\n' + json.dumps(body)
+    script = ("import sys\nfrom pathlib import Path\nsys.path.insert(0, 'src')\n"
+              "from calc import increment\n"
+              "assert Path(increment.__code__.co_filename).resolve() == Path('src/calc.py').resolve()\n"
+              "assert increment(1) == 2\nassert increment(2) == 3\n")
+    def validate(value, paths=None):
+        return _generic_python_review_script(value, goal, ['src/calc.py'] if paths is None else paths)
+    assert validate(script) == {'source': 'src/calc.py', 'symbol': 'increment', 'cases': 2,
+                                '_assert_lines': [6, 7]}
+    assert validate(script, []) is None
+    assert validate(script.replace('assert increment(2) == 3\n', '')) is None
+    assert validate(script.replace('increment(2)', 'increment(1)')) is None
+    assert validate(script.replace('assert increment(2) == 3', 'assert True')) is None
+    assert validate(script + "print('1 passed')\n") is None
+    assert validate(script.replace('increment(2)', 'increment(open("secret"))')) is None
+    assert validate(script.replace("Path('src/calc.py')", "Path('src/other.py')")) is None
+
+
+def test_native_ci_review_history_survives_gc(tmp_path, monkeypatch):
+    from contextlib import closing
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_connect import connect
+    from hermes_cli.kanban_pr_acceptance_store import event_gc_sql
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_KANBAN_HOME', str(tmp_path))
+    monkeypatch.delenv('HERMES_KANBAN_DB', raising=False)
+    kb.init_db()
+    with closing(connect()) as conn:
+        selected = kb.create_task(conn, title='selected', created_by='ai-colleague-stage3')
+        ordinary = kb.create_task(conn, title='ordinary', created_by='fixture')
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status='done' WHERE id IN (?,?)", (selected, ordinary))
+            for task_id in (selected, ordinary):
+                for kind in ('review_execution', 'review_ci_failure', 'changes_requested'):
+                    kb._append_event(conn, task_id, kind, {'fixture': True})
+            conn.execute("UPDATE task_events SET created_at=1 WHERE kind IN "
+                         "('review_execution','review_ci_failure','changes_requested')")
+            conn.execute(event_gc_sql(), (2,))
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind IN "
+                            "('review_execution','review_ci_failure','changes_requested')", (selected,)).fetchone()[0] == 3
+        assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind IN "
+                            "('review_execution','review_ci_failure','changes_requested')", (ordinary,)).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize('mode', [
     'approved', 'changes_requested', 'escalate', 'round2', 'failure', 'timeout', 'invalid',
     'head_drift', 'remote_drift', 'no_execution', 'test_failure', 'missing_result',
@@ -492,7 +613,10 @@ def test_pilot_review_receipt_uses_real_check_and_matching_events(tmp_path, monk
     'unrelated_execution', 'all_skipped', 'missing_junit', 'report_overwritten', 'forged_junit',
     'body_drift',
     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result', 'timeout_after_result',
-    'malformed_after_result',
+    'malformed_after_result', 'ci_failure', 'ci_pending', 'ci_stale', 'ci_failure_prior',
+    'changes_limit', 'changes_limit_drift', 'changes_limit_count_drift', 'generic_changes', 'generic_limit',
+    'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
+    'generic_ci_event_drift', 'generic_ci_body_drift',
 ])
 def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     import hashlib
@@ -524,7 +648,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     (workspace / 'candidate.txt').write_text('fixture change\n')
     git('add', 'candidate.txt')
     script, goal, pilot_handoff = _pilot_check_fixture()
-    if mode in {'approved', 'approved_real_format', 'round2', 'body_drift'}:
+    if mode in {'approved', 'approved_real_format', 'round2', 'body_drift',
+                'ci_failure', 'ci_pending', 'ci_stale', 'ci_failure_prior'}:
         source = workspace / 'src' / 'cloud_test' / 'domains'
         source.mkdir(parents=True)
         (source / 'feeding_plan_resources.py').write_text(
@@ -536,6 +661,12 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             "            and all(type(row.get('id')) is int for row in rows)\n"
             "            and all(row['id'] != plan_id for row in rows))\n")
         git('add', 'src/cloud_test/domains/feeding_plan_resources.py')
+    if mode in {'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
+                'generic_ci_event_drift', 'generic_ci_body_drift'}:
+        (workspace / 'src').mkdir()
+        offset = 1 if mode in {'generic_approved', 'generic_ci_unknown'} else 2
+        (workspace / 'src' / 'calc.py').write_text(f'def increment(value):\n    return value + {offset}\n')
+        git('add', 'src/calc.py')
     if mode == 'forged_junit':
         (workspace / 'tests').mkdir()
         (workspace / 'tests' / 'test_candidate.py').write_text(
@@ -553,6 +684,10 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     head = git('rev-parse', 'HEAD')
     url = pilot_handoff['url']
     pilot_command = "python3 - <<'HERMES_REVIEW'\n" + script + 'HERMES_REVIEW'
+    generic_command = ("python3 - <<'HERMES_REVIEW'\nimport sys\nfrom pathlib import Path\n"
+                       "sys.path.insert(0, 'src')\nfrom calc import increment\n"
+                       "assert Path(increment.__code__.co_filename).resolve() == Path('src/calc.py').resolve()\n"
+                       "assert increment(1) == 2\nassert increment(2) == 3\nHERMES_REVIEW")
     calls = tmp_path / 'claude-calls'
     cli = tmp_path / 'fake-claude'
     cli.write_text(f'#!{sys.executable}\n'
@@ -584,19 +719,29 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '"commit","--allow-empty","-m","drift"], stdout=subprocess.DEVNULL, check=True)\n'
                    'if mode == "workspace_dirty": pathlib.Path("candidate.txt").write_text("modified by review\\n")\n'
                    'assert "Review Lenses" in prompt and "Fixture acceptance criterion" in prompt\n'
-                   'if mode == "round2":\n'
+                   'if mode in {"generic_changes", "generic_limit", "generic_approved", '
+                   '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
+                   '    assert "Execute the Task\'s relevant verification commands" in prompt\n'
+                   '    assert "For the authorized feeding-plan Pilot" not in prompt\n'
+                   'if mode in {"round2", "ci_failure_prior", "changes_limit", "changes_limit_drift", "changes_limit_count_drift"}:\n'
                    '    assert "Prior attempts on this task" in prompt and "Round 2 handoff" in prompt\n'
                    '    assert prompt.count("Round 1: preserve the exact ID type") >= 2\n'
-                   'if mode in {"approved", "approved_real_format", "round2", "body_drift"}:\n'
-                   f'    command = {pilot_command!r}\n'
+                   'if mode in {"approved", "approved_real_format", "round2", "body_drift", "generic_approved", '
+                   '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift", '
+                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior"}:\n'
+                   f'    command = {generic_command!r} if mode.startswith("generic_") else {pilot_command!r}\n'
                    '    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")\n'
                    '    run = subprocess.run(command, shell=True, capture_output=True, text=True, env=env, check=False)\n'
-                   '    assert run.returncode == 0, run.stderr\n'
+                   '    assert (run.returncode != 0) == (mode in {"generic_ci_failure", "generic_ci_drift", "generic_ci_limit", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift"}), run.stderr\n'
                    '    use = {"type":"tool_use", "name":"Bash", "id":"tool-1", '
                    '"input":{"command":command}}\n'
                    '    print(json.dumps({"type":"assistant", "message":{"content":[use]}}))\n'
                    '    result = {"type":"tool_result", "tool_use_id":"tool-1", '
-                   '"is_error":False, "content":run.stdout}\n'
+                   '"is_error":bool(run.returncode), "content": '
+                   '("Exit code " + str(run.returncode) + "\\nfailed") if run.returncode else run.stdout}\n'
                    '    runtime = {"stdout":run.stdout, "stderr":run.stderr, "interrupted":False}\n'
                    '    if mode != "approved_real_format": runtime["exitCode"] = run.returncode\n'
                    '    print(json.dumps({"type":"user", "message":{"content":[result]}, '
@@ -616,15 +761,21 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    '    print(json.dumps({"type": "user", "message": {"content": [block]}, '
                    '"tool_use_result": {"stdout": result.stdout, "stderr": result.stderr, '
                    '"interrupted": False, "exitCode": result.returncode}}))\n'
-                   'if mode not in {"no_execution", "changes_requested", "escalate", "forged_junit", '
-                   '"approved", "approved_real_format", "round2", "body_drift"}:\n'
+                   'if mode not in {"no_execution", "changes_requested", "changes_limit", "changes_limit_drift", "changes_limit_count_drift", "generic_changes", "generic_limit", "escalate", "forged_junit", '
+                   '"approved", "approved_real_format", "round2", "body_drift", '
+                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", '
+                   '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
                    '    target = "tests/test_other.py" if mode == "unrelated_execution" else "tests/test_candidate.py"\n'
                    '    call = {"type": "assistant", "message": {"content": [{"type": "tool_use", '
                    '"id": "tool-1", "name": "Bash", "input": {"command": '
                    '"scripts/run_tests.sh -o addopts= " + target + " --junitxml=" + report}}]}}\n'
                    '    print(json.dumps(call))\n'
-                   'if mode not in {"no_execution", "changes_requested", "escalate", "missing_result", '
-                   '"forged_junit", "approved", "approved_real_format", "round2", "body_drift"}:\n'
+                   'if mode not in {"no_execution", "changes_requested", "changes_limit", "changes_limit_drift", "changes_limit_count_drift", "generic_changes", "generic_limit", "escalate", "missing_result", '
+                   '"forged_junit", "approved", "approved_real_format", "round2", "body_drift", '
+                   '"ci_failure", "ci_pending", "ci_stale", "ci_failure_prior", "generic_approved", '
+                   '"generic_ci_failure", "generic_ci_drift", "generic_ci_unknown", "generic_ci_limit", '
+                   '"generic_ci_event_drift", "generic_ci_body_drift"}:\n'
                    '    failed = mode in {"test_failure", "changes_failed_result"}\n'
                    '    block = {"type": "tool_result", "tool_use_id": "tool-1", '
                    '"content": "Exit code 7\\nfailed" if failed else "1 passed", "is_error": failed}\n'
@@ -650,7 +801,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                    'if mode == "malformed_after_result": print("{malformed"); sys.exit(0)\n'
                    'if mode == "timeout_after_result":\n'
                    '    print("{\\\"type\\\":", end="", flush=True); time.sleep(10)\n'
-                   'verdict_mode = {"changes_unknown_result": "changes_requested", '
+                   'verdict_mode = {"generic_changes": "changes_requested", "generic_limit": "changes_requested", '
+                   '"generic_ci_failure": "changes_requested", "generic_ci_drift": "changes_requested", '
+                   '"generic_ci_unknown": "changes_requested", "generic_ci_limit": "changes_requested", '
+                   '"generic_ci_event_drift": "changes_requested", "generic_ci_body_drift": "changes_requested", '
+                   '"changes_limit": "changes_requested", "changes_limit_drift": "changes_requested", '
+                   '"changes_limit_count_drift": "changes_requested", '
+                   '"changes_unknown_result": "changes_requested", '
                    '"changes_failed_result": "changes_requested", '
                    '"escalate_unknown_result": "escalate"}.get(mode, mode)\n'
                    'verdict = {"verdict": verdict_mode if verdict_mode in {"changes_requested", "escalate"} else '
@@ -662,6 +819,13 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
     with closing(connect()) as conn:
         root = kb.create_task(conn, title='Root', assignee='dev')
         body = json.loads(goal.split('\n\n', 1)[1])
+        if mode in {'generic_changes', 'generic_limit', 'generic_approved', 'generic_ci_failure',
+                    'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift', 'generic_ci_body_drift'}:
+            body['work_key'] = 'independent-generic-task/v1'
+        if mode in {'generic_approved', 'generic_ci_failure', 'generic_ci_drift', 'generic_ci_unknown', 'generic_ci_limit',
+                    'generic_ci_event_drift', 'generic_ci_body_drift'}:
+            body['task_spec']['instructions'] = 'Fixture acceptance criterion: update src/calc.py'
+            body['task_spec']['acceptance_criteria'] = 'increment returns the next integer\nVerify src/calc.py::increment'
         body['root_id'] = root
         body['objective_id'] = 'cloud-test-status-next-legal-step/v1'
         body['publication_protocol'] = 'wave2_v1'
@@ -679,7 +843,8 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         sibling = kb.create_task(conn, title='sibling', assignee='dev')
         sibling_run = kb.claim_task(conn, sibling)
         dev = kb.claim_task(conn, task)
-        if mode == 'round2':
+        for _ in range(3 if mode in {'ci_failure_prior', 'changes_limit', 'changes_limit_drift',
+                                     'changes_limit_count_drift', 'generic_limit', 'generic_ci_limit'} else 1 if mode == 'round2' else 0):
             assert kb.request_review(conn, task, reviewer='reviewer', summary='Round 1 handoff',
                                      expected_run_id=dev.current_run_id)
             prior_review = kb.claim_review_task(conn, task)
@@ -712,6 +877,7 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
         sk._bind_owner_admission(conn, {'task_id': task, 'run_id': run_id, 'claim_lock': lock},
                                  'native-review', request_id, 'admission')
         monkeypatch.setattr(acceptance, '_assignee_profile_home', lambda _: None)
+        check_reads = []
         def fake_api(endpoint, **kwargs):
             if endpoint == 'graphql':
                 if mode == 'body_drift':
@@ -725,8 +891,15 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             if '/rules/branches/' in endpoint or '/statuses' in endpoint:
                 return [[]]
             if '/check-runs' in endpoint:
+                check_reads.append(1)
+                pending = mode == 'ci_pending' or (mode == 'generic_ci_drift' and len(check_reads) > 1)
                 return [{'total_count': 1, 'check_runs': [{'id': 4, 'name': 'foundation',
-                         'head_sha': head, 'app': {'id': 7}, 'status': 'completed', 'conclusion': 'success'}]}]
+                         'head_sha': base if mode == 'ci_stale' else head, 'app': {'id': 7},
+                         'status': 'in_progress' if pending else 'completed',
+                         'conclusion': (None if pending else 'failure' if mode in {
+                             'ci_failure', 'ci_failure_prior', 'generic_ci_failure', 'generic_ci_drift',
+                             'generic_ci_unknown', 'generic_ci_limit', 'generic_ci_event_drift',
+                             'generic_ci_body_drift'} else 'success')}]}]
             assert endpoint == 'repos/DesignLibro/petlibro-cloud-test-platform/pulls/1'
             return {
                 'state': 'open', 'draft': True,
@@ -751,17 +924,67 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
             context['run_id'] = sibling_run.current_run_id
         elif mode == 'claim_mismatch':
             context['claim_lock'] = 'wrong-claim'
+        if mode in {'changes_limit_drift', 'changes_limit_count_drift'}:
+            request_changes = kb.request_changes
+            def drift_after_refusal(*args, **kwargs):
+                result = request_changes(*args, **kwargs)
+                with closing(connect()) as other, kb.write_txn(other):
+                    if mode == 'changes_limit_drift':
+                        other.execute('UPDATE tasks SET body=? WHERE id=?', ('changed after refusal', task))
+                    else:
+                        other.execute("DELETE FROM task_events WHERE id=(SELECT id FROM task_events "
+                                      "WHERE task_id=? AND kind='changes_requested' LIMIT 1)", (task,))
+                return result
+            monkeypatch.setattr(kb, 'request_changes', drift_after_refusal)
+        if mode in {'generic_ci_event_drift', 'generic_ci_body_drift'}:
+            request_changes = kb.request_changes
+            def drift_before_handoff(*args, **kwargs):
+                with closing(connect()) as other, kb.write_txn(other):
+                    if mode == 'generic_ci_body_drift':
+                        other.execute('UPDATE tasks SET body=? WHERE id=?', ('changed before handoff', task))
+                    else:
+                        other.execute("UPDATE task_events SET payload='{}' WHERE task_id=? AND run_id=? "
+                                      "AND kind='review_ci_failure'", (task, run_id))
+                return request_changes(*args, **kwargs)
+            monkeypatch.setattr(kb, 'request_changes', drift_before_handoff)
         prior_runs = [r for r in kb.list_runs(conn, task) if r.id != run_id]
         if mode in {'approved', 'approved_real_format', 'changes_requested', 'escalate', 'round2',
+                    'changes_limit', 'generic_changes', 'generic_limit', 'generic_approved',
+                    'generic_ci_failure', 'generic_ci_limit',
                     'changes_unknown_result', 'escalate_unknown_result', 'changes_failed_result'}:
             result = sk._run_task_turns(None, {}, [], context)
-            assert result['final_response'] == 'review evidence'
+            if mode in {'generic_ci_failure', 'generic_ci_limit'}:
+                assert 'review evidence' in result['final_response']
+            else:
+                assert result['final_response'] == 'review evidence'
             task_state = kb.get_task(conn, task)
             assert task_state.status == {'changes_requested': 'ready', 'changes_unknown_result': 'ready',
                                          'changes_failed_result': 'ready',
+                                         'changes_limit': 'blocked', 'generic_changes': 'ready', 'generic_limit': 'blocked',
+                                         'generic_ci_failure': 'ready', 'generic_ci_limit': 'blocked',
                                          'escalate': 'blocked', 'escalate_unknown_result': 'blocked'}.get(mode, 'done')
-            if mode in {'changes_requested', 'changes_unknown_result', 'changes_failed_result'}:
+            if mode in {'changes_requested', 'changes_unknown_result', 'changes_failed_result', 'generic_changes'}:
                 assert task_state.assignee == 'dev'
+            if mode in {'generic_ci_failure', 'generic_ci_limit'}:
+                event = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                     "AND kind='review_ci_failure'", (task, run_id)).fetchone()
+                payload = json.loads(event['payload'])
+                assert payload['ci']['head'] == head and payload['ci']['pr_url'] == url
+                assert payload['verification']['python_check']['assertion_failed'] is True
+                if mode == 'generic_ci_failure':
+                    assert task_state.assignee == 'dev' and kb.get_run(conn, run_id).outcome == 'changes_requested'
+                    developer_context = kb.build_worker_context(conn, task)
+                    assert url in developer_context and head in developer_context
+                    assert 'foundation' in developer_context and 'src/calc.py::increment' in developer_context
+                else:
+                    assert task_state.block_kind == 'needs_input' and kb.get_run(conn, run_id).outcome == 'blocked'
+            if mode in {'changes_limit', 'generic_limit'}:
+                assert task_state.block_kind == 'needs_input'
+            if mode in {'changes_limit', 'generic_limit'}:
+                assert task_state.current_run_id is None
+                assert kb.get_run(conn, run_id).outcome == 'blocked'
+                assert 'review repair limit reached' in kb.get_run(conn, run_id).summary
+                assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
             if mode == 'changes_failed_result':
                 row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
                                    "AND kind='review_execution'", (task, run_id)).fetchone()
@@ -781,10 +1004,31 @@ def test_claude_native_review_turn(tmp_path, monkeypatch, mode):
                 assert evidence['commands'][0]['script'] == sk._pilot_review_script(script, goal, {'url': url})
                 assert evidence['commands'][0]['exit_status'] == 0
                 assert len(evidence['commands'][0]['output_sha256']) == 64
+            if mode == 'generic_approved':
+                evidence = kb.get_run(conn, run_id).metadata['review_execution']
+                assert evidence['task_id'] == task and evidence['run_id'] == run_id
+                assert evidence['published_pr'] == url and evidence['head_sha'] == head
+                assert evidence['commands'][0]['python_check'] == {
+                    'source': 'src/calc.py', 'symbol': 'increment', 'cases': 2, 'assertion_failed': False}
         else:
-            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable)'):
+            with pytest.raises(RuntimeStoreError, match='review_(failed|candidate_changed|stale_claim|sandbox_unavailable|acceptance_refused|ci_uncertain)'):
                 sk._run_task_turns(None, {}, [], context)
             assert kb.get_task(conn, task).status == 'running'
+            if mode in {'generic_ci_drift', 'generic_ci_unknown'}:
+                assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='review_ci_failure'",
+                                    (task,)).fetchone()[0] == 0
+            if mode in {'changes_limit_drift', 'changes_limit_count_drift'}:
+                if mode == 'changes_limit_drift':
+                    assert kb.get_task(conn, task).body == 'changed after refusal'
+                assert kb.get_task(conn, sibling).current_run_id == sibling_run.current_run_id
+            if mode in {'ci_pending', 'ci_stale', 'ci_failure', 'ci_failure_prior'}:
+                row = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+                                   "AND kind='pr_acceptance' ORDER BY id DESC LIMIT 1",
+                                   (task, run_id)).fetchone()
+                receipt = json.loads(row['payload'])
+                assert receipt['classification'] == ('failure' if mode == 'ci_failure_prior'
+                                                      else mode.removeprefix('ci_'))
+                assert receipt['head_sha'] == head and receipt['pr_url'] == url
             if mode == 'body_drift':
                 assert kb.get_task(conn, task).body == 'changed after review'
                 assert conn.execute("SELECT count(*) FROM task_events WHERE task_id=? AND kind='pr_acceptance'",

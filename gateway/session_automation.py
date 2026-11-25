@@ -238,17 +238,48 @@ async def admit_automation(authority, adapter, event, identity):
     from gateway.session_authority import LiveSession
     sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
     ref = SessionRef(authority.profile_id, sid)
+    from gateway.session_kanban import check_board_execution
+    # Exact replays skip the NEW-write authorization callback; refuse them before scheduling too.
+    check_board_execution(authority, ref)
     authority.sessions.setdefault(ref.session_id, LiveSession(event.source, entry.session_key))
     from functools import partial
     from gateway.session_runtime_workers import tracked_write
     return await tracked_write(authority, partial(
         admit_session_input, authority.db, epoch=authority.epoch, principal_id='automation:' + entry.session_key,
         session_id=ref.session_id, request_id=identity, payload=deepcopy(payload),
-        _authorize_write=authority._admission_gate()), then=partial(authority._admitted, ref, event), ordered=True,
+        _authorize_write=authority._board_admission_gate(ref)), then=partial(authority._admitted, ref, event), ordered=True,
         after=partial(authority._schedule_admitted, ref))
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
+
+
+async def recover_route_move_settlements(authority, ref):
+    """Re-publish pending cancellation on the restored Owner before media release."""
+    import asyncio
+    import logging
+    from functools import partial
+    from gateway.session_contract import Principal
+    from hermes_state_runtime import clear_route_move_receipt, mark_route_move_notified, route_move_receipts
+    receipts = await asyncio.to_thread(route_move_receipts, authority.db)
+    actor = Principal('messaging-control', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'reset')
+    for receipt in receipts:
+        if receipt['old_session'] != ref.session_id:
+            continue
+        admission_id = receipt['old']
+        try:
+            if receipt.get('settled') is True:
+                await asyncio.to_thread(clear_route_move_receipt, authority.db, epoch=authority.epoch,
+                                        admission_id=admission_id)
+                continue
+            if receipt.get('notified') is not True or receipt.get('notice_epoch') != authority.epoch:
+                authority.cancel_obligations.add(admission_id)
+            await authority.cancel_queued(actor, ref, admission_id, _before_media=partial(
+                mark_route_move_notified, authority.db, epoch=authority.epoch, admission_id=admission_id))
+            await asyncio.to_thread(clear_route_move_receipt, authority.db, epoch=authority.epoch,
+                                    admission_id=admission_id)
+        except Exception:
+            logging.getLogger(__name__).warning('Route move settlement remains pending', exc_info=True)
 
 
 async def move_route_wakes(runner, session_key, old_session_id):
@@ -266,34 +297,95 @@ async def move_route_wakes(runner, session_key, old_session_id):
     from functools import partial
     from gateway.session_authority import LiveSession
     from gateway.session_contract import Principal
-    from gateway.session_runtime_workers import tracked_write
-    from hermes_state_runtime import list_session_admissions
+    from gateway.session_runtime_workers import track_mutation, tracked_write
+    from hermes_state_runtime import get_session_admission, list_session_admissions, move_queued_route_input
     old = SessionRef(authority.profile_id, authority.logical_owner(old_session_id))
     new = SessionRef(authority.profile_id, authority.logical_owner(entry.session_id))
     if old.session_id not in authority.sessions or old == new:
         return
+    await recover_route_move_settlements(authority, old)
+    from gateway.session_kanban import check_board_execution
+    actor = Principal('messaging-control', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'reset')
+    # A prior commit may have succeeded while cancellation publication failed.
+    # Reuse the original exact-retry settlement and media-release path.
+    for admission_id in tuple(authority.cancel_obligations):
+        prior = await asyncio.to_thread(get_session_admission, authority.db, admission_id=admission_id)
+        if (prior and prior['target_session_id'] == old.session_id
+                and (prior['status'], prior['outcome']) == ('terminal', 'cancelled')):
+            await authority.cancel_queued(actor, old, admission_id)
+    check_board_execution(authority, old)
+    check_board_execution(authority, new)
     rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=old.session_id)
     if any(row['status'] == 'unknown' for row in rows):
         return
-    actor = Principal('messaging-control', authority.profile_id, frozenset({'session:submit', 'session:control'}), 'reset')
     for row in rows:
         automation = row['payload'].get('native_text_v1', {}).get('automation', {})
         identity = json.loads(row['request_id']) if automation and row['request_id'].startswith('[') else None
         if (row['status'] != 'queued' or row['principal_id'] != 'automation:' + session_key
                 or not isinstance(identity, list) or identity[:1] not in ([p] for p in _ROUTE_WAKE_PRODUCERS)):
             continue
-        try:
-            await authority.cancel_queued(actor, old, row['admission_id'])
-        except RuntimeStoreError:
-            continue  # claimed meanwhile: it runs where it is
+        check_board_execution(authority, old)
+        check_board_execution(authority, new)
         payload = deepcopy(row['payload'])
         payload['native_text_v1']['automation']['owner'] = new.session_id
         authority.sessions.setdefault(new.session_id, LiveSession(authority.sessions[old.session_id].source, session_key))
-        await tracked_write(authority, partial(
-            admit_session_input, authority.db, epoch=authority.epoch, principal_id=row['principal_id'],
-            session_id=new.session_id, request_id=row['request_id'], payload=payload,
-            _authorize_write=authority._admission_gate()), then=partial(authority._admitted, new, None),
-            ordered=True, after=partial(authority._schedule_admitted, new))
+        before = await authority.receipt(actor, old, row['admission_id'])
+        if before.status != 'queued':
+            continue
+        def guard(conn):
+            authority._board_admission_gate(old)(conn)
+            authority._board_admission_gate(new)(conn)
+        committed = [False]
+        async def publish(result):
+            committed[0] = True
+            try:
+                from hermes_state_runtime import clear_route_move_receipt, mark_route_move_notified
+                await authority.cancel_queued(actor, old, row['admission_id'], _before_media=partial(
+                    mark_route_move_notified, authority.db, epoch=authority.epoch, admission_id=row['admission_id']))
+                await asyncio.to_thread(clear_route_move_receipt, authority.db, epoch=authority.epoch,
+                                        admission_id=row['admission_id'])
+                return authority._admitted(new, None, result)
+            except Exception:
+                authority._schedule_admitted(new)
+                raise
+        authority.cancel_obligations.add(row['admission_id'])
+        async def move_and_reconcile():
+            try:
+                return await tracked_write(authority, partial(
+                    move_queued_route_input, authority.db, epoch=authority.epoch, admission_id=row['admission_id'],
+                    old_session_id=old.session_id, new_session_id=new.session_id, principal_id=row['principal_id'],
+                    request_id=row['request_id'], payload=payload, guard=guard), then=publish,
+                    ordered=True, after=partial(authority._schedule_admitted, new))
+            except RuntimeStoreError:
+                if not committed[0]:
+                    prior = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
+                    if prior and prior['status'] == 'queued':
+                        authority.cancel_obligations.discard(row['admission_id'])
+                    elif prior and (prior['status'], prior['outcome']) == ('terminal', 'cancelled'):
+                        # A first transaction committed before its retry saw a
+                        # newly paused Board. Finish its already-owed notice;
+                        # do not dispatch the now-paused destination.
+                        await recover_route_move_settlements(authority, old)
+                raise
+            except Exception:
+                # Commit may have succeeded even if its caller saw an error.
+                # Re-read before retrying settlement, and wake the destination
+                # even if the database is currently unavailable.
+                try:
+                    prior = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
+                    if prior and (prior['status'], prior['outcome']) == ('terminal', 'cancelled'):
+                        await recover_route_move_settlements(authority, old)
+                    elif prior and prior['status'] == 'queued':
+                        authority.cancel_obligations.discard(row['admission_id'])
+                finally:
+                    authority._schedule_admitted(new)
+                raise
+        try:
+            await asyncio.shield(track_mutation(authority, move_and_reconcile()))
+        except RuntimeStoreError as exc:
+            if exc.reason == 'stale_generation':
+                continue
+            raise
 
 
 async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):

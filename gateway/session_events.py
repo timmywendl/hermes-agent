@@ -60,7 +60,13 @@ class SessionEvents:
                 return {'jsonrpc': '2.0', 'method': 'event', 'params': {
                     'type': 'session.replay_gap', 'session_id': session_id,
                     'payload': {'replay_epoch': self.epoch, 'latest_seq': self.sequence}}}
-            delivered = self.fanout.write(frame, overflow=overflow)
+            fanout_error = None
+            try:
+                delivered = self.fanout.write(frame, overflow=overflow)
+            except Exception as exc:  # health: allow BLE001 -- notify observers before re-raising arbitrary fanout failures
+                # The frame is already in the replay ring. Synchronous
+                # projections must still receive it before the error returns.
+                fanout_error, delivered = exc, False
             for observer in tuple(self.observers):
                 try:
                     observer(frame)
@@ -69,6 +75,8 @@ class SessionEvents:
                     # A request-owned projection cannot undo committed publication or starve peers.
                     logging.getLogger(__name__).warning('Session event observer failed for %s', session_id,
                                                         exc_info=True)
+            if fanout_error is not None:
+                raise fanout_error
             # True when a live viewer or observer took the frame; the replay ring alone is not
             # delivery (a detached finite viewer reads nothing until it reattaches).
             return delivered

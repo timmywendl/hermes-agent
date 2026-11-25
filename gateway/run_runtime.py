@@ -396,6 +396,11 @@ async def recover_gateway_native_sessions(runner):
             await recover_webhook_finalizations(authority)
             pending = {row['target_session_id'] for row in authority.db._read_all(
                 "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")}
+            # A moved wake can already be terminal while its old cancellation
+            # notice or media release remains pending after a restart.
+            from hermes_state_runtime import route_move_receipts
+            pending.update(receipt['new_session'] for receipt in await asyncio.to_thread(
+                route_move_receipts, authority.db))
             bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
                         for entry in runner.session_store.list_sessions() if entry.origin is not None
                         for owner in [authority.logical_owner(entry.session_id)] if owner in pending]

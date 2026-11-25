@@ -151,6 +151,13 @@ class SessionAuthority:
                 authorize(conn)
         return guard
 
+    def _board_admission_gate(self, ref, authorize=None):
+        def guard(conn):
+            self._admission_gate(authorize)(conn)
+            from gateway.session_kanban import check_board_execution
+            check_board_execution(self, ref, conn=conn)
+        return guard
+
     def logical_owner(self, session_id):
         """The FIFO/admission identity of a route: the root of its compression lineage.
         Compression advances the physical transcript, never the admission identity. A session this
@@ -353,7 +360,7 @@ class SessionAuthority:
         request_id = str(payload['native_text_v1']['event']['message_id'] or uuid.uuid4().hex)
         return await tracked_write(self, partial(
             self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
-            request_id=request_id, payload=payload, authorize=self._admission_gate()),
+            request_id=request_id, payload=payload, authorize=self._board_admission_gate(ref)),
             then=partial(self._admitted, ref, event), ordered=True,
             after=partial(self._schedule_admitted, ref))
 
@@ -416,6 +423,25 @@ class SessionAuthority:
                             self, SessionRef(self.profile_id, sid), row, source=source)
                 self._require_admission_open()
                 self.sessions.setdefault(sid, LiveSession(source, route))
+                from gateway.session_automation import recover_route_move_settlements
+                from hermes_state_runtime import route_move_receipts
+                moves = await asyncio.to_thread(route_move_receipts, self.db)
+                queue, seen, ancestors = [sid], {sid}, []
+                while queue:
+                    target = queue.pop()
+                    for moved in moves:
+                        if moved['new_session'] != target or moved['principal'] != 'automation:' + route:
+                            continue
+                        old_sid = moved['old_session']
+                        if old_sid in seen:
+                            continue
+                        seen.add(old_sid)
+                        queue.append(old_sid)
+                        ancestors.append(old_sid)
+                for old_sid in reversed(ancestors):
+                    self.sessions.setdefault(old_sid, LiveSession(source, route))
+                    await recover_route_move_settlements(self, SessionRef(self.profile_id, old_sid))
+                await recover_route_move_settlements(self, SessionRef(self.profile_id, sid))
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
                 self._schedule(SessionRef(self.profile_id, sid))
@@ -435,6 +461,8 @@ class SessionAuthority:
 
     async def _submit(self, actor, request, *, _authorize_write=None):
         self._require_admission_open()
+        from gateway.session_kanban import check_board_execution
+        check_board_execution(self, request.ref)
         if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
                 'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
@@ -469,7 +497,7 @@ class SessionAuthority:
                 return admit_session_input(self.db, epoch=self.epoch, principal_id=actor.subject,
                                            session_id=request.ref.session_id, request_id=request.request_id,
                                            payload=payload, intent=request.intent,
-                                           _authorize_write=self._admission_gate(_authorize_write))
+                                           _authorize_write=self._board_admission_gate(request.ref, _authorize_write))
             except Exception:
                 self._release_refused_capture(request, payload)
                 raise
@@ -510,12 +538,14 @@ class SessionAuthority:
             row = live.settling.get(admission_id, row)
         return self._receipt(row)
 
-    async def cancel_queued(self, actor, ref, admission_id):
+    async def cancel_queued(self, actor, ref, admission_id, *, _before_media=None):
         before = await self.receipt(actor, ref, admission_id)
         from gateway.session_runtime_workers import track_mutation
         # Write off the shared loop; commit and observer settlement are one tracked task the
         # caller cannot cancel between (an exact retry still pays a left-over obligation).
         row = await asyncio.shield(track_mutation(self, self._commit_cancel(ref, admission_id, before)))
+        if _before_media is not None:
+            await asyncio.to_thread(_before_media)
         # Media collection is its own write txn after the committed, settled cancellation: its
         # failure surfaces to the caller, and an exact retry collects again without re-settling.
         from gateway.session_ingress_media import release_admission_media
@@ -567,8 +597,20 @@ class SessionAuthority:
             # completion is not attributed to the turn currently running ahead of it.
             live.event_stream.execution = {'authority_epoch': self.epoch, 'admission_id': admission_id}
             try:
-                live.event_stream.publish(ref.session_id, {
-                    'text': '', 'content': '', 'admission_id': admission_id, 'outcome': 'cancelled'})
+                watermark = live.event_stream.watermark()
+                try:
+                    live.event_stream.publish(ref.session_id, {
+                        'text': '', 'content': '', 'admission_id': admission_id, 'outcome': 'cancelled'})
+                except Exception:
+                    # Fanout can fail after the frame was committed to the
+                    # replay ring. Do not publish the same cancellation twice.
+                    replay = live.event_stream.since(*watermark)
+                    if replay['truncated'] or not any(
+                            event.get('type') == 'message.complete'
+                            and event.get('payload', {}).get('admission_id') == admission_id
+                            and event.get('payload', {}).get('outcome') == 'cancelled'
+                            for event in replay['events']):
+                        raise
             finally:
                 live.event_stream.execution = running
         # Published once: a later exact retry re-collects media but never repeats the completion.
@@ -770,6 +812,8 @@ class SessionAuthority:
     async def _claim_next(self, ref, live):
         # False asks the pump to re-read after a queued head changed during preflight.
         async with live.claim_gate, live.mutation_lock:
+            from gateway.session_kanban import check_board_execution
+            check_board_execution(self, ref)
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
@@ -829,7 +873,7 @@ class SessionAuthority:
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
+                                                    session_id=ref.session_id, _guard=self._board_admission_gate(ref),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
@@ -1097,4 +1141,7 @@ async def initialize_session_authority(runner, *, profile_id, instance_id, db=No
     epochs[db_key] = epoch
     from gateway.session_local_recovery import recover_local_sessions
     recover_local_sessions(authority)
+    from gateway.session_automation import recover_route_move_settlements
+    for sid in tuple(authority.sessions):
+        await recover_route_move_settlements(authority, SessionRef(authority.profile_id, sid))
     return authority

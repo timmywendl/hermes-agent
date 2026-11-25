@@ -178,3 +178,19 @@ def probe_root(tmp_path):
     """
     (tmp_path / "hermes_bootstrap.py").write_text("", encoding="utf-8")
     return tmp_path
+
+
+@pytest.fixture(autouse=True)
+def _dormant_board_dispatch_contract(request, monkeypatch):
+    """Exercise retained dispatcher internals in historical unit contracts only.
+
+    Pause tests use the shipped constant unchanged. This is not a product configuration
+    override and does not run a product Worker; historical spawn callbacks remain stubs.
+    """
+    if "kanban" not in request.path.name or request.node.name.startswith("test_board_pause"):
+        return
+    for fixture in ("isolated_kanban_home", "isolated_kanban_home_with_profiles"):
+        if fixture in request.fixturenames:
+            request.getfixturevalue(fixture)  # these legacy fixtures purge/reimport the dispatcher
+    from hermes_cli import kanban_db_dispatch
+    monkeypatch.setattr(kanban_db_dispatch, "BOARD_EXECUTION_ENABLED", True)

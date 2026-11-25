@@ -1721,6 +1721,11 @@ def main(
         _run_legacy_gateway()
         return
 
+    if not (list_tools or list_toolsets) and os.environ.get("HERMES_KANBAN_TASK"):
+        from hermes_cli.kanban_db_dispatch import BOARD_EXECUTION_ENABLED, BOARD_EXECUTION_PAUSE_REASON
+        if not BOARD_EXECUTION_ENABLED:
+            raise SystemExit(BOARD_EXECUTION_PAUSE_REASON)
+
     if not (list_tools or list_toolsets):
         from hermes_cli.process_identity import register_self
         from hermes_cli.shared_profile_warning import shared_profile_warning

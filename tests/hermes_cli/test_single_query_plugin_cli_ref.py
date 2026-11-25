@@ -33,6 +33,15 @@ def _stub(**extra):
     )
 
 
+@pytest.mark.parametrize("query", [None, "fixture"])
+def test_board_pause_refuses_cli_before_agent_setup(monkeypatch, query):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "fixture-task")
+    monkeypatch.setattr("hermes_cli.kanban_db_dispatch.BOARD_EXECUTION_ENABLED", False)
+    monkeypatch.setattr(cli, "_build_cli_from_args", lambda *a, **k: pytest.fail("agent setup reached"))
+    with pytest.raises(SystemExit, match="Board Local/Managed execution paused"):
+        cli.main(query=query)
+
+
 def test_one_shot_turn_binds_the_cli_for_plugins():
     stub = _stub()
     with pytest.raises(SystemExit):

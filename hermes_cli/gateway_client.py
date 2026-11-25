@@ -152,9 +152,12 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None) 
     from hermes_cli.gateway_runtime_discovery import connect_private, _identify_response
     # A served secondary's ticket is minted by the multiplexer's socket, bound to the secondary.
     home = control_home_for(home, endpoint)
+    binding = ({"launch_id": endpoint.launch_id, "authority_epoch": endpoint.authority_epoch,
+                "code_sha": endpoint.code_sha} if getattr(endpoint, "launch_id", None) else {})
     request = json.dumps({"protocol": 1, "id": 1, "verb": "session-ticket", "params": {
         "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "purpose": purpose,
         **({"scope": scope} if scope else {}),
+        **binding,
     }}).encode() + b"\n"
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
@@ -175,24 +178,28 @@ def _session_ticket(home: Path, endpoint, *, purpose="interactive", scope=None) 
                 data.extend(chunk)
     grant = _identify_response(bytes(data))
     if any(grant.get(k) != v for k, v in {
-        "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "runtime_protocol": 1,
+        "profile_id": endpoint.profile_id, "instance_id": endpoint.instance_id, "runtime_protocol": 1, **binding,
     }.items()) or not isinstance(grant.get("ticket"), str) or not grant["ticket"]:
         raise GatewayClientError("Gateway bootstrap identity changed; retry launch")
     return grant["ticket"]
 
 
 @asynccontextmanager
-async def connect_gateway(endpoint=None):
+async def connect_gateway(endpoint=None, *, no_cron=False):
     """Attach to this home's owner. ``endpoint``: an already-discovered ready owner to dial as-is
     (maintenance that must never start a gateway); default ensures one, starting it if needed."""
     from websockets.asyncio.client import connect
     from hermes_constants import get_hermes_home
-    from hermes_cli.gateway_runtime import ensure_gateway_runtime
+    from hermes_cli.gateway_runtime import ensure_gateway_runtime, ensure_no_cron_gateway
     from urllib.parse import urlsplit
 
     remote = "" if endpoint is not None else os.environ.get("HERMES_TUI_GATEWAY_URL", "").strip()
+    if no_cron and (endpoint is not None or remote):
+        raise GatewayClientError("No-cron chat cannot attach to an existing or remote gateway")
     protocols = None
     if endpoint is not None:
+        if "no-cron-v1" in getattr(endpoint, "capabilities", ()):
+            raise GatewayClientError("No-cron gateway belongs to its launching chat")
         ticket = await asyncio.to_thread(_session_ticket, get_hermes_home().resolve(), endpoint)
         url, protocols = gateway_ws_target(endpoint, ticket)
     elif remote:
@@ -204,7 +211,11 @@ async def connect_gateway(endpoint=None):
         home = get_hermes_home().resolve()
         # A client's own start: the daemon it may launch ends itself once idle (no client, adapter,
         # cron/kanban work or admission), and the next client starts a fresh one.
-        result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
+        if no_cron:
+            import uuid
+            result = await asyncio.to_thread(ensure_no_cron_gateway, home, uuid.uuid4().hex)
+        else:
+            result = await asyncio.to_thread(ensure_gateway_runtime, home, idle_exit=True)
         if result.state != "ready" or result.endpoint is None:
             detail = getattr(result, "detail", None)
             if result.reason_code == "runtime_exited" and detail:

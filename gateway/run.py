@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the bounded no-cron entrypoint preserves the public runner facade
 """Gateway runner - entry point for messaging platform integrations.
 
 Provides ``start_gateway()`` (start all configured adapters) and ``GatewayRunner`` (lifecycle).
@@ -4545,7 +4546,7 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
 
 def _start_gateway_housekeeping(
     stop_event: threading.Event, adapters=None, loop=None, interval: int = 60, cron_provider=None, runner=None,
-    cron_thread=None,
+    cron_thread=None, cron_enabled=True,
 ):
     """Background thread for gateway-only periodic chores (NOT cron). Separate from the cron trigger
     so chores run under any ``CronScheduler`` provider (external scale-to-zero has no 60s loop).
@@ -4558,7 +4559,7 @@ def _start_gateway_housekeeping(
         # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
         # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
         (1, "Runtime heartbeat", _write_runtime_status_quiet)]
-    if adapters is not None or runner is not None:
+    if cron_enabled and (adapters is not None or runner is not None):
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner)))
@@ -4594,7 +4595,7 @@ def _start_gateway_housekeeping(
     # Between ticks the queue file is watched so a worker's send goes out when it is queued,
     # not up to ``interval`` later (#117307); the tick's drain above remains the fallback.
     queue_watch = None
-    if adapters is not None or runner is not None:
+    if cron_enabled and (adapters is not None or runner is not None):
         def served_homes() -> list:
             return [home for _name, home in _handoff_watch_scopes(runner)] if runner is not None else [None]
 
@@ -4894,7 +4895,7 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
-def _claim_host_gateway_role(force: bool = False) -> None:
+def _claim_host_gateway_role(force: bool = False, *, strict_no_cron: bool = False) -> None:
     """Take the HOST-wide gateway lock, publish the record — or REFUSE to be the second gateway.
 
     The lock is no longer observe-only. ``gateway.host_attach`` already answers "is there a host
@@ -4924,6 +4925,8 @@ def _claim_host_gateway_role(force: bool = False) -> None:
             raise SystemExit(GATEWAY_SERVICE_RESTART_EXIT_CODE)
     try:
         outcome, error = hr.claim_host_lock(hr.ROLE_GATEWAY)
+        if strict_no_cron and outcome is not hr.HostLockOutcome.ACQUIRED:
+            raise SystemExit("No-cron gateway requires the exclusive host lock")
         if outcome is hr.HostLockOutcome.ACQUIRED:
             # PROVISIONAL: an owner exists, its served set is not decided yet (multiplex is
             # settled by the runner, and the attach channel is not bound for another moment).
@@ -4942,6 +4945,8 @@ def _claim_host_gateway_role(force: bool = False) -> None:
                 "No second gateway is implied — the lock directory itself is unusable.", error)
             return
     except Exception:
+        if strict_no_cron:
+            raise
         logger.debug("host gateway rendezvous failed", exc_info=True)
         return
     # Lost the lock. Reading the owner's record may fail (it is published a moment after the
@@ -5132,10 +5137,13 @@ async def _host_attach_or_none(replace: bool, force: bool = False) -> Optional[b
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        no_cron_launch_id: str | None = None) -> bool:
     """Run the process lifecycle; the runner facade remains the public entrypoint."""
     from gateway.run_bootstrap import start_gateway as bootstrap
-    return await bootstrap(config, replace, verbosity, force, idle_exit)
+    if no_cron_launch_id is None:
+        return await bootstrap(config, replace, verbosity, force, idle_exit)
+    return await bootstrap(config, replace, verbosity, force, idle_exit, no_cron_launch_id)
 
 
 def _guard_corrupt_user_config() -> None:

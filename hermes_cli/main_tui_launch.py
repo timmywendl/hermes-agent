@@ -24,9 +24,12 @@ logger = logging.getLogger("hermes_cli.main")
 def _bypass_chat_launch(args) -> bool:
     """--safe-mode / --ignore-user-config chat: the gateway owner freezes code defaults and runs
     the turn out of process, so the profile's display.interface must not pick a surface and the
-    client performs no discovery. Explicit --tui forwards the flags in its session.create policy."""
-    return bool(getattr(args, "safe_mode", False) or getattr(args, "ignore_user_config", False)) \
+    client performs no discovery. Explicit --tui forwards the flags in its session.create policy.
+    No-cron also uses this transport but retains ordinary configuration and consent checks."""
+    return bool(getattr(args, "no_cron", False)) or (
+        bool(getattr(args, "safe_mode", False) or getattr(args, "ignore_user_config", False))
         and not getattr(args, "tui", False)
+    )
 
 
 def _read_tui_active_session_file(path: Optional[str]) -> Optional[str]:

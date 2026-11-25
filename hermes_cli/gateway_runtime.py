@@ -36,6 +36,8 @@ class GatewayEndpoint:
     # A gateway that outlived ``hermes update`` keeps serving old code, so an attaching client
     # compares this with its own checkout and restarts the owner instead of re-attaching it.
     code_sha: str | None = None
+    launch_id: str | None = None
+    launch_supervisor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,12 +98,24 @@ def _endpoint(payload: dict, home: Path, control_home: Path | None = None) -> Ga
     supervisor = payload.get("supervisor")
     if supervisor not in {"none", "systemd", "launchd", "windows", "external"}:
         return GatewayDiscovery("inaccessible", reason_code="invalid_supervisor")
+    no_cron = "no-cron-v1" in capabilities
+    launch_id = payload.get("launch_id")
+    if no_cron and (not isinstance(launch_id, str) or len(launch_id) != 32
+                    or any(c not in "0123456789abcdef" for c in launch_id)
+                    or supervisor != "none" or payload.get("launch_supervisor") != "manual"
+                    or len(profiles) != 1 or _canonical_home(matches[0]["profile_id"]) != wanted
+                    or control_home is not None):
+        return GatewayDiscovery("inaccessible", reason_code="invalid_no_cron_identity")
+    if not no_cron and launch_id is not None:
+        return GatewayDiscovery("inaccessible", reason_code="invalid_no_cron_identity")
     return GatewayDiscovery("ready", GatewayEndpoint(
         profile_id=matches[0]["profile_id"], instance_id=instance,
         authority_epoch=epoch, runtime_protocol=1, api_origin=origin,
         supervisor=supervisor, capabilities=frozenset(capabilities),
         control_home=str(control_home) if control_home is not None else None,
         code_sha=code_sha if isinstance(code_sha := payload.get("code_sha"), str) and code_sha else None,
+        launch_id=launch_id,
+        launch_supervisor=payload.get("launch_supervisor"),
     ))
 
 
@@ -227,6 +241,58 @@ _REPLACE_FAILED_DETAIL = "an older Hermes gateway still owns this profile after 
 _RETIRING = frozenset({"idle_exit", "replaced"})
 
 
+def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
+                           timeout: float = DEFAULT_ENSURE_TIMEOUT) -> GatewayDiscovery:
+    """Start exactly one unmanaged owner; never adopt or replace an existing owner."""
+    import time
+    from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
+    from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway
+    from hermes_cli.version_info import get_code_identity
+    from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    from gateway.host_attach import host_gateway
+
+    if (not math.isfinite(timeout) or timeout <= 0 or not isinstance(launch_id, str)
+            or len(launch_id) != 32 or any(c not in "0123456789abcdef" for c in launch_id)):
+        raise ValueError("invalid no-cron launch")
+    home = Path(_canonical_home(profile_home))
+    deadline = time.monotonic() + timeout
+    try:
+        if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
+            return GatewayDiscovery("draining", reason_code="update_paused")
+        if (discover_gateway_endpoint(home, timeout=remaining(deadline)).state != "absent"
+                or _multiplexer_starting(home) or host_gateway(wait_for_channel=0.01) is not None):
+            return GatewayDiscovery("conflict", reason_code="existing_gateway")
+        code_sha = get_code_identity().get("sha")
+        if not isinstance(code_sha, str) or not code_sha:
+            return GatewayDiscovery("inaccessible", reason_code="unknown_code_identity")
+        child = spawn_unmanaged_gateway(home, deadline=deadline, idle_exit=True, launch_id=launch_id)
+        while True:
+            status = child.poll()
+            observed = discover_gateway_endpoint(home, timeout=remaining(deadline))
+            if observed.state == "ready" and observed.endpoint is not None:
+                endpoint = observed.endpoint
+                if (status is None and endpoint.launch_id == launch_id and endpoint.supervisor == "none"
+                        and endpoint.launch_supervisor == "manual"
+                        and endpoint.control_home is None and _canonical_home(endpoint.profile_id) == str(home)
+                        and endpoint.code_sha == code_sha and "no-cron-v1" in endpoint.capabilities
+                        and "session-authority-v1" in endpoint.capabilities):
+                    return observed
+                return GatewayDiscovery("conflict", reason_code="launch_identity_mismatch")
+            if status is not None:
+                return GatewayDiscovery("inaccessible", reason_code="runtime_exited")
+            if observed.state not in {"absent", "starting"}:
+                return observed
+            time.sleep(min(0.05, remaining(deadline)))
+    except TimeoutError:
+        return GatewayDiscovery("starting", reason_code="deadline")
+    except RuntimeStartError as exc:
+        return GatewayDiscovery(exc.state, reason_code=exc.reason)
+    except PermissionError:
+        return GatewayDiscovery("inaccessible", reason_code="authorization")
+    except OSError:
+        return GatewayDiscovery("inaccessible", reason_code="runtime_start_failed")
+
+
 def _observe_replacing_stale(home: Path, deadline: float, replaced: set[Path]) -> GatewayDiscovery:
     """Discovery, except that a gateway an older Hermes left on this home is stopped once (like
     ``hermes gateway stop``) and reported as retiring; a refusal keeps ``incompatible`` + its remedy."""
@@ -290,6 +356,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             # published its owner a moment later. A winning racer shows up as starting/ready instead.
             status = child.poll() if child is not None else None
             observed = _observe_replacing_stale(home, deadline, replaced)
+            if observed.endpoint is not None and "no-cron-v1" in observed.endpoint.capabilities:
+                return GatewayDiscovery("incompatible", reason_code="no_cron_gateway")
             if observed.reason_code == "control_timeout":
                 return GatewayDiscovery("starting", reason_code="deadline")
             if observed.state == "draining" and observed.reason_code in _RETIRING:

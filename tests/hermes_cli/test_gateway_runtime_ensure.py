@@ -10,6 +10,62 @@ import time
 
 import pytest
 
+
+def test_no_cron_start_binds_only_own_launch_and_refuses_racer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    launch = "a" * 32
+    endpoint = runtime.GatewayEndpoint(str(tmp_path), "instance", 1, 1, "http://127.0.0.1:1234",
+                                       "none", frozenset({"session-authority-v1", "no-cron-v1"}),
+                                       code_sha="abc", launch_id=launch, launch_supervisor="manual")
+    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
+    monkeypatch.setattr(runtime, "_multiplexer_starting", lambda home: False)
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: None)
+    monkeypatch.setattr(version_info, "get_code_identity", lambda: {"sha": "abc"})
+    spawned = []
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *args, **kwargs:
+                        spawned.append(kwargs) or SimpleNamespace(poll=lambda: None))
+
+    def attempt(candidate):
+        observations = iter([runtime.GatewayDiscovery("absent"), runtime.GatewayDiscovery("ready", candidate)])
+        monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: next(observations))
+        return runtime.ensure_no_cron_gateway(tmp_path, launch)
+
+    assert attempt(endpoint).endpoint == endpoint
+    from dataclasses import replace
+    assert attempt(replace(endpoint, launch_id="b" * 32)).reason_code == "launch_identity_mismatch"
+    assert attempt(replace(endpoint, code_sha="other")).reason_code == "launch_identity_mismatch"
+    assert attempt(replace(endpoint, launch_supervisor="desktop")).reason_code == "launch_identity_mismatch"
+    assert len(spawned) == 4 and all(s["idle_exit"] and s["launch_id"] == launch for s in spawned)
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: runtime.GatewayDiscovery("starting"))
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "existing_gateway"
+    assert len(spawned) == 4
+
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: runtime.GatewayDiscovery("absent"))
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: object())
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "existing_gateway"
+    assert len(spawned) == 4
+
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: None)
+    observations = iter([runtime.GatewayDiscovery("absent"), runtime.GatewayDiscovery("ready", endpoint)])
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: next(observations))
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *args, **kwargs: SimpleNamespace(poll=lambda: 1))
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "launch_identity_mismatch"
+
+
+def test_normal_ensure_refuses_no_cron_owner(tmp_path, monkeypatch):
+    from hermes_cli import gateway_runtime as runtime
+
+    endpoint = runtime.GatewayEndpoint(str(tmp_path), "instance", 1, 1, "http://127.0.0.1:1234",
+                                       "none", frozenset({"session-authority-v1", "no-cron-v1"}),
+                                       launch_id="a" * 32, launch_supervisor="manual")
+    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
+    monkeypatch.setattr(runtime, "_observe_replacing_stale",
+                        lambda *args: runtime.GatewayDiscovery("ready", endpoint))
+    result = runtime.ensure_gateway_runtime(tmp_path)
+    assert result.state == "incompatible" and result.reason_code == "no_cron_gateway"
+
 def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime_start as start

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- no-cron work accounting and teardown stay with the existing shutdown mixin
 """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner.
 
 Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
@@ -200,8 +201,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             + self._active_deferred_agent_worker_count()
         )
 
-    @staticmethod
-    def _running_cron_job_count() -> int:
+    def _running_cron_job_count(self) -> int:
         # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
         # pool and API-server runs live on the adapter — both outside _running_agents (the #60432 blind
         # spot), so counting agents alone let a suspend land mid-cron-job. Fail-AWAKE accounting: the shared
@@ -209,6 +209,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # which is fine for a drain but unsafe for a suspend predicate — a transient read failure would make
         # live work look idle and reopen the mid-job freeze. Here an unreadable source counts as work
         # (sentinel 1) so the machine stays awake until the source is readable again.
+        if getattr(self, "_no_cron", False) is True:
+            return 0
         from cron.scheduler import get_running_job_ids
         return len(get_running_job_ids())
 
@@ -223,6 +225,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         command is still running (#60432). Best-effort: returns 0 if the cron module can't be imported (e.g.
         a minimal test double for this class).
         """
+        if getattr(self, "_no_cron", False) is True:
+            return 0
         try:
             return self._running_cron_job_count()
         except Exception:
@@ -467,7 +471,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                 logger.debug("scale-to-zero: %s unreadable — staying awake", label, exc_info=True)
                 return busy_sentinel
 
-        cron_count = _read_or_awake("cron work count", self._running_cron_job_count, 1)
+        cron_count = (0 if getattr(self, "_no_cron", False) is True else
+                      _read_or_awake("cron work count", self._running_cron_job_count, 1))
         api_count = _read_or_awake("api work count", lambda: self._api_server_hook("active_agent_work_count"), 1)
         # An attached dashboard/desktop/TUI client (heartbeat mtime) is inbound activity — folded into
         # the inbound clock, not a conjunct, so a lingering marker cannot pin the box.
@@ -1498,6 +1503,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         Fail-soft toward waiting: if the split can't be read, every active cron run stays
         awaitable and nothing is excluded.
         """
+        if getattr(self, "_no_cron", False) is True:
+            return {"awaitable": 0, "wedged": 0, "restart_safe": 0}
         try:
             from cron.scheduler import get_restart_wait_cron_counts
             return get_restart_wait_cron_counts()
@@ -1595,14 +1602,15 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
                         unit["current_tool"] = summary.get("current_tool")
                         unit["idle_s"] = summary.get("seconds_since_activity")
             units.append(unit)
-        with suppress(Exception):
-            from cron.scheduler import get_running_job_details, get_wedged_job_ids
-            wedged = get_wedged_job_ids()
-            for job in get_running_job_details():
-                units.append({"kind": "cron", "job_id": job["job_id"], "elapsed_s": job["elapsed_s"],
-                              "pid": job["worker_pid"] or os.getpid(), "external": bool(job["worker_pid"]),
-                              "wedged": job["job_id"] in wedged,
-                              "restart_safe": bool(job.get("restart_safe"))})
+        if getattr(self, "_no_cron", False) is not True:
+            with suppress(Exception):
+                from cron.scheduler import get_running_job_details, get_wedged_job_ids
+                wedged = get_wedged_job_ids()
+                for job in get_running_job_details():
+                    units.append({"kind": "cron", "job_id": job["job_id"], "elapsed_s": job["elapsed_s"],
+                                  "pid": job["worker_pid"] or os.getpid(), "external": bool(job["worker_pid"]),
+                                  "wedged": job["job_id"] in wedged,
+                                  "restart_safe": bool(job.get("restart_safe"))})
         for kind, count in (("managed", managed_turn_count(self)), ("api", self._active_api_run_count()),
                             ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
@@ -1675,6 +1683,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return True
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
+        if getattr(self, "_no_cron", False) is True:
+            return False
         if self._restart_task_started:
             return False
         self._restart_requested = True
@@ -1743,7 +1753,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             return None
 
     @staticmethod
-    def _stop_kill_tool_subprocesses(phase: str) -> list:
+    def _stop_kill_tool_subprocesses(phase: str, *, no_cron: bool = False) -> list:
         """Kill tool subprocesses + terminal envs + browsers; returns cron job IDs marked interrupted.
 
         Called twice: after a drain timeout (reclaim children before systemd SIGKILLs) and as a final
@@ -1791,7 +1801,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             )
 
         _step("process_registry.kill_all", _kill_processes)
-        _marked_cron_jobs = _step("mark_running_jobs_interrupted", _mark_cron_interrupted) or []
+        _marked_cron_jobs = [] if no_cron else (_step("mark_running_jobs_interrupted", _mark_cron_interrupted) or [])
         _step("async interrupt_all", _interrupt_delegations)
         def _cleanup_environments() -> None:
             from tools.terminal_tool_lifecycle import cleanup_all_environments
@@ -1806,7 +1816,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         return _marked_cron_jobs
 
     @staticmethod
-    async def _stop_kill_tool_subprocesses_off_loop(phase: str) -> list:
+    async def _stop_kill_tool_subprocesses_off_loop(phase: str, *, no_cron: bool = False) -> list:
         """Run _stop_kill_tool_subprocesses in a worker thread; returns cron job IDs marked interrupted.
 
         ``kill_all`` fans out into per-target ``kill_process`` calls that do blocking work
@@ -1819,9 +1829,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         worker runs, the thread is left to finish on its own; the thread-based shutdown
         watchdog remains the hard backstop.
         """
-        return await asyncio.to_thread(
-            GatewayShutdownMixin._stop_kill_tool_subprocesses, phase
-        )
+        if no_cron:
+            return await asyncio.to_thread(GatewayShutdownMixin._stop_kill_tool_subprocesses, phase, no_cron=True)
+        return await asyncio.to_thread(GatewayShutdownMixin._stop_kill_tool_subprocesses, phase)
 
     async def _stop_begin_teardown(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Flag teardown, stop room worker/watchdog, notify sessions."""
@@ -1936,7 +1946,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             logger.debug("Re-signaled interrupt for work still live at settle-window exit")
         # Kill tool subprocesses NOW: deferring past adapter/DB teardown risks the systemd cgroup SIGKILL.
         # Off-loop: the sweep does blocking kills that must not monopolize the event loop (#116327).
-        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop("post-interrupt")
+        _cleanup_options = {"no_cron": True} if getattr(self, "_no_cron", False) is True else {}
+        _interrupted_cron_jobs = await GatewayRunner._stop_kill_tool_subprocesses_off_loop(
+            "post-interrupt", **_cleanup_options)
         logger.info("Shutdown phase: post-interrupt tool kill done at +%.2fs", ctx.elapsed())
         # Last window with the transport up (the cron worker's own notice arrives after teardown).
         with _log_suppressed(logging.DEBUG, "Cron interrupt notification failed: %s"):
@@ -1947,7 +1959,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
 
     async def _stop_finalize_agents_and_adapters(self, ctx: GatewayShutdownMixin._StopContext) -> None:
         """Detached restart launch, agent finalization, idle-cache cleanup, adapter teardown."""
-        if self._restart_requested and self._restart_detached:
+        if (getattr(self, "_no_cron", False) is not True
+                and self._restart_requested and self._restart_detached):
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart: %s"):
                 await self._launch_detached_restart_command()
         await self._finalize_shutdown_agents(ctx.active_agents)
@@ -2017,7 +2030,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
-        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup")
+        _cleanup_options = {"no_cron": True} if getattr(self, "_no_cron", False) is True else {}
+        await GatewayRunner._stop_kill_tool_subprocesses_off_loop("final-cleanup", **_cleanup_options)
         logger.info("Shutdown phase: final-cleanup tool kill done at +%.2fs", ctx.elapsed())
         # Reap the auxiliary-client cache: clients bound to dead worker-thread loops leak httpx transports.
         def _reap_aux_clients() -> None:
@@ -2238,7 +2252,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _stop_guards = getattr(self, "_stop_loop_liveness_guards", None)
         if callable(_stop_guards):
             _stop_guards()
-        if restart:
+        if restart and getattr(self, "_no_cron", False) is not True:
             self._restart_requested = True
             self._restart_detached = detached_restart
             self._restart_via_service = service_restart

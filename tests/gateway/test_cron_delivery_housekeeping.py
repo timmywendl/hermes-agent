@@ -20,6 +20,33 @@ class _OneTickStopEvent:
         return True
 
 
+def test_no_cron_housekeeping_omits_drain_and_watch_but_keeps_heartbeat(monkeypatch):
+    from gateway import run_delivery_queue_watch
+
+    labels = []
+    monkeypatch.setattr(gateway_run, "_housekeeping_chore", lambda label, fn: labels.append(label))
+    monkeypatch.setattr(run_delivery_queue_watch, "DeliveryQueueWatch",
+                        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("cron watcher created")))
+    gateway_run._start_gateway_housekeeping(_OneTickStopEvent(), adapters={}, loop=object(),
+                                           interval=0, cron_enabled=False)
+    assert "Runtime heartbeat" in labels
+    assert not any("cron" in label.lower() or "delivery" in label.lower() for label in labels)
+
+
+def test_default_housekeeping_keeps_cron_drain_and_watch(monkeypatch):
+    from gateway import run_delivery_queue_watch
+
+    labels, watches = [], []
+    monkeypatch.setattr(gateway_run, "_housekeeping_chore", lambda label, fn: labels.append(label))
+    monkeypatch.setattr(run_delivery_queue_watch, "DeliveryQueueWatch",
+                        lambda *a, **kw: watches.append(True) or object())
+    monkeypatch.setattr(run_delivery_queue_watch, "wait_for_next_tick",
+                        lambda stop, interval, watch, chore: stop.wait(interval))
+    gateway_run._start_gateway_housekeeping(_OneTickStopEvent(), adapters={}, loop=object(), interval=0)
+    assert watches == [True]
+    assert run_delivery_queue_watch.DRAIN_LABEL in labels
+
+
 def test_gateway_housekeeping_drains_cron_delivery_with_live_adapters(monkeypatch):
     adapters = {"discord": object()}
     loop = object()

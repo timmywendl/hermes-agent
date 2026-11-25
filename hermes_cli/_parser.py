@@ -229,6 +229,7 @@ def _build_chat_parser(subparsers) -> argparse.ArgumentParser:
         "chat", help="Interactive chat with the agent",
         description="Start an interactive chat session with Hermes Agent")
     add, inherited, SUPPRESS = chat_parser.add_argument, _inherited_flag, argparse.SUPPRESS
+    add("--no-cron", action="store_true", help="Start an isolated, idle-exit gateway without cron")
     _query_group = chat_parser.add_mutually_exclusive_group()
     _query_group.add_argument("-q", "--query", help=(
         "Query to run. On a real TTY the prompt seeds an interactive "

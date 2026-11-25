@@ -25,7 +25,8 @@ DAEMON_STRIPPED_ENV = (
 )
 
 
-def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False) -> subprocess.Popen:
+def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
+                            launch_id: str | None = None) -> subprocess.Popen:
     """Request a daemon, not readiness. Refuse Windows no-breakaway fallback.
 
     No --replace, persistence, login changes, elevation, shell, or inherited stdio.
@@ -33,6 +34,9 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     ``idle_exit``: the daemon ends itself once idle (a chat/TUI/cron client's own start; never
     Desktop's ``gateway ensure``, which keeps its attached gateway for the app's lifetime).
     """
+    if launch_id is not None and (not isinstance(launch_id, str) or not idle_exit or len(launch_id) != 32
+                                  or any(c not in "0123456789abcdef" for c in launch_id)):
+        raise ValueError("invalid no-cron launch identity")
     home = profile_home.resolve()
     root = Path(__file__).resolve().parent.parent
     # A root home is only pinned by an explicit selector: without one the child's
@@ -40,7 +44,8 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     # profile's daemon. A <root>/profiles/<name> home is already trusted as-is.
     selector = [] if home.parent.name == "profiles" else ["--profile", "default"]
     command = [sys.executable, "-m", "hermes_cli.main", *selector, "gateway", "run", "--quiet",
-               *(["--idle-exit"] if idle_exit else [])]
+               *(["--idle-exit"] if idle_exit else []),
+               *(["--no-cron-launch-id", launch_id] if launch_id is not None else [])]
     # The target profile's own secrets, never the launching client's: a `hermes -p work` client's
     # dotenv would otherwise become the default daemon's frozen launch env (host_gateway_child_env).
     from tools.environments.local import served_profile_child_env

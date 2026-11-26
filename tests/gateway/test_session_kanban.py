@@ -290,7 +290,7 @@ def test_review_check_receipt_records_real_failure_without_script_contents(tmp_p
 
 def _pilot_check_fixture():
     body = {'repo': 'DesignLibro/petlibro-cloud-test-platform',
-            'work_key': 'cloud-confirm-feeding-plan-absent-bool-id/v1',
+            'work_key': 'confirm-feeding-plan-absent-bool-id/v1',
             'task_spec': {'title': 'Repair confirm_feeding_plan_absent',
                           'instructions': 'Fixture acceptance criterion: reject bool IDs',
                           'acceptance_criteria': 'Preserve valid and error behavior.\nRun tests/test_candidate.py offline'}}
@@ -321,6 +321,38 @@ assert Path(confirm_feeding_plan_absent.__code__.co_filename).resolve() == Path(
         script += ('assert confirm_feeding_plan_absent(SimpleNamespace(status_code='
                    f'{status!r}, json=lambda: {data!r}), 7) is {expected!r}\n')
     return script, 'Pilot\n\n' + json.dumps(body), handoff
+
+
+@pytest.mark.parametrize(('work_key', 'accepted'), [
+    ('confirm-feeding-plan-absent-bool-id/v1', True),
+    ('cloud-confirm-feeding-plan-absent-bool-id/v1', False),
+])
+def test_pilot_work_key_matches_review_and_task_origin(work_key, accepted):
+    import hashlib
+    import sqlite3
+    from gateway.session_kanban import _pilot_review_script, _pilot_task_origin
+
+    script, goal, handoff = _pilot_check_fixture()
+    body = json.loads(goal.split('\n\n', 1)[1])
+    body.update(work_key=work_key, objective_id='fixture-objective', root_id='root',
+                publication_protocol='wave2_v1',
+                publication_target={'repo': body['repo'], 'base': 'main', 'branch': 'candidate'})
+    spec_bytes = json.dumps(body['task_spec'], sort_keys=True, ensure_ascii=False,
+                            separators=(',', ':'), allow_nan=False).encode()
+    body['task_spec_digest'] = hashlib.sha256(spec_bytes).hexdigest()
+    work_bytes = json.dumps([body['repo'], body['objective_id'], work_key],
+                            separators=(',', ':')).encode()
+    key = 'colleague-stage3:' + hashlib.sha256(work_bytes).hexdigest()
+    origin = {'creator_task_id': 'root', 'parents': [], 'publication_protocol': 'wave2_v1',
+              'publication_target': body['publication_target'], 'completion_contract': body['repo']}
+    with sqlite3.connect(':memory:') as conn:
+        conn.execute('CREATE TABLE tasks (id TEXT, created_by TEXT, idempotency_key TEXT)')
+        conn.execute('CREATE TABLE task_events (id INTEGER, task_id TEXT, kind TEXT, payload TEXT)')
+        conn.execute('INSERT INTO tasks VALUES (?, ?, ?)', ('task', 'ai-colleague-stage3', key))
+        conn.execute('INSERT INTO task_events VALUES (?, ?, ?, ?)', (1, 'task', 'created', json.dumps(origin)))
+        context = {'task_id': 'task', 'review_task_body': json.dumps(body)}
+        assert (_pilot_task_origin(conn, context) is not None) is accepted
+    assert (_pilot_review_script(script, 'Pilot\n\n' + json.dumps(body), handoff) is not None) is accepted
 
 
 def test_pilot_check_executes_candidate_and_rejects_unrelated_or_unsafe_programs(tmp_path):

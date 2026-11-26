@@ -53,6 +53,8 @@ async def _build_profile_authority(runner, name, home, *, register):
             registry.remove(home)
             raise
     registry.replace(home, authority)
+    from gateway.session_vz_adapter import recover_q1_reservations
+    recover_q1_reservations(authority)
     return authority
 
 
@@ -204,6 +206,13 @@ def managed_turn_count(runner):
     return uncounted_runtime_work(runner)
 
 
+async def _revoke_q1_handle(handle):
+    try:
+        await asyncio.to_thread(handle.revoke)
+    except Exception:
+        logger.exception('Q1 revocation failed; ownership retained')
+
+
 def stop_authority_turns(authority, *, in_process=False):
     """Cooperative Stop for every turn *authority* is executing: the control a user's Stop sends to a
     managed worker (acknowledged, or terminated within STOP_ACK_SECONDS, and the admission settles
@@ -211,6 +220,18 @@ def stop_authority_turns(authority, *, in_process=False):
     executing in-process turn, or latches the generation ``adopt_agent`` consumes before it exists."""
     from hermes_state_runtime import RuntimeStoreError
     signalled = 0
+    for handle in list(getattr(authority, '_q1_native_workers', {}).values()):
+        try:
+            handle.control({'type': 'stop'})
+            if handle.revocation_task is None:
+                asyncio.get_running_loop()
+                from gateway.session_runtime_workers import track_mutation
+                handle.revocation_task = track_mutation(authority, _revoke_q1_handle(handle))
+        except Exception:
+            # An old epoch or failed storage write retains Q1 custody, but
+            # must not prevent Stop reaching the authority's other workers.
+            logger.exception('Q1 revocation failed; ownership retained')
+        signalled += 1
     workers = getattr(authority, '_managed_workers', {})
     for worker in list(workers.values()):
         if worker.closed.is_set() or (getattr(worker, 'stop', None) is not None and worker.stop.is_set()):
@@ -240,6 +261,17 @@ def stop_authority_turns(authority, *, in_process=False):
             request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown')
         signalled += 1
     return signalled
+
+
+async def qualify_q1_guest(runner, profile_home, ref, row, diagnostic):
+    """Finite qualification caller on an already registered original Owner.
+
+    No public RPC, configuration switch or normal Board dispatcher selects
+    this candidate, and no production Agent or secret bootstrap is prepared.
+    """
+    from gateway.session_managed_worker import execute_q1_diagnostic
+    authority = runner.session_authorities.require(profile_home)
+    return await execute_q1_diagnostic(authority, ref, row, diagnostic)
 
 
 def stop_managed_turns(runner):

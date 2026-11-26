@@ -1,4 +1,5 @@
-// Compile with main.swift and -parse-as-library; no VZ import/API, signing or entitlement use.
+// Compile with main.swift and -parse-as-library. Q1C_NATIVE_IMPLEMENTATION additionally
+// typechecks the native candidate and tests admission denial, never constructs a VZ object.
 import Foundation
 
 struct TestFailure: Error { let message: String }
@@ -54,7 +55,62 @@ func request(_ descriptor: Descriptor, _ operation: String, _ sequence: Int64, p
         try parserTests(&suite)
         try lifecycleTests(&suite)
         try adapterTests(&suite)
+        try readinessTests(&suite)
+        try stopPlanTests(&suite)
         print("PASS \(suite.assertions) actual Swift assertions; pure contract only; VZ_API_OPERATIONS=NOT_RUN")
+    }
+
+    static func stopPlanTests(_ suite: inout Suite) throws {
+        var plan = ExactStopPlan()
+        let beforeBoot = plan.request(bootSpent: false, startPending: false, observedStopped: true, canStop: false)
+        try suite.check(!plan.requested && !beforeBoot.armDeadline && !beforeBoot.closeObservedHandles,
+                        "pre-boot refusal does not assert stop or close a future boot's handles")
+        let duringStart = plan.request(bootSpent: true, startPending: true, observedStopped: false, canStop: false)
+        try suite.check(plan.requested && duringStart.armDeadline && !duringStart.stopExact,
+                        "deadline covers the pending late-start interval without spending stop")
+        let stillStarting = plan.request(bootSpent: true, startPending: true, observedStopped: true, canStop: false)
+        try suite.check(!stillStarting.armDeadline && !stillStarting.stopExact && !stillStarting.closeObservedHandles,
+                        "transient stopped while startup is pending is not completed stop")
+        let lateRunning = plan.request(bootSpent: true, startPending: false, observedStopped: false, canStop: true)
+        try suite.check(lateRunning.stopExact && !lateRunning.armDeadline && plan.attemptSpent,
+                        "late child is stopped exactly once without extending original deadline")
+        let duplicate = plan.request(bootSpent: true, startPending: false, observedStopped: false, canStop: true)
+        try suite.check(!duplicate.stopExact && !duplicate.armDeadline, "errors/deadlines never authorize a second native stop")
+        var uncertain = Lifecycle()
+        uncertain.invalidate()
+        let afterDeadline = plan.request(bootSpent: true, startPending: false, observedStopped: true, canStop: false)
+        try suite.check(afterDeadline.closeObservedHandles && !afterDeadline.stopExact,
+                        "late stopped observation still closes original console handles")
+        try suite.check(uncertain.state == .stopUncertain && uncertain.capabilitiesRevoked,
+                        "closing observed handles cannot clear uncertainty or claim retirement")
+        var normal = ExactStopPlan()
+        let running = normal.request(bootSpent: true, startPending: false, observedStopped: false, canStop: true)
+        try suite.check(running.armDeadline && running.stopExact, "ordinary stop is finite and exact")
+        let stopped = normal.request(bootSpent: true, startPending: false, observedStopped: true, canStop: false)
+        try suite.check(stopped.closeObservedHandles && !stopped.armDeadline && !stopped.stopExact,
+                        "ordinary stopped callback closes handles with no extra VM operation")
+        try suite.check(NativeDeadlines.stopReserveAt == 270 && NativeDeadlines.remainingStop(after: 270) == 30,
+                        "final thirty seconds are reserved inside the total native window")
+        try suite.check(NativeDeadlines.remainingStop(after: 280) == 20 && NativeDeadlines.remainingStop(after: 300) == 0,
+                        "late stop callback cannot extend the original total deadline")
+        try suite.check(NativeDeadlines.remainingStop(after: 301) == 0,
+                        "cleanup after an expired window remains unknown without a fresh wait budget")
+    }
+
+    static func readinessTests(_ suite: inout Suite) throws {
+        let denial = try NativeReadiness.denial.object(keys: ["code", "native", "stop_verified", "missing"])
+        try suite.check(denial["code"] == .string("CONTAINMENT_UNVERIFIED"), "authority gate is unavailable")
+        try suite.check(denial["native"] == .string("NOT_RUN") && denial["stop_verified"] == .bool(false),
+                        "no qualification or retirement inferred")
+        try suite.check(NativeReadiness.missing.contains("HOST_POLICY_DENIAL_WITNESS"), "effective Host policy required")
+        try suite.check(NativeReadiness.missing.contains("INDEPENDENT_PER_VM_OBSERVER"), "independent witness required")
+        try suite.check(NativeReadiness.missing.contains("PROTECTED_HASH_BOUND_APPROVAL"), "protected exact-hash approval required")
+        #if Q1C_NATIVE_IMPLEMENTATION
+        let descriptor = try Descriptor(encoded(fixture()))
+        // Nonexistent artifact paths deliberately remain unopened. This tests only
+        // the native candidate's fail-closed pre-acquisition path, not VZ behavior.
+        try suite.rejects(.containmentUnverified) { _ = try NativeVM.acquire(descriptor: descriptor) }
+        #endif
     }
 
     static func descriptorTests(_ suite: inout Suite) throws {
@@ -74,6 +130,8 @@ func request(_ descriptor: Descriptor, _ operation: String, _ sequence: Int64, p
         let raw = String(decoding: try encoded(fixture()), as: UTF8.self)
         try suite.rejects(.invalidDescriptor) { _ = try Descriptor(Data(raw.replacingOccurrences(of: "\"socket_devices\":1", with: "\"socket_devices\":2").utf8)) }
         try suite.rejects(.invalidDescriptor) { _ = try Descriptor(Data(raw.replacingOccurrences(of: "\"network_devices\":[]", with: "\"network_devices\":[\"NIC\"]").utf8)) }
+        try suite.rejects(.invalidDescriptor) { _ = try Descriptor(Data(raw.replacingOccurrences(of: "\"read_only\":true", with: "\"read_only\":false").utf8)) }
+        try suite.rejects(.invalidDescriptor) { _ = try Descriptor(Data(raw.replacingOccurrences(of: "\"tag\":\"task\"", with: "\"tag\":\"other\"").utf8)) }
     }
 
     static func parserTests(_ suite: inout Suite) throws {

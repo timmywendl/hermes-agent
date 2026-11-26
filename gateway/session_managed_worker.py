@@ -452,6 +452,28 @@ def _interrupted_before_bootstrap(authority, row):
     return ''
 
 
+async def execute_q1_diagnostic(authority, ref, row, diagnostic):
+    """Original-Owner inert qualification, isolated from Worker bootstrap.
+
+    The current candidate can persist/read back custody but cannot yet supply
+    independently verified Host rights or a resource observer. Refusal retains
+    the reservation and never enters the ordinary local Popen branch.
+    """
+    from gateway.session_vz_adapter import reserve_q1_diagnostic
+    from gateway.session_worker_spawn import check_q1_acquisition
+    from gateway.session_runtime_workers import tracked_write
+
+    def prepare():
+        handle = reserve_q1_diagnostic(authority, ref, row, diagnostic)
+        try:
+            check_q1_acquisition(handle, diagnostic)
+        finally:
+            # The same tracked operation owns late completion after caller
+            # cancellation. No cancelled await can separate commit and revoke.
+            handle.revoke()
+    await tracked_write(authority, prepare)
+
+
 async def execute_managed(authority, ref, row, policy):
     from gateway.session_kanban import check_board_execution
     check_board_execution(authority, ref, policy=policy)

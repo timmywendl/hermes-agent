@@ -62,10 +62,15 @@ def test_no_cron_idle_skips_cron_but_preserves_pending_admissions(tmp_path, monk
 
 
 def test_no_cron_rejects_disabled_idle_exit(monkeypatch):
+    from gateway import run_bootstrap, run_runtime
+
     runner = SimpleNamespace(_no_cron=True)
+    monkeypatch.setattr(run_runtime, "publish_gateway_runtime_ready", lambda runner: pytest.fail("published READY"))
     for window in (0, float("inf"), float("nan")):
         monkeypatch.setattr(run_idle_exit, "idle_exit_seconds", lambda runner, value=window: value)
         assert not run_idle_exit.arm_unmanaged_idle_exit(runner)
+        with pytest.raises(RuntimeError, match=r"gateway\.unmanaged_idle_exit_seconds.*positive and finite"):
+            run_bootstrap._start_gateway_publish_ready(runner, idle_exit=True, no_cron=True)
 
 
 def test_no_cron_freezes_positive_idle_exit_window(monkeypatch):

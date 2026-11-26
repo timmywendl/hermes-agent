@@ -92,6 +92,30 @@ def test_no_cron_unknown_sha_refuses_without_spawn(tmp_path, monkeypatch):
     assert result.reason_code == 'unknown_code_identity' and 'no verifiable code SHA' in result.detail
 
 
+def test_no_cron_control_timeout_before_and_after_spawn_is_fail_closed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    monkeypatch.setattr('gateway.control_socket._detect_supervisor', lambda: 'manual')
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    monkeypatch.setattr('gateway.host_attach.host_gateway', lambda **kw: None)
+    monkeypatch.setattr(runtime, '_update_fenced', lambda homes: False)
+    monkeypatch.setattr(runtime, '_multiplexer_starting', lambda home: False)
+    monkeypatch.setattr(version_info, 'get_code_identity', lambda: {'sha': 'abc'})
+    calls = []
+    monkeypatch.setattr(start, 'spawn_unmanaged_gateway', lambda *a, **kw:
+                        calls.append(kw) or SimpleNamespace(poll=lambda: None))
+    timeout = runtime.GatewayDiscovery('inaccessible', reason_code='control_timeout')
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: timeout)
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result is timeout and result.endpoint is None and not calls
+
+    observations = iter([runtime.GatewayDiscovery('absent'), timeout])
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: next(observations))
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result is timeout and result.endpoint is None and len(calls) == 1
+
+
 def test_no_cron_child_exit_reports_redacted_startup_detail(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
@@ -118,7 +142,7 @@ def test_no_cron_child_exit_reports_redacted_startup_detail(tmp_path, monkeypatc
 
 
 def test_normal_ensure_refuses_no_cron_owner(tmp_path, monkeypatch):
-    from hermes_cli import gateway_runtime as runtime
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start
 
     endpoint = runtime.GatewayEndpoint(str(tmp_path), "instance", 1, 1, "http://127.0.0.1:1234",
                                        "none", frozenset({"session-authority-v1", "no-cron-v1"}),
@@ -126,8 +150,10 @@ def test_normal_ensure_refuses_no_cron_owner(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
     monkeypatch.setattr(runtime, "_observe_replacing_stale",
                         lambda *args: runtime.GatewayDiscovery("ready", endpoint))
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *a, **kw: pytest.fail("spawned"))
     result = runtime.ensure_gateway_runtime(tmp_path)
     assert result.state == "incompatible" and result.reason_code == "no_cron_gateway"
+    assert result.endpoint is None and all(word in result.detail for word in ("Close", "idle exit", "retry"))
 
 def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch):
     from types import SimpleNamespace

@@ -264,7 +264,10 @@ def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
                 detail="No-Cron requires an unmanaged launch; use an ordinary terminal or the normal managed Gateway.")
         if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
             return GatewayDiscovery("draining", reason_code="update_paused")
-        if (discover_gateway_endpoint(home, timeout=remaining(deadline)).state != "absent"
+        initial = discover_gateway_endpoint(home, timeout=remaining(deadline))
+        if initial.reason_code == "control_timeout":
+            return initial
+        if (initial.state != "absent"
                 or _multiplexer_starting(home) or host_gateway(wait_for_channel=0.01) is not None):
             return GatewayDiscovery("conflict", reason_code="existing_gateway")
         code_sha = get_code_identity().get("sha")
@@ -365,7 +368,8 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
             status = child.poll() if child is not None else None
             observed = _observe_replacing_stale(home, deadline, replaced)
             if observed.endpoint is not None and "no-cron-v1" in observed.endpoint.capabilities:
-                return GatewayDiscovery("incompatible", reason_code="no_cron_gateway")
+                return GatewayDiscovery("incompatible", reason_code="no_cron_gateway",
+                    detail="Close the active one-off No-Cron chat, wait for its idle exit, then retry.")
             if observed.reason_code == "control_timeout":
                 return GatewayDiscovery("starting", reason_code="deadline")
             if observed.state == "draining" and observed.reason_code in _RETIRING:

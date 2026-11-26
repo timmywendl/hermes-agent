@@ -695,7 +695,8 @@ def _start_gateway_publish_ready(runner, *, idle_exit, no_cron):
     if no_cron:
         from gateway.run_idle_exit import arm_unmanaged_idle_exit
         if not arm_unmanaged_idle_exit(runner):
-            raise RuntimeError("no-cron gateway requires an active idle-exit watcher")
+            raise RuntimeError("no-cron gateway requires an active idle-exit watcher; "
+                               "gateway.unmanaged_idle_exit_seconds must be positive and finite")
     publish_gateway_runtime_ready(runner)
     if not no_cron:
         runner._start_systemd_watchdog()

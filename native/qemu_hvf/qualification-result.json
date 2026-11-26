@@ -1,0 +1,29 @@
+{
+  "package": "HERMES_Q1_HVF_PROCESS_OWNED_GUEST_FEASIBILITY_V1",
+  "executed_source_head": "39a1443d35460d25fdecfd38cc799cdee284ce53",
+  "helper_sha256": "ecfc393fb8e1dc93303befc7bd17a7fe016ba4269dc6aa3be7f1828ed1c95696",
+  "native_qemu_processes": 1,
+  "vm_create_successes": 1,
+  "normal_retired": 0,
+  "abnormal_executed": 0,
+  "slots_2_to_5": "NOT_RUN_FIRST_FAILURE_STOP",
+  "qualification": "NOT_PASS",
+  "custody": "STOP_UNCERTAIN",
+  "guest_boot": "PASS",
+  "effective_sandbox": "PASS_TESTED_BUILD_ONLY",
+  "device_inventory": "PASS_2CPU_2GIB_NO_NIC_RO_128MIB",
+  "guest_orderly_shutdown": "NOT_OBSERVED",
+  "explicit_hv_vm_destroy": "NOT_OBSERVED",
+  "original_owner_wait_status": "UNKNOWN_NOT_PERSISTED_ON_FAILURE_PATH",
+  "cause": "QEMU ringbuf-write modifies output ring, not Guest serial ingress; normal stop timed out",
+  "post_stop_correction": "INHERITED_UNNAMED_AF_UNIX_SERIAL_OFFLINE_ONLY",
+  "native_retry": "NOT_AUTHORIZED_NO_RETRY_PERFORMED",
+  "stage3": "NOT_QUALIFIED",
+  "worker_dispatch": "NOT_AUTHORIZED",
+  "evidence_sha256": {
+    "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/native-campaign-owner.log": "ecbeec03f95ec840f8a72e93caee4d646b45acd584b7186b341a1dbf036596d1",
+    "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/campaign/native-results/slot-1/stderr.log": "355761918dbc5e990f1308d05810e7a488ba6b03061e5cc72cc257558ca4da2a",
+    "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/campaign/native-results/slot-1/stdout.log": "1387063d5b5dd4eb1e4dd63d8d9724c8d4b6d1e4097cc4ab6732fb3ed43b05f8",
+    "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/campaign/native-results/slot-1/serial.log": "cea2bc49629df86b8d9eb06bbde1fca41a0e37cb8cc93c0cfb1ff2b0a43ff6b3"
+  }
+}

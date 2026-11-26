@@ -1,0 +1,60 @@
+{
+  "signature_type": 0,
+  "public_key_algorithm": 1,
+  "hash_algorithm": "sha512",
+  "signed_sha256": "5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22",
+  "fingerprint": "CEACC9E15534EBABB82D3FA03353C9CEF108B584",
+  "source": "https://download.qemu.org/qemu-11.1.3.tar.xz",
+  "version": "11.1.3",
+  "vendor_signature": "PASS",
+  "protected_publisher_approval": "NOT_IMPLIED",
+  "extraction": {
+    "historical_initial_failure": "data filter refused edk2 absolute symlink in sources; partial extraction preserved unused",
+    "build_sources": "sources-verified",
+    "excluded_absolute_symlinks": [
+      {
+        "name": "qemu-11.1.3/roms/edk2/EmulatorPkg/Unix/Host/X11IncludeHack",
+        "target": "/opt/X11/include",
+        "reason": "absolute symlink, not built"
+      }
+    ],
+    "downloads_sha256": {
+      "pkgconf-2.5.1.tar.xz": "cd05c9589b9f86ecf044c10a2269822bc9eb001eced2582cfffd658b0a50c243",
+      "ninja-1.13.0.tar.gz": "f08641d00099a9e40d44ec0146f841c472ae58b7e6dd517bee3945cfd923cedf",
+      "qemu-release-key.asc": "05d6f38c5acd314bf22670393240f79d5fa199628ee8a46bdf565144083da3ab",
+      "qemu-11.1.3.tar.xz": "5a8289c7940dc77d3873c81a6c29ba3afe1446fc9d36e77fa1658cdbecb84b22",
+      "qemu-11.1.3.tar.xz.sig": "362dc9aacb38575aea217380b55065416843dc84cbaf0dd58aab5a5e44d41c8f"
+    }
+  },
+  "guest": {
+    "guest": "SERIAL_ONLY_INERT_NO_WORKER",
+    "build_argv": [
+      "/Users/timmywen/Documents/AI_Colleague/evidence/first-worker-owned-delivery-20261120/q1-candidate-20261121/guest/tools/zig-aarch64-macos-0.15.2/zig",
+      "cc",
+      "-target",
+      "aarch64-linux-musl",
+      "-ffreestanding",
+      "-fno-stack-protector",
+      "-fno-builtin",
+      "-nostdlib",
+      "-static",
+      "-O2",
+      "-Wl,-e,_start",
+      "native/qemu_hvf/guest_init.c",
+      "-o",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/guest/serial-init"
+    ],
+    "kernel_reused": "/Users/timmywen/Documents/AI_Colleague/evidence/first-worker-owned-delivery-20261120/q1-candidate-20261121/guest/artifacts/kernel.Image",
+    "raw_disk_reused": "/Users/timmywen/Documents/AI_Colleague/evidence/first-worker-owned-delivery-20261120/q1-candidate-20261121/guest/artifacts/root-disk.raw",
+    "original_guest_artifacts_unchanged": true,
+    "derived_serial_init_only": "Adapts VZ-only control to explicitly authorized local serial shutdown; no new kernel/distro/runtime",
+    "sha256": {
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/guest/serial-init": "52cf9bc003de083e60e1e4a1ba62547d4779520cce5fa24aad9b957cdd3b3c6d",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/guest/serial-initramfs.cpio.gz": "7da9c40b4169136350c72893e641cbdd72cb9a37ae723a4cb5b913f4236dca0e",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/first-worker-owned-delivery-20261120/q1-candidate-20261121/guest/artifacts/kernel.Image": "9c37ace54ef7e1919411fd912e9f34d6982ddd7f4c8ef3c8aee56f4c4d70db67",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/first-worker-owned-delivery-20261120/q1-candidate-20261121/guest/artifacts/root-disk.raw": "f7e5ae63f02aab7451f459f71d230dd353ab7ae2d99354d979ed73d3ea9b0e2d"
+    },
+    "boot": "NOT_RUN"
+  },
+  "scope": "inert Q1 only; no Worker dispatch; Native NOT_RUN at build"
+}

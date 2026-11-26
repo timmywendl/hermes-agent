@@ -212,7 +212,10 @@ def stop_authority_turns(authority, *, in_process=False):
     from hermes_state_runtime import RuntimeStoreError
     signalled = 0
     workers = getattr(authority, '_managed_workers', {})
-    for worker in list(workers.values()):
+    hvf = getattr(authority, '_hvf_workers', {})
+    if hasattr(authority, '_hvf_campaign_stop'):
+        authority._hvf_campaign_stop.set()
+    for worker in [*workers.values(), *hvf.values()]:
         if worker.closed.is_set() or (getattr(worker, 'stop', None) is not None and worker.stop.is_set()):
             continue
         try:

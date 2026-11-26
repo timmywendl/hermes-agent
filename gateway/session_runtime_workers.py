@@ -18,7 +18,10 @@ def uncounted_runtime_work(runner):
     authorities = all_authorities(runner)
     managed = sum(not worker.closed.is_set() for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+    hvf = sum(len({*getattr(authority, '_hvf_retained', ()),
+                   *(key for key, handle in getattr(authority, '_hvf_workers', {}).items()
+                     if not handle.closed.is_set())}) for authority in authorities)
+    return (managed + hvf + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
                 for authority in authorities for sid, live, _ in executing_sessions(authority))
             + sum(len(mutation_tasks(authority)) for authority in authorities))
 
@@ -142,7 +145,10 @@ async def join_authority_work(authority, timeout):
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         stop_authority_work(authority)
-        if not list(physical_workers(authority)) and not list(executing_sessions(authority)) and not mutation_tasks(authority):
+        hvf_pending = (bool(getattr(authority, '_hvf_retained', ()))
+                       or any(not h.closed.is_set() for h in getattr(authority, '_hvf_workers', {}).values()))
+        if (not hvf_pending and not list(physical_workers(authority))
+                and not list(executing_sessions(authority)) and not mutation_tasks(authority)):
             return
         if asyncio.get_running_loop().time() >= deadline:
             raise TimeoutError('Profile workers did not stop; ownership retained')

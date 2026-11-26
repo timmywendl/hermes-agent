@@ -1,0 +1,39 @@
+{
+  "grant": "PR15_HVF_RERUN_20261121_A",
+  "authorizing_comment": "https://github.com/spareribes/ai-colleague/issues/139#issuecomment-7060302726",
+  "candidate": {
+    "profile": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/campaign/hvf-qualification",
+    "board": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/campaign/hvf-qualification/kanban/boards/hvf-qualification/kanban.db",
+    "helper": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/MacOS/qemu-system-aarch64",
+    "plan": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/canary-plan.json",
+    "kernel": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/kernel.Image",
+    "initramfs": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/serial-initramfs.cpio.gz",
+    "disk": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/root-disk.raw",
+    "output": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/campaign/native-results",
+    "files": {
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Frameworks/libglib-2.0.0.dylib": "359bb9c6d2276ef925b4255a09d589597a114f7536ab3002f985ee1a978eee30",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Frameworks/libintl.8.dylib": "49a52bc4a7241bf82392f65eb3ae20f5414bdd8684e806f79115a03ec5940747",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Frameworks/libpcre2-8.0.dylib": "4c494053ae7324f5dda00472f12c9b3d6303dcf8ac2ca3baf7dcdd7d80f95021",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Info.plist": "ed78da64e964ecfd400a11e6a633dea2fe9af67d8ce8128c8af5eab84c5a28f6",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/MacOS/qemu-system-aarch64": "36f23b811da6658c4ba27008b4588feeea86e94ea62346e84aa8c6533be0eebe",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/approved-marker": "aefd34f9817ec64c326183e4e73e12719b671ff8851dd39e365397fe7fa5f6a1",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/canary-plan.json": "4e4d3129b21608af42d5e5ce13addc45e5204322b9b58735e3593d6739bd691a",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/kernel.Image": "9c37ace54ef7e1919411fd912e9f34d6982ddd7f4c8ef3c8aee56f4c4d70db67",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/root-disk.raw": "f7e5ae63f02aab7451f459f71d230dd353ab7ae2d99354d979ed73d3ea9b0e2d",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/Resources/serial-initramfs.cpio.gz": "7da9c40b4169136350c72893e641cbdd72cb9a37ae723a4cb5b913f4236dca0e",
+      "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/rerun-PR15_HVF_RERUN_20261121_A/candidate/HermesQ1HVF.app/Contents/_CodeSignature/CodeResources": "6b075c66a13fa15f2b813266ac4a2748a9b16ca82bce0774e72a38f9087ce816"
+    },
+    "prior_profile": "/Users/timmywen/Documents/AI_Colleague/evidence/pr15-qemu-hvf-feasibility-20261121/campaign/hvf-qualification",
+    "prior_snapshot_sha256": "3d06840ae1e7ba63cf7336740e31fd66133aae32800b2f417d77aede00ff9cd9"
+  },
+  "modes": [
+    "normal",
+    "normal",
+    "normal",
+    "sigkill",
+    "sigabrt"
+  ],
+  "max_native_seconds": 1800,
+  "max_concurrent_vm": 1,
+  "old_grant": "SPENT_NEVER_RESUME"
+}

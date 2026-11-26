@@ -251,6 +251,11 @@ class GatewayRuntimeAPI:
 
     async def __call__(self, scope, receive, send):
         descriptor = getattr(self.runner, 'session_runtime_descriptor', None)
+        no_cron_socket = (getattr(self.runner, '_no_cron', False) is True
+                          and scope['type'] == 'websocket' and scope['path'] == '/api/ws')
+        if no_cron_socket and descriptor is None:
+            await send({'type': 'websocket.close', 'code': 1013})
+            return
         if scope['type'] not in {'http', 'websocket'} or descriptor is None:
             return await self.app(scope, receive, send)
         draining_socket = (descriptor['state'] in {'ready', 'draining'}
@@ -290,8 +295,8 @@ class GatewayRuntimeAPI:
         ws = WebSocket(scope, receive, send)
         ticket, reason = _gateway_ws_ticket_from_subprotocol(ws)
         if reason == 'none' or ws.headers.get('origin'):
-            if draining_socket:
-                await ws.close(code=1013)
+            if draining_socket or no_cron_socket:
+                await ws.close(code=1013 if draining_socket else 4403)
                 return
             return await self.app(scope, receive, send)
         if (reason != 'ok' or not _embedded_chat_enabled()
@@ -309,8 +314,8 @@ class GatewayRuntimeAPI:
                 grant = self.runner.session_ticket_store.redeem(ticket, profile_id=None, purpose='worker-adoption')
             except PermissionError:
                 # Browser/OAuth tickets have a separate issuer.
-                if draining_socket:
-                    await ws.close(code=1013)
+                if draining_socket or no_cron_socket:
+                    await ws.close(code=1013 if draining_socket else 4403)
                     return
                 return await self.app(scope, receive, send)
         allow_draining = not operator

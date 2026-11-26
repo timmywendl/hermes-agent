@@ -7,6 +7,77 @@ from websockets.asyncio.client import connect
 
 
 @pytest.mark.asyncio
+async def test_no_cron_websocket_only_accepts_native_tickets_without_fallback(monkeypatch):
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    from gateway import run_api, session_authorities
+    from gateway.runtime_bootstrap import TicketStore
+    from tui_gateway import ws as tui_ws
+
+    fallback, accepted = [], []
+    async def dashboard(scope, receive, send):
+        fallback.append(True)
+    async def handler(ws, **kwargs):
+        accepted.append(kwargs)
+    monkeypatch.setattr(run_api, '_embedded_chat_enabled', lambda: True)
+    monkeypatch.setattr('hermes_cli.web_server_boundary.ws_host_origin_reason', lambda ws, state: None)
+    monkeypatch.setattr('hermes_cli.web_server_boundary.ws_client_reason', lambda ws, state: None)
+    monkeypatch.setattr(session_authorities, 'authority_for_profile_id', lambda runner, profile: object())
+    monkeypatch.setattr(session_authorities, 'owner_scope', lambda authority: nullcontext())
+    monkeypatch.setattr(tui_ws, 'handle_ws', handler)
+    store = TicketStore('instance', frozenset({'profile'}))
+    runner = SimpleNamespace(_no_cron=True, _draining=False, session_ticket_store=store,
+                             session_runtime_descriptor={'state': 'ready'})
+    app = run_api.GatewayRuntimeAPI(dashboard, runner, SimpleNamespace(state=object()))
+    async def attempt(protocol=None, origin=False):
+        headers = [(b'host', b'localhost')]
+        if protocol is not None:
+            headers.append((b'sec-websocket-protocol', protocol.encode()))
+        if origin:
+            headers.append((b'origin', b'http://localhost'))
+        scope = {'type': 'websocket', 'path': '/api/ws', 'headers': headers,
+                 'client': ('127.0.0.1', 1234), 'server': ('127.0.0.1', 80),
+                 'scheme': 'ws', 'query_string': b'', 'subprotocols': []}
+        messages = []
+        async def receive():
+            return {'type': 'websocket.connect'}
+        async def send(message):
+            messages.append(message)
+        await app(scope, receive, send)
+        return messages
+    for protocol, origin in ((None, False), ('hermes-gateway-ticket.invalid', False),
+                             ('hermes-gateway-v1, hermes-gateway-ticket.bad', False), (None, True)):
+        assert (await attempt(protocol, origin))[0]['type'] == 'websocket.close'
+    ticket = store.mint(profile_id='profile', subject='uid:test', purpose='interactive')
+    protocol = f'hermes-gateway-v1, hermes-gateway-ticket.{ticket}'
+    assert await attempt(protocol) == [] and len(accepted) == 1
+    assert (await attempt(protocol))[0]['type'] == 'websocket.close'  # replay
+    expired = store.mint(profile_id='profile', subject='uid:test', purpose='interactive')
+    monkeypatch.setattr('gateway.runtime_bootstrap.time.monotonic', lambda: float('inf'))
+    assert (await attempt(f'hermes-gateway-v1, hermes-gateway-ticket.{expired}'))[0]['type'] == 'websocket.close'
+    assert fallback == []
+    runner.session_runtime_descriptor = None
+    assert (await attempt())[0]['type'] == 'websocket.close'
+    runner._no_cron = False
+    runner.session_runtime_descriptor = {'state': 'ready'}
+    assert await attempt() == [] and fallback == [True]
+
+
+@pytest.mark.asyncio
+async def test_no_cron_empty_shutdown_notice_never_imports_cron(monkeypatch):
+    import builtins
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name == 'cron' or name.startswith('cron.'):
+            pytest.fail('cron imported')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    assert await GatewayShutdownMixin._notify_interrupted_cron_jobs(object(), []) == 0
+
+
+@pytest.mark.asyncio
 async def test_no_cron_never_hot_serves_another_profile(tmp_path):
     from types import SimpleNamespace
     from gateway.run_runtime import serve_profile_runtime

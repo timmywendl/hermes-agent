@@ -4579,7 +4579,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Refresh the systemd unit on every boot so restart settings stay current even after an
     # exit-code-75 respawn (stale-code or /restart), which bypasses `hermes gateway restart`.
-    if supports_systemd_services():
+    if no_cron_launch_id is None and supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:

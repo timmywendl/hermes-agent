@@ -4,6 +4,34 @@ import argparse
 import pytest
 
 
+def test_no_cron_never_refreshes_systemd_unit(monkeypatch):
+    from hermes_cli import gateway
+    from hermes_cli.observability import shared_metrics_process
+
+    for name in ('_guard_official_docker_root_gateway', '_attach_to_host_gateway_or_guard',
+                 '_guard_supervised_gateway_conflict', '_guard_existing_gateway_process_conflict',
+                 '_apply_startup_watchdog_config'):
+        monkeypatch.setattr(gateway, name, lambda *a, **kw: None)
+    monkeypatch.setattr(shared_metrics_process, 'begin_process', lambda *a: None)
+    for name in ('_stdin_is_tty', '_windows_console_window_attached', '_windows_gateway_breakaway_state',
+                 '_windows_gateway_should_absorb_console_controls', '_running_under_gateway_supervisor', 'is_linux'):
+        monkeypatch.setattr(gateway, name, lambda: False)
+    monkeypatch.setattr(gateway, 'supports_systemd_services', lambda: True)
+    refreshed = []
+    monkeypatch.setattr(gateway, 'refresh_systemd_unit_if_needed', lambda **kw: refreshed.append(kw))
+    class StopBeforeGateway(Exception):
+        pass
+    def stop():
+        raise StopBeforeGateway
+    monkeypatch.setattr(gateway, '_gateway_detached_env', stop)
+    with pytest.raises(StopBeforeGateway):
+        gateway.run_gateway(idle_exit=True, no_cron_launch_id='a' * 32)
+    assert refreshed == []
+    with pytest.raises(StopBeforeGateway):
+        gateway.run_gateway()
+    assert refreshed == [{'system': False}]
+
+
 def test_no_cron_routes_through_existing_chat_without_bypass_policy(monkeypatch):
     from hermes_cli import gateway_chat, main, main_tui_launch, gateway_chat_startup
 

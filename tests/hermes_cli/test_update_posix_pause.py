@@ -23,6 +23,60 @@ _UNIT = {"kind": "systemd", "scope": "user", "unit": "hermes-gateway-p2probe.ser
 
 
 @pytest.mark.platforms("posix")
+@pytest.mark.parametrize("launch_arg", ["--no-cron-launch-id", "--no-cron-launch-id=abc"])
+def test_no_cron_refuses_update_before_commit_or_pause(monkeypatch, tmp_path, launch_arg):
+    from hermes_cli import update_cmd_commit as commit, update_cmd_posix_pause as pause, update_pause_record
+
+    entry = {"pid": 4242, "home": str(tmp_path), "argv": ["hermes", "gateway", "run", launch_arg]}
+    monkeypatch.setattr(pause, "_RUN", pause._empty_token())
+    monkeypatch.setattr(pause, "_discover_systemd", list)
+    monkeypatch.setattr(pause, "_discover_launchd", list)
+    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([entry], []))
+    monkeypatch.setattr(pause, "_left_running", lambda *a: pytest.fail("entered supervisor handling"))
+    monkeypatch.setattr(pause, "_stop_gateways", lambda *a: pytest.fail("stopped a gateway"))
+    monkeypatch.setattr(pause, "_relaunch_bare", lambda *a: pytest.fail("replayed a gateway"))
+    monkeypatch.setattr(update_pause_record, "record_pause", lambda *a, **kw: pytest.fail("recorded pause"))
+    monkeypatch.setattr(commit, "arm_commit_obligations", lambda *a: pytest.fail("armed checkout"))
+    monkeypatch.setattr(commit, "arm_tree_move", lambda *a, **kw: pytest.fail("armed tree move"))
+    refusal = commit.arm_commit_point(None, tmp_path, "target")
+    assert "No-Cron" in refusal and "idle exit" in refusal
+    assert pause._RUN["resume_needed"] is False and not pause._RUN["unmapped"]
+    assert pause.pause_at_commit_point() == refusal
+
+
+@pytest.mark.platforms("posix")
+def test_no_gateway_restart_still_skips_pause(monkeypatch):
+    from hermes_cli import update_cmd_posix_pause as pause
+    monkeypatch.setattr(pause, "_RUN", None)
+    monkeypatch.setattr(pause, "_discover_bare", lambda *a: pytest.fail("discovered gateway"))
+    assert pause.arm_pause(no_gateway_restart=True) is None
+    assert pause.pause_at_commit_point() is None
+
+
+@pytest.mark.platforms("posix")
+def test_normal_bare_gateway_is_paused_and_replayed(monkeypatch, tmp_path):
+    from gateway import status
+    from hermes_cli import update_cmd_posix_pause as pause, update_pause_record as record
+
+    entry = {"pid": 4242, "home": str(tmp_path), "argv": ["hermes", "gateway", "run"]}
+    monkeypatch.setattr(pause, "_discover_systemd", list)
+    monkeypatch.setattr(pause, "_discover_launchd", list)
+    monkeypatch.setattr(pause, "_discover_bare", lambda pids: ([entry], []))
+    monkeypatch.setattr(pause, "_left_running", lambda units, jobs: (units, jobs, []))
+    monkeypatch.setattr(status, "get_process_start_time", lambda pid: 1)
+    monkeypatch.setattr(record, "identity", lambda pid: {"ct": "ct:1"})
+    for name in ("record_pause", "mark_stop_requested", "sync"):
+        monkeypatch.setattr(record, name, lambda *a, **kw: None)
+    stopped, replayed = [], []
+    monkeypatch.setattr(pause, "_stop_gateways", lambda token, entries: stopped.extend(entries))
+    monkeypatch.setattr(pause, "_relaunch_bare", lambda item: replayed.append(item) or 4243)
+    token = pause._empty_token()
+    assert pause._pause(token) is None and stopped == [entry]
+    pause.resume_paused_set(token)
+    assert replayed == [entry] and not token["resume_needed"]
+
+
+@pytest.mark.platforms("posix")
 @pytest.mark.live_system_guard_bypass
 def test_a_killed_updaters_supervised_units_are_adopted_by_the_next_update(tmp_path):
     """The updater stopped a systemd unit and was SIGKILLed: the next ``hermes update`` must own

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- bounded No-Cron Cron-ingress guard in the existing API Server boundary; exact PR #25 closeout only
 """OpenAI-compatible API server platform adapter (aiohttp).
 
 Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/sessions,
@@ -3776,6 +3777,13 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
 
+    def _no_cron_response(self, request: web.Request) -> Optional[web.Response]:
+        runner = self.gateway_runner or request.app.get("gateway_runner")
+        if getattr(runner, "_no_cron", False) is True:
+            return web.json_response({"error": "Cron is unavailable while the one-off gateway is active"},
+                                     status=503, headers={"Retry-After": "60"})
+        return None
+
     def _cron_request_guard(
         self, request: web.Request, *, need_job_id: bool = False, check_draining: bool = False,
     ) -> tuple:
@@ -3783,6 +3791,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         auth_err = self._check_auth(request)
         if auth_err:
             return None, auth_err
+        if unavailable := self._no_cron_response(request):
+            return None, unavailable
         if check_draining:
             draining = self._draining_response()
             if draining is not None:
@@ -3952,6 +3962,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """POST /api/cron/fire — Chronos fire webhook (NAS -> agent), authenticated by a
         NAS-minted JWT via the pluggable verifier, NOT API_SERVER_KEY. 202 + background run so
         a long turn never trips NAS's timeout; the store CAS claim guards double-fire on retry."""
+        if unavailable := self._no_cron_response(request):
+            return unavailable
         # Startup-wait budget starts here so a slow JWKS fetch cannot outlast the forwarder timeout.
         received_at = asyncio.get_running_loop().time()
         from hermes_cli.config import cfg_get, load_config

@@ -7,6 +7,44 @@ from websockets.asyncio.client import connect
 
 
 @pytest.mark.asyncio
+async def test_no_cron_startup_skips_notice_import_but_keeps_recovery(monkeypatch):
+    import builtins
+    import sys
+    from types import SimpleNamespace
+    from gateway import run, run_runtime, run_startup, shutdown_flush
+    from tools.process_registry import process_registry
+
+    calls = []
+    async def event(name, *args, **kwargs):
+        calls.append(name)
+    runner = SimpleNamespace(_no_cron=True,
+        _start_post_connect_services=lambda n: event('services'),
+        _await_startup_boot_sends=lambda **kw: event('sends'),
+        _schedule_resume_pending_sessions=lambda: calls.append('resume'),
+        _finish_startup_restore=lambda: event('restore'),
+        _send_session_db_warning_notifications=lambda: event('warnings'))
+    monkeypatch.setattr(run, '_restart_notification_pending', lambda: False)
+    monkeypatch.setattr(run, '_planned_restart_notification_pending', lambda: False)
+    monkeypatch.setattr(shutdown_flush, 'recover_gateway_pending', lambda runner: calls.append('pending'))
+    monkeypatch.setattr(run_runtime, 'recover_gateway_native_sessions', lambda runner: event('native'))
+    monkeypatch.setattr(process_registry, 'pending_watchers', [])
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name == 'gateway.cron_store_notices':
+            pytest.fail('no-cron imported store notices')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    await run_startup.GatewayStartupMixin._start_finish_wiring(runner, 0)
+    assert calls == ['services', 'sends', 'pending', 'resume', 'restore', 'native', 'warnings']
+    monkeypatch.setattr(builtins, '__import__', original)
+    monkeypatch.setitem(sys.modules, 'gateway.cron_store_notices',
+                        SimpleNamespace(install_cron_store_notices=lambda runner, loop: calls.append('cron-notice')))
+    runner._no_cron = False
+    await run_startup.GatewayStartupMixin._start_finish_wiring(runner, 0)
+    assert calls[-1] == 'cron-notice'
+
+
+@pytest.mark.asyncio
 async def test_no_cron_websocket_only_accepts_native_tickets_without_fallback(monkeypatch):
     from contextlib import nullcontext
     from types import SimpleNamespace

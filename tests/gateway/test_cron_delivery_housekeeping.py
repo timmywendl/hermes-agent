@@ -8,6 +8,39 @@ from cron import scheduler_preflight as sched_preflight
 import gateway.run as gateway_run
 
 
+def test_headless_no_cron_owner_holds_agent_jobs_but_keeps_scripts(monkeypatch, tmp_path):
+    from cron import scheduler_gateway_gate as gate
+    from hermes_cli import gateway_runtime
+    import hermes_constants
+
+    jobs = [{'id': 'agent'}, {'id': 'script', 'no_agent': True}]
+    observed = SimpleNamespace(state='ready', endpoint=SimpleNamespace(capabilities={'no-cron-v1'}))
+    monkeypatch.delenv('HERMES_TUI_GATEWAY_URL', raising=False)
+    monkeypatch.setattr(hermes_constants, 'get_hermes_home', lambda: tmp_path)
+    monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint', lambda *a, **kw: observed)
+    refused = []
+    monkeypatch.setattr(gate, '_note_fire_refused', lambda ids, detail: refused.append((ids, detail)))
+    assert gate.refuse_agent_jobs_without_gateway(jobs) == [jobs[1]]
+    assert refused[0][0] == ['agent'] and 'no-cron' in refused[0][1]
+    observed.endpoint.capabilities = {'session-authority-v1'}
+    assert gate.refuse_agent_jobs_without_gateway(jobs) == jobs
+    assert len(refused) == 1
+
+
+def test_held_headless_job_clears_only_uncommitted_claim(monkeypatch):
+    from contextlib import nullcontext
+    from cron import jobs, scheduler_gateway_gate as gate
+
+    row = {'id': 'agent', 'next_run_at': '2030-01-01T00:00:00Z', 'pending_slot': 'slot', 'run_claim': 'claim'}
+    saved = []
+    monkeypatch.setattr(jobs, '_jobs_lock', lambda: nullcontext())
+    monkeypatch.setattr(jobs, 'load_jobs', lambda: [row])
+    monkeypatch.setattr(jobs, 'save_jobs', lambda rows: saved.append(rows))
+    gate._note_fire_refused(['agent'], 'held')
+    assert saved == [[row]] and row['next_run_at'] == '2030-01-01T00:00:00Z'
+    assert 'pending_slot' not in row and row['run_claim'] is None and row['last_fire_error']['detail'] == 'held'
+
+
 class _OneTickStopEvent:
     def __init__(self):
         self.waited = False

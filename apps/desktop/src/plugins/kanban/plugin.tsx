@@ -32,8 +32,9 @@ import {
 
 import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
 import { KanbanBoardPage } from './board'
-import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
+import { MissionWorkbench } from './workbench'
+import { WORKBENCH_LOCALES } from './workbench-i18n'
 
 // Live "N running / ready" pill — one glance at fleet activity from anywhere,
 // clicks through to the board. Shares the board query (one cache, one poll with
@@ -84,7 +85,7 @@ const plugin: HermesPlugin = {
   description: 'Multi-agent task board — board page, sidebar entry, and a live in-flight count in the status bar.',
   defaultEnabled: false,
   register(ctx) {
-    ctx.i18n.register(KANBAN_LOCALES)
+    ctx.i18n.register(WORKBENCH_LOCALES)
     ctx.onDispose(bindApi(ctx.rest, ctx.storage, ctx.socket, { os: ctx.os, t: ctx.i18n.t }))
 
     // The plugin command pattern: ONE action id (`kanban.newTask`) wired into
@@ -112,6 +113,12 @@ const plugin: HermesPlugin = {
         render: () => <KanbanBoardPage />
       },
       {
+        id: 'workbench',
+        area: ROUTES_AREA,
+        data: { path: '/workbench' } satisfies RouteContribution,
+        render: () => <MissionWorkbench />
+      },
+      {
         id: 'count',
         area: STATUSBAR_AREAS.right,
         order: 80,
@@ -121,6 +128,16 @@ const plugin: HermesPlugin = {
 
     const registerLabels = () =>
       ctx.registerMany([
+        {
+          id: 'workbench-nav',
+          area: SIDEBAR_NAV_AREA,
+          order: 49,
+          data: {
+            codicon: 'organization',
+            label: ctx.i18n.t('workbench.title'),
+            path: '/workbench'
+          } satisfies SidebarNavContribution
+        },
         {
           id: 'nav',
           area: SIDEBAR_NAV_AREA,

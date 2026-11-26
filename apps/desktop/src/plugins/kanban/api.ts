@@ -43,6 +43,7 @@ import type {
   TaskEstimate,
   WorkerLog
 } from './types'
+import type { DeliverySnapshot, MissionConfirmation, MissionPlan, WorkbenchSnapshot } from './workbench-types'
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
@@ -406,6 +407,32 @@ export const fetchProfiles = () => call<{ profiles: KanbanProfile[] }>('/profile
 export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/projects')
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
+
+// Planning and inspection must never pass through nudged(): saving a Mission
+// is not permission to wake the dispatcher.
+export const fetchWorkbench = (projectId: string) =>
+  call<WorkbenchSnapshot>(withBoard('/workbench', projectId ? { project_id: projectId } : {}))
+
+export const fetchDelivery = (taskId: string) =>
+  call<DeliverySnapshot>(withBoard(`/workbench/delivery/${encodeURIComponent(taskId)}`))
+
+export const previewMission = (goal: string, projectId: string) =>
+  call<MissionPlan>(withBoard('/workbench/plan'), {
+    method: 'POST',
+    body: { goal, project_id: projectId || null }
+  })
+
+export const confirmMission = (plan: MissionPlan, projectId: string, requestId: string) =>
+  call<MissionConfirmation>(withBoard('/workbench/confirm'), {
+    method: 'POST',
+    body: { plan, project_id: projectId || null, request_id: requestId }
+  })
+
+export const respondToDecision = (taskId: string, decisionId: string, response: string) =>
+  call(withBoard(`/workbench/decisions/${encodeURIComponent(taskId)}/respond`), {
+    method: 'POST',
+    body: { decision_id: decisionId, response }
+  })
 
 // ── writes ────────────────────────────────────────────────────────────────────
 

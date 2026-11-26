@@ -246,10 +246,12 @@ def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
     """Start exactly one unmanaged owner; never adopt or replace an existing owner."""
     import time
     from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
-    from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway
+    from hermes_cli.gateway_runtime_start import spawn_unmanaged_gateway, startup_failure_report, stdio_log_size
     from hermes_cli.version_info import get_code_identity
     from hermes_constants import get_default_hermes_root, get_process_hermes_home
+    from gateway.control_socket import _detect_supervisor
     from gateway.host_attach import host_gateway
+    from gateway.restart import is_gateway_supervisor_process
 
     if (not math.isfinite(timeout) or timeout <= 0 or not isinstance(launch_id, str)
             or len(launch_id) != 32 or any(c not in "0123456789abcdef" for c in launch_id)):
@@ -257,6 +259,9 @@ def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
     home = Path(_canonical_home(profile_home))
     deadline = time.monotonic() + timeout
     try:
+        if _detect_supervisor() != "manual" or is_gateway_supervisor_process():
+            return GatewayDiscovery("inaccessible", reason_code="supervised_launcher",
+                detail="No-Cron requires an unmanaged launch; use an ordinary terminal or the normal managed Gateway.")
         if _update_fenced({home, get_process_hermes_home(), get_default_hermes_root()}):
             return GatewayDiscovery("draining", reason_code="update_paused")
         if (discover_gateway_endpoint(home, timeout=remaining(deadline)).state != "absent"
@@ -264,7 +269,9 @@ def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
             return GatewayDiscovery("conflict", reason_code="existing_gateway")
         code_sha = get_code_identity().get("sha")
         if not isinstance(code_sha, str) or not code_sha:
-            return GatewayDiscovery("inaccessible", reason_code="unknown_code_identity")
+            return GatewayDiscovery("inaccessible", reason_code="unknown_code_identity",
+                detail="No-Cron cannot safely start: this installation has no verifiable code SHA from an install stamp or Git provenance.")
+        child_offset = stdio_log_size(home)
         child = spawn_unmanaged_gateway(home, deadline=deadline, idle_exit=True, launch_id=launch_id)
         while True:
             status = child.poll()
@@ -279,7 +286,8 @@ def ensure_no_cron_gateway(profile_home: str | Path, launch_id: str, *,
                     return observed
                 return GatewayDiscovery("conflict", reason_code="launch_identity_mismatch")
             if status is not None:
-                return GatewayDiscovery("inaccessible", reason_code="runtime_exited")
+                return GatewayDiscovery("inaccessible", reason_code="runtime_exited",
+                                        detail=startup_failure_report(home, child_offset, status, child.pid))
             if observed.state not in {"absent", "starting"}:
                 return observed
             time.sleep(min(0.05, remaining(deadline)))

@@ -552,10 +552,8 @@ def _describe(token: dict) -> str:
 def pause_at_commit_point() -> str | None:
     """Stop this install's gateways before the first checkout move; once per run.
 
-    Never refuses the update: the pause is protection, not a gate. When it cannot complete
-    (discovery or the durable record fails, a stop fails), the gateways run through the swap and
-    the post-commit restart refreshes them, which is how POSIX updated before the pause existed.
-    Always ``None``; the caller's refusal branch stays for the contract it shares with Windows."""
+    Refuses a tree move while an invocation-bound No-Cron gateway is active. Other pause failures
+    retain the existing fallback, where gateways run through the swap and are restarted afterwards."""
     token = _RUN
     if token is None:
         return None
@@ -568,8 +566,12 @@ def _pause(token: dict) -> str | None:
     from hermes_cli import update_pause_record as pause_record
     try:
         units, jobs = _discover_systemd(), _discover_launchd()
-        units, jobs, notices = _left_running(units, jobs)
         bare, more = _discover_bare({u["pid"] for u in units} | {j["pid"] for j in jobs})
+        if any(any(arg == "--no-cron-launch-id" or arg.startswith("--no-cron-launch-id=")
+                   for arg in entry.get("argv", ())) for entry in bare):
+            return ("A one-off No-Cron chat owns a gateway. Close the chat, allow its idle exit, "
+                    "then retry the update.")
+        units, jobs, notices = _left_running(units, jobs)
     except Exception as exc:  # health: allow BLE001 -- a discovery that cannot finish stops nothing
         print(f"  ⚠ Could not list the running gateways ({exc}); they keep running and are restarted after the update")
         return None

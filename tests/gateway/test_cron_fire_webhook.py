@@ -26,6 +26,36 @@ def _make_adapter() -> APIServerAdapter:
     return APIServerAdapter(PlatformConfig(enabled=True, extra={"key": "sk-secret"}))
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handler", ["_handle_list_jobs", "_handle_create_job", "_handle_get_job",
+    "_handle_update_job", "_handle_delete_job", "_handle_pause_job", "_handle_resume_job", "_handle_run_job",
+    "_handle_cron_fire"])
+async def test_no_cron_rejects_cron_http_before_work(adapter, monkeypatch, handler):
+    adapter.gateway_runner = SimpleNamespace(_no_cron=True)
+    monkeypatch.setattr(adapter, "_check_auth", lambda request: None)
+    monkeypatch.setattr("cron.scheduler_provider.resolve_cron_scheduler", lambda: pytest.fail("resolved provider"))
+    request = SimpleNamespace(app={}, match_info={"job_id": "abc"}, headers={"Authorization": "Bearer valid"})
+    response = await getattr(adapter, handler)(request)
+    assert response.status == 503 and response.headers["Retry-After"] == "60"
+
+
+@pytest.mark.asyncio
+async def test_normal_cron_http_guard_remains_available(adapter, monkeypatch):
+    adapter.gateway_runner = SimpleNamespace(_no_cron=False)
+    monkeypatch.setattr(adapter, "_check_auth", lambda request: None)
+    monkeypatch.setattr("gateway.platforms.api_server._CRON_AVAILABLE", True)
+    request = SimpleNamespace(app={}, match_info={"job_id": "abcdef123456"})
+    assert adapter._cron_request_guard(request, need_job_id=True) == ("abcdef123456", None)
+    assert adapter._no_cron_response(request) is None
+
+
+@pytest.mark.asyncio
+async def test_no_cron_keeps_non_cron_health_route(adapter):
+    adapter.gateway_runner = SimpleNamespace(_no_cron=True)
+    response = await adapter._handle_health(SimpleNamespace())
+    assert response.status == 200
+
+
 def _create_app(adapter: APIServerAdapter) -> web.Application:
     app = web.Application(middlewares=[cors_middleware])
     app["api_server_adapter"] = adapter

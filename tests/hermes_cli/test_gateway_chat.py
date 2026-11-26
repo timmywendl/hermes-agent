@@ -4,6 +4,133 @@ import argparse
 import pytest
 
 
+def test_no_cron_never_refreshes_systemd_unit(monkeypatch):
+    from hermes_cli import gateway
+    from hermes_cli.observability import shared_metrics_process
+
+    for name in ('_guard_official_docker_root_gateway', '_attach_to_host_gateway_or_guard',
+                 '_guard_supervised_gateway_conflict', '_guard_existing_gateway_process_conflict',
+                 '_apply_startup_watchdog_config'):
+        monkeypatch.setattr(gateway, name, lambda *a, **kw: None)
+    monkeypatch.setattr(shared_metrics_process, 'begin_process', lambda *a: None)
+    for name in ('_stdin_is_tty', '_windows_console_window_attached', '_windows_gateway_breakaway_state',
+                 '_windows_gateway_should_absorb_console_controls', '_running_under_gateway_supervisor', 'is_linux'):
+        monkeypatch.setattr(gateway, name, lambda: False)
+    monkeypatch.setattr(gateway, 'supports_systemd_services', lambda: True)
+    refreshed = []
+    monkeypatch.setattr(gateway, 'refresh_systemd_unit_if_needed', lambda **kw: refreshed.append(kw))
+    class StopBeforeGateway(Exception):
+        pass
+    def stop():
+        raise StopBeforeGateway
+    monkeypatch.setattr(gateway, '_gateway_detached_env', stop)
+    with pytest.raises(StopBeforeGateway):
+        gateway.run_gateway(idle_exit=True, no_cron_launch_id='a' * 32)
+    assert refreshed == []
+    with pytest.raises(StopBeforeGateway):
+        gateway.run_gateway()
+    assert refreshed == [{'system': False}]
+
+
+def test_no_cron_routes_through_existing_chat_without_bypass_policy(monkeypatch):
+    from hermes_cli import gateway_chat, main, main_tui_launch, gateway_chat_startup
+
+    parser, _ = main._build_cli_parser()
+    args = parser.parse_args(["chat", "--no-cron", "-q", "hello"])
+    assert args.no_cron and main_tui_launch._bypass_chat_launch(args)
+    assert not gateway_chat.bypass_launch(args)
+    calls = []
+    monkeypatch.setattr(gateway_chat_startup, "launch_gateway_chat", lambda value: calls.append(value) or 0)
+    with pytest.raises(SystemExit) as exit_info:
+        main.cmd_chat(args)
+    assert exit_info.value.code == 0 and calls == [args]
+    assert not main_tui_launch._bypass_chat_launch(argparse.Namespace())
+    assert main_tui_launch._bypass_chat_launch(argparse.Namespace(safe_mode=True))
+    assert not main_tui_launch._bypass_chat_launch(argparse.Namespace(safe_mode=True, tui=True))
+
+
+def test_no_cron_fast_chat_routes_to_existing_transport(monkeypatch):
+    import sys
+    from hermes_cli import main, gateway_chat_startup
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "chat", "--no-cron", "-q", "hello"])
+    monkeypatch.setenv("HERMES_DISABLE_FAST_CHAT_LAUNCH", "0")
+    monkeypatch.setattr("hermes_cli.config.get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main, "_prepare_agent_startup", lambda args: None)
+    monkeypatch.setattr(main, "_has_any_provider_configured", lambda: pytest.fail("fell through to classic chat"))
+    calls = []
+    monkeypatch.setattr(gateway_chat_startup, "launch_gateway_chat", lambda args: calls.append(args) or 0)
+    with pytest.raises(SystemExit) as exit_info:
+        main._try_fast_chat_launch()
+    assert exit_info.value.code == 0 and len(calls) == 1 and calls[0].no_cron
+
+
+def test_no_cron_tui_refuses_before_gateway(monkeypatch, capsys):
+    from hermes_cli import gateway_chat, main, main_tui_launch
+
+    parser, _ = main._build_cli_parser()
+    args = parser.parse_args(["chat", "--no-cron", "--tui"])
+    assert main_tui_launch._bypass_chat_launch(args)
+    monkeypatch.setattr(gateway_chat, "connect_gateway", lambda *a, **kw: pytest.fail("gateway contacted"))
+    monkeypatch.setattr(main, "_confirm_startup_expensive_model_override", lambda args: None)
+    with pytest.raises(SystemExit) as exit_info:
+        main.cmd_chat(args)
+    assert exit_info.value.code == 2
+    assert "--no-cron cannot be combined with --tui" in capsys.readouterr().err
+
+
+def test_no_cron_keeps_config_provider_and_consent_checks(monkeypatch):
+    from hermes_cli import gateway_chat, main, gateway_chat_startup
+    from hermes_cli.observability import shared_metrics_consent
+
+    seen = []
+    monkeypatch.setattr(main, "_guard_noninteractive_user_config", lambda args: seen.append("config"))
+    monkeypatch.setattr(main, "_has_any_provider_configured", lambda: seen.append("provider") or True)
+    monkeypatch.setattr(shared_metrics_consent, "offer_consent_before_chat", lambda args: seen.append("consent"))
+    monkeypatch.setattr(gateway_chat, "_register_terminal_process", lambda: None)
+    monkeypatch.setattr(gateway_chat_startup, "ensure_launch_provider", lambda args: seen.append("provider-check") or False)
+    assert gateway_chat.launch_from_args(argparse.Namespace(no_cron=True)) == 0
+    assert seen == ["config", "provider", "consent", "provider-check"]
+
+
+def test_no_cron_ticket_requires_ready_exact_launch_epoch_and_code(tmp_path):
+    from gateway.control_socket import GatewayControlServer
+    from gateway.runtime_bootstrap import TicketStore
+
+    server = GatewayControlServer(tmp_path)
+    server.ticket_store = TicketStore("instance", frozenset({str(tmp_path)}))
+    server.no_cron_required = True
+    server.runtime_descriptor = {"state": "starting", "capabilities": []}
+    params = {"profile_id": str(tmp_path), "instance_id": "instance", "purpose": "interactive"}
+    request = {"protocol": 1, "params": params}
+    with pytest.raises(PermissionError):
+        server._session_ticket(request, "uid:test")
+    binding = {"launch_id": "a" * 32, "authority_epoch": 4, "code_sha": "abc"}
+    server.runtime_descriptor = {"state": "ready", "capabilities": ["no-cron-v1"], **binding}
+    with pytest.raises(PermissionError):
+        server._session_ticket(request, "uid:test")
+    for key in binding:
+        wrong = dict(binding, **{key: "wrong"})
+        with pytest.raises(PermissionError):
+            server._session_ticket({"protocol": 1, "params": {**params, **wrong}}, "uid:test")
+    grant = server._session_ticket({"protocol": 1, "params": {**params, **binding}}, "uid:test")
+    assert all(grant[key] == value for key, value in binding.items())
+    assert grant["profile_id"] == str(tmp_path) and grant["instance_id"] == "instance"
+    for key in ("profile_id", "instance_id"):
+        with pytest.raises(PermissionError):
+            server._session_ticket({"protocol": 1, "params": {**params, **binding, key: "other"}}, "uid:test")
+
+
+@pytest.mark.asyncio
+async def test_no_cron_refuses_explicit_remote_before_connect(monkeypatch):
+    from hermes_cli.gateway_client import GatewayClientError, connect_gateway
+
+    monkeypatch.setenv("HERMES_TUI_GATEWAY_URL", "wss://invalid.example/ws")
+    with pytest.raises(GatewayClientError, match="existing or remote"):
+        async with connect_gateway(no_cron=True):
+            pytest.fail("connected")
+
+
 def test_unsupported_launch_options_fail_before_connection(monkeypatch, capsys):
     from hermes_cli import gateway_chat
     calls = []

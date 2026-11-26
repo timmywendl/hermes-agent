@@ -222,7 +222,7 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
     return shutdown_signal_handler
 
 
-def _start_gateway_claim_pid_file(force: bool = False) -> bool:
+def _start_gateway_claim_pid_file(force: bool = False, *, strict_no_cron: bool = False) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
     from gateway.run import (_claim_host_gateway_role, logger, os)
     import atexit
@@ -247,7 +247,10 @@ def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     atexit.register(release_gateway_runtime_lock)
     from hermes_cli.gateway_multiplex_mode import publish_pending_multiplex_decision
     publish_pending_multiplex_decision()
-    _claim_host_gateway_role(force=force)
+    if strict_no_cron:
+        _claim_host_gateway_role(force=force, strict_no_cron=True)
+    else:
+        _claim_host_gateway_role(force=force)
     return True
 
 
@@ -275,7 +278,7 @@ async def _start_gateway_start_control_socket(runner):
             payload = build_identify_payload()
             payload.update({key: descriptor[key] for key in (
                 "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
+                "served_profiles", "parked_profiles", "capabilities", "launch_id", "code_sha") if key in descriptor})
             if getattr(runner, '_draining', False):
                 payload.update(state='draining', capabilities=[])
             if payload.get('state') == 'draining' and descriptor.get('drain_reason'):
@@ -297,6 +300,9 @@ async def _start_gateway_start_control_socket(runner):
                 _drain = float(_get_restart_drain_timeout())
             except Exception:
                 _drain = 30.0
+            if getattr(runner, '_no_cron', False) is True:
+                stopping = getattr(runner, '_draining', False) is True or getattr(runner, '_stop_task', None) is not None
+                return {"pausing": False, "already_stopping": stopping, "pid": os.getpid(), "drain_timeout": _drain}
             accepted_box: list[bool] = []
             _done = threading.Event()
 
@@ -339,6 +345,8 @@ async def _start_gateway_start_control_socket(runner):
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
                            "reload-plugins": reload_plugins_verb(runner, _main_loop)})
         _control_server.ticket_store = runner.session_ticket_store
+        _control_server.runtime_descriptor = descriptor
+        _control_server.no_cron_required = getattr(runner, "_no_cron", False) is True
         if not await _control_server.start():
             _control_server = None
         else:
@@ -356,6 +364,16 @@ def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
     from gateway.run import (Dict, Platform, _cron_profile_gate, _cron_tick_profile_homes, _start_gateway_housekeeping, asyncio, logger, threading)
+    if getattr(runner, "_no_cron", False) is True:
+        from gateway.runtime_ownership import process_ownership
+        cron_stop = threading.Event()
+        housekeeping_thread = threading.Thread(
+            target=_start_gateway_housekeeping, args=(cron_stop,),
+            kwargs={"adapters": runner.adapters, "loop": asyncio.get_running_loop(),
+                    "runner": runner, "cron_enabled": False},
+            daemon=True, name="gateway-housekeeping")
+        process_ownership.start_writer(housekeeping_thread)
+        return cron_stop, None, None, housekeeping_thread
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
@@ -460,11 +478,12 @@ async def _start_gateway_shutdown_tail(
     # message was silently dropped (#58818). Awaiting keeps the loop alive so the in-flight delivery
     # finishes before we tear down.
     cron_stop.set()
-    _stop_cron_provider(cron_provider)
-    if not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
+    if cron_provider is not None:
+        _stop_cron_provider(cron_provider)
+    if cron_thread is not None and not await _await_thread_exit(cron_thread, timeout=_CRON_SHUTDOWN_DRAIN_TIMEOUT):
         logger.warning("Cron ticker did not exit within %.0fs of shutdown — an in-flight "
                        "delivery may have been dropped.", _CRON_SHUTDOWN_DRAIN_TIMEOUT)
-    await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
+    housekeeping_exited = await _await_thread_exit(housekeeping_thread, timeout=_HOUSEKEEPING_SHUTDOWN_DRAIN_TIMEOUT)
 
     # Stop the planned-stop watcher (daemon=True so this is belt-and-suspenders).
     _planned_stop_watcher_stop.set()
@@ -479,7 +498,8 @@ async def _start_gateway_shutdown_tail(
 
     # The failure verdict comes AFTER the cooperative teardown: returning early here leaked the
     # cron ticker + housekeeping threads (and open MCP connections) for embedded callers (#12175).
-    return _resolve_gateway_exit_verdict(runner, _signal_initiated_shutdown[0])
+    return (housekeeping_exited or getattr(runner, "_no_cron", False) is not True) and _resolve_gateway_exit_verdict(
+        runner, _signal_initiated_shutdown[0])
 
 
 
@@ -644,8 +664,53 @@ def _start_gateway_early_environment_probe() -> None:
         logger.debug("early environment probe did not start", exc_info=True)
 
 
+def _valid_no_cron_launch(launch_id, *, idle_exit, replace, force):
+    from gateway.control_socket import _detect_supervisor
+    from gateway.restart import is_gateway_supervisor_process
+    return (isinstance(launch_id, str) and len(launch_id) == 32
+            and all(c in "0123456789abcdef" for c in launch_id)
+            and idle_exit and not replace and not force
+            and _detect_supervisor() == "manual" and not is_gateway_supervisor_process())
+
+
+def _no_cron_profiles_match(runner):
+    from gateway.run_runtime import reserved_profile_homes
+    from hermes_constants import get_hermes_home
+    homes = reserved_profile_homes(runner)
+    served = runner.session_runtime_descriptor.get("served_profiles", [])
+    if len(homes) != 1 or homes[0][1] != get_hermes_home().resolve() or len(served) != 1:
+        return False
+    identity = served[0]
+    return (isinstance(identity, dict) and all(isinstance(identity.get(k), str) and identity[k]
+            and Path(identity[k]).resolve() == homes[0][1] for k in ("home", "profile_id")))
+
+
+def _no_cron_can_start(config):
+    from gateway.host_attach import host_gateway
+    return getattr(config, "multiplex_profiles", None) is False and host_gateway(wait_for_channel=0.01) is None
+
+
+def _start_gateway_publish_ready(runner, *, idle_exit, no_cron):
+    from gateway.run_runtime import publish_gateway_runtime_ready
+    if no_cron:
+        from gateway.run_idle_exit import arm_unmanaged_idle_exit
+        if not arm_unmanaged_idle_exit(runner):
+            raise RuntimeError("no-cron gateway requires an active idle-exit watcher; "
+                               "gateway.unmanaged_idle_exit_seconds must be positive and finite")
+    publish_gateway_runtime_ready(runner)
+    if not no_cron:
+        runner._start_systemd_watchdog()
+    if idle_exit and not no_cron:
+        from gateway.run_idle_exit import arm_unmanaged_idle_exit
+        arm_unmanaged_idle_exit(runner)
+    elif not idle_exit:
+        from gateway.run_api import warm_gateway_dashboard
+        warm_gateway_dashboard(runner)
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        no_cron_launch_id: str | None = None) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
@@ -667,6 +732,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         os,
         threading,
     )
+    no_cron = no_cron_launch_id is not None
+    if no_cron and not _valid_no_cron_launch(no_cron_launch_id, idle_exit=idle_exit, replace=replace, force=force):
+        logger.error("Invalid no-cron gateway launch")
+        return False
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
     _start_gateway_resolve_terminal_cwd()
@@ -681,6 +750,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Config verdicts come before the duplicate-instance guard: `--replace` must not stop a healthy
     # gateway for a launch that cannot start.
     resolved_config = config if config is not None else load_gateway_config_for_runner()
+    if no_cron and not _no_cron_can_start(resolved_config):
+        logger.error("No-cron gateway requires a single profile and no existing host gateway")
+        return False
     # The first turn's prompt needs the host toolchain probe (five subprocess calls); start it now
     # so it runs beside the boot imports instead of serially inside the pre-READY warm-up.
     _start_gateway_early_environment_probe()
@@ -693,7 +765,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
-    _host_decision = await _host_attach_or_none(replace, force)
+    _host_decision = None if no_cron else await _host_attach_or_none(replace, force)
     if _host_decision is not None:
         return _host_decision
 
@@ -714,7 +786,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Only --force skips the host-lock refusal. Every generated unit carries --replace, so reading it as
     # --force there disabled the one arbiter of the two-units-at-once race; a replace that took the
     # owner over already freed the lock with that process.
-    if not _start_gateway_claim_pid_file(force=force):
+    claim_options = {"strict_no_cron": True} if no_cron else {}
+    if not _start_gateway_claim_pid_file(force=force, **claim_options):
         release_gateway_runtime_lock()
         return False
 
@@ -728,8 +801,13 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
 
         runner = GatewayRunner(resolved_config)
+        if no_cron:
+            runner._no_cron = True
+            runner._no_cron_launch_id = no_cron_launch_id
         from gateway.run_runtime import initialize_gateway_runtime
         await initialize_gateway_runtime(runner)
+        if no_cron and not await asyncio.to_thread(_no_cron_profiles_match, runner):
+            raise RuntimeError("no-cron profile reservation mismatch")
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
         # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
         # See #82936.
@@ -812,20 +890,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
             _start_gateway_start_cron_and_housekeeping(runner))
         # From here every exit (a READY publication that raises included) runs the shutdown tail,
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
-        from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
+        from gateway.run_runtime import wait_gateway_runtime
         try:
-            # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
-            publish_gateway_runtime_ready(runner)
-            runner._start_systemd_watchdog()
-            if idle_exit:
-                from gateway.run_idle_exit import arm_unmanaged_idle_exit
-                arm_unmanaged_idle_exit(runner)
-            else:
-                # A supervised/explicit gateway serves Desktop and the dashboard SPA, which call the
-                # dashboard routes right away: mount them now, after READY. A client's own idle-exit
-                # gateway (chat -q, TUI) only uses the native WebSocket; it mounts on first request.
-                from gateway.run_api import warm_gateway_dashboard
-                warm_gateway_dashboard(runner)
+            _start_gateway_publish_ready(runner, idle_exit=idle_exit, no_cron=no_cron)
             await wait_gateway_runtime(runner)
         finally:
             try:

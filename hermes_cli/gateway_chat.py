@@ -151,7 +151,8 @@ async def run_gateway_chat(args, emitter=None):
     # Finite: answer one prompt and exit (-z, --oneshot, -Q, stream-json, or -q off a TTY).
     oneshot = bool(oneshot_prompt or getattr(args, "oneshot_exit", False) or quiet or
                    (query and not (sys.stdin.isatty() and sys.stdout.isatty())))
-    async with connect_gateway() as client:
+    connection = connect_gateway(no_cron=True) if getattr(args, "no_cron", False) else connect_gateway()
+    async with connection as client:
         description = await client.rpc("runtime.describe")
         title = continue_title(args)
         create_if_missing = bool(title and getattr(args, "create_if_missing", False))
@@ -310,6 +311,9 @@ def _register_terminal_process() -> None:
 
 def launch_from_args(args) -> int:
     from websockets.exceptions import WebSocketException
+    if getattr(args, "no_cron", False) and (getattr(args, "tui", False) or getattr(args, "tui_native", False)):
+        print("Error: --no-cron cannot be combined with --tui", file=sys.stderr)
+        return 2
     emitter = None
     if getattr(args, "output_format", "text") == "stream-json":
         # Built before validation/connection so any failed start still closes the protocol
@@ -325,6 +329,12 @@ def launch_from_args(args) -> int:
 
     try:
         validate_options(args)
+        if getattr(args, "no_cron", False) and not bypass_launch(args):
+            from hermes_cli.main import _guard_noninteractive_user_config, _has_any_provider_configured
+            from hermes_cli.observability.shared_metrics_consent import offer_consent_before_chat
+            _guard_noninteractive_user_config(args)
+            if _has_any_provider_configured():
+                offer_consent_before_chat(args)
         if getattr(args, "list_tools", False) or getattr(args, "list_toolsets", False):
             # A catalog listing needs no session and no gateway (main printed it and exited).
             from hermes_cli.gateway_chat_listing import print_tool_listing

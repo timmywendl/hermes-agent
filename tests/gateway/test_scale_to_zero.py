@@ -21,6 +21,31 @@ from gateway.scale_to_zero import (
 )
 
 
+def test_no_cron_scale_to_zero_keeps_noncron_work_and_skips_scheduler(monkeypatch):
+    import time
+    from gateway.run_shutdown import GatewayShutdownMixin
+    from gateway import scale_to_zero
+
+    runner = object.__new__(GatewayShutdownMixin)
+    runner._no_cron = True
+    runner._last_inbound_at = time.time() - 600
+    runner._running_agent_count = lambda: 0
+    runner._api_server_hook = lambda name: 0
+    runner._scale_to_zero_idle_timeout_seconds = lambda: 60
+    runner._scale_to_zero_has_live_background_work = lambda: False
+    monkeypatch.setattr(scale_to_zero, "dashboard_client_last_seen", lambda: None)
+    monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: pytest.fail("cron was queried"))
+    assert runner._running_cron_job_count() == 0
+    assert runner._restart_wait_cron_counts() == {"awaitable": 0, "wedged": 0, "restart_safe": 0}
+    assert runner.request_restart(detached=True) is False
+    assert runner._scale_to_zero_is_idle()
+    runner._running_agent_count = lambda: 1
+    assert not runner._scale_to_zero_is_idle()
+    runner._running_agent_count = lambda: 0
+    runner._scale_to_zero_has_live_background_work = lambda: True
+    assert not runner._scale_to_zero_is_idle()
+
+
 # ── scale_to_zero_enabled (the Labs HERMES_SCALE_TO_ZERO stamp, D11/Q8=A) ────
 
 

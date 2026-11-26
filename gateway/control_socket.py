@@ -181,6 +181,8 @@ class GatewayControlServer:
         # symlinked component, so an unresolved symlinked ~/.hermes would never mint tickets.
         self._home = Path(home).resolve()
         self.ticket_store = None
+        self.runtime_descriptor = None
+        self.no_cron_required = False
         self.private_handlers = {}
         self._server: Optional[asyncio.AbstractServer] = None
         self._pipe_server: Any = None  # Windows proactor pipe server
@@ -330,15 +332,27 @@ class GatewayControlServer:
             raise PermissionError("invalid bootstrap envelope")
         params = request.get("params")
         if (not isinstance(params, dict) or not {"profile_id", "instance_id", "purpose"} <= set(params)
-                or set(params) - {"profile_id", "instance_id", "purpose", "scope"}):
+                or set(params) - {"profile_id", "instance_id", "purpose", "scope",
+                                  "launch_id", "authority_epoch", "code_sha"}):
             raise PermissionError("invalid bootstrap parameters")
+        descriptor = self.runtime_descriptor or {}
+        binding_keys = {"launch_id", "authority_epoch", "code_sha"}
+        binding = {}
+        if self.no_cron_required:
+            binding = {key: descriptor.get(key) for key in binding_keys}
+            if (descriptor.get("state") != "ready" or "no-cron-v1" not in descriptor.get("capabilities", [])
+                    or any(value is None for value in binding.values())
+                    or any(params.get(key) != value for key, value in binding.items())):
+                raise PermissionError("no-cron runtime identity mismatch")
+        elif binding_keys & params.keys():
+            raise PermissionError("unexpected no-cron runtime identity")
         if params["instance_id"] != self.ticket_store.instance_id:
             raise PermissionError("stale runtime instance")
         ticket = self.ticket_store.mint(profile_id=params["profile_id"], subject=peer_subject,
                                        purpose=params["purpose"], scope=params.get("scope", "profile"))
         return {"ticket": ticket, "expires_in_seconds": 30,
                 "instance_id": self.ticket_store.instance_id,
-                "profile_id": params["profile_id"], "runtime_protocol": 1}
+                "profile_id": params["profile_id"], "runtime_protocol": 1, **binding}
 
     def _posix_peer_subject(self, writer) -> Optional[str]:
         # The legacy diagnostic channel may operate without bootstrap-safe metadata.

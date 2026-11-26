@@ -10,6 +10,151 @@ import time
 
 import pytest
 
+
+def test_no_cron_start_binds_only_own_launch_and_refuses_racer(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    launch = "a" * 32
+    endpoint = runtime.GatewayEndpoint(str(tmp_path), "instance", 1, 1, "http://127.0.0.1:1234",
+                                       "none", frozenset({"session-authority-v1", "no-cron-v1"}),
+                                       code_sha="abc", launch_id=launch, launch_supervisor="manual")
+    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
+    monkeypatch.setattr(runtime, "_multiplexer_starting", lambda home: False)
+    monkeypatch.setattr("gateway.control_socket._detect_supervisor", lambda: "manual")
+    monkeypatch.setattr("gateway.restart.is_gateway_supervisor_process", lambda: False)
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: None)
+    monkeypatch.setattr(version_info, "get_code_identity", lambda: {"sha": "abc"})
+    spawned = []
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *args, **kwargs:
+                        spawned.append(kwargs) or SimpleNamespace(poll=lambda: None))
+
+    def attempt(candidate):
+        observations = iter([runtime.GatewayDiscovery("absent"), runtime.GatewayDiscovery("ready", candidate)])
+        monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: next(observations))
+        return runtime.ensure_no_cron_gateway(tmp_path, launch)
+
+    assert attempt(endpoint).endpoint == endpoint
+    from dataclasses import replace
+    assert attempt(replace(endpoint, launch_id="b" * 32)).reason_code == "launch_identity_mismatch"
+    assert attempt(replace(endpoint, code_sha="other")).reason_code == "launch_identity_mismatch"
+    assert attempt(replace(endpoint, launch_supervisor="desktop")).reason_code == "launch_identity_mismatch"
+    assert len(spawned) == 4 and all(s["idle_exit"] and s["launch_id"] == launch for s in spawned)
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: runtime.GatewayDiscovery("starting"))
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "existing_gateway"
+    assert len(spawned) == 4
+
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: runtime.GatewayDiscovery("absent"))
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: object())
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "existing_gateway"
+    assert len(spawned) == 4
+
+    monkeypatch.setattr("gateway.host_attach.host_gateway", lambda **kwargs: None)
+    observations = iter([runtime.GatewayDiscovery("absent"), runtime.GatewayDiscovery("ready", endpoint)])
+    monkeypatch.setattr(runtime, "discover_gateway_endpoint", lambda *a, **kw: next(observations))
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *args, **kwargs: SimpleNamespace(poll=lambda: 1))
+    assert runtime.ensure_no_cron_gateway(tmp_path, launch).reason_code == "launch_identity_mismatch"
+
+
+def test_no_cron_supervised_launcher_refuses_before_discovery_or_spawn(tmp_path, monkeypatch):
+    from gateway import control_socket, restart
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start
+
+    for marker in ('INVOCATION_ID', 'HERMES_DESKTOP_MANAGED', 'HERMES_S6_SUPERVISED_CHILD',
+                   'HERMES_GATEWAY_EXTERNAL_SUPERVISOR', 'HERMES_LAUNCHD_LABEL', 'LAUNCHD_SOCKET'):
+        monkeypatch.delenv(marker, raising=False)
+    monkeypatch.setenv('XPC_SERVICE_NAME', '0')
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: pytest.fail('discovered'))
+    monkeypatch.setattr(start, 'spawn_unmanaged_gateway', lambda *a, **kw: pytest.fail('spawned'))
+    for marker in ('INVOCATION_ID', 'HERMES_DESKTOP_MANAGED', 'HERMES_S6_SUPERVISED_CHILD',
+                   'HERMES_GATEWAY_EXTERNAL_SUPERVISOR', 'HERMES_LAUNCHD_LABEL'):
+        with monkeypatch.context() as scoped:
+            marker_value = 'ai.hermes.gateway' if marker == 'HERMES_LAUNCHD_LABEL' else '1'
+            scoped.setenv(marker, marker_value)
+            assert control_socket._detect_supervisor() != 'manual' or restart.is_gateway_supervisor_process()
+            result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+            assert result.reason_code == 'supervised_launcher' and 'unmanaged' in result.detail
+            assert os.environ[marker] == marker_value
+
+
+def test_no_cron_unknown_sha_refuses_without_spawn(tmp_path, monkeypatch):
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    monkeypatch.setattr('gateway.control_socket._detect_supervisor', lambda: 'manual')
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    monkeypatch.setattr('gateway.host_attach.host_gateway', lambda **kw: None)
+    monkeypatch.setattr(runtime, '_update_fenced', lambda homes: False)
+    monkeypatch.setattr(runtime, '_multiplexer_starting', lambda home: False)
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: runtime.GatewayDiscovery('absent'))
+    monkeypatch.setattr(version_info, 'get_code_identity', lambda: {'sha': None})
+    monkeypatch.setattr(start, 'spawn_unmanaged_gateway', lambda *a, **kw: pytest.fail('spawned'))
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result.reason_code == 'unknown_code_identity' and 'no verifiable code SHA' in result.detail
+
+
+def test_no_cron_control_timeout_before_and_after_spawn_is_fail_closed(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    monkeypatch.setattr('gateway.control_socket._detect_supervisor', lambda: 'manual')
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    monkeypatch.setattr('gateway.host_attach.host_gateway', lambda **kw: None)
+    monkeypatch.setattr(runtime, '_update_fenced', lambda homes: False)
+    monkeypatch.setattr(runtime, '_multiplexer_starting', lambda home: False)
+    monkeypatch.setattr(version_info, 'get_code_identity', lambda: {'sha': 'abc'})
+    calls = []
+    monkeypatch.setattr(start, 'spawn_unmanaged_gateway', lambda *a, **kw:
+                        calls.append(kw) or SimpleNamespace(poll=lambda: None))
+    timeout = runtime.GatewayDiscovery('inaccessible', reason_code='control_timeout')
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: timeout)
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result is timeout and result.endpoint is None and not calls
+
+    observations = iter([runtime.GatewayDiscovery('absent'), timeout])
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: next(observations))
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result is timeout and result.endpoint is None and len(calls) == 1
+
+
+def test_no_cron_child_exit_reports_redacted_startup_detail(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start, version_info
+
+    monkeypatch.setattr('gateway.control_socket._detect_supervisor', lambda: 'manual')
+    monkeypatch.setattr('gateway.restart.is_gateway_supervisor_process', lambda: False)
+    monkeypatch.setattr('gateway.host_attach.host_gateway', lambda **kw: None)
+    monkeypatch.setattr(runtime, '_update_fenced', lambda homes: False)
+    monkeypatch.setattr(runtime, '_multiplexer_starting', lambda home: False)
+    monkeypatch.setattr(runtime, 'discover_gateway_endpoint', lambda *a, **kw: runtime.GatewayDiscovery('absent'))
+    monkeypatch.setattr(version_info, 'get_code_identity', lambda: {'sha': 'abc'})
+    path = start.stdio_log_path(tmp_path)
+    path.parent.mkdir(parents=True)
+    path.write_text('old diagnostic\n')
+    secret = 'sk-proj-abc123def456ghi789jkl012'
+    def spawn(*args, **kwargs):
+        with path.open('a') as output:
+            output.write('new startup failure OPENAI_API_KEY=' + secret + '\n')
+        return SimpleNamespace(pid=42, poll=lambda: 7)
+    monkeypatch.setattr(start, 'spawn_unmanaged_gateway', spawn)
+    result = runtime.ensure_no_cron_gateway(tmp_path, 'a' * 32)
+    assert result.reason_code == 'runtime_exited' and 'new startup failure' in result.detail
+    assert secret not in result.detail and 'old diagnostic' not in result.detail and 'status 7' in result.detail
+
+
+def test_normal_ensure_refuses_no_cron_owner(tmp_path, monkeypatch):
+    from hermes_cli import gateway_runtime as runtime, gateway_runtime_start as start
+
+    endpoint = runtime.GatewayEndpoint(str(tmp_path), "instance", 1, 1, "http://127.0.0.1:1234",
+                                       "none", frozenset({"session-authority-v1", "no-cron-v1"}),
+                                       launch_id="a" * 32, launch_supervisor="manual")
+    monkeypatch.setattr(runtime, "_update_fenced", lambda homes: False)
+    monkeypatch.setattr(runtime, "_observe_replacing_stale",
+                        lambda *args: runtime.GatewayDiscovery("ready", endpoint))
+    monkeypatch.setattr(start, "spawn_unmanaged_gateway", lambda *a, **kw: pytest.fail("spawned"))
+    result = runtime.ensure_gateway_runtime(tmp_path)
+    assert result.state == "incompatible" and result.reason_code == "no_cron_gateway"
+    assert result.endpoint is None and all(word in result.detail for word in ("Close", "idle exit", "retry"))
+
 def test_unmanaged_runtime_drops_session_config_bypass_flags(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from hermes_cli import gateway_runtime_start as start

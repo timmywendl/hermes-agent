@@ -37,6 +37,8 @@ def _gateway_unavailable(home) -> str | None:
         return None  # explicit remote gateway: connect_gateway never spawns for it
     observed = discover_gateway_endpoint(home, timeout=_HEADLESS_PROBE_TIMEOUT_S)
     if observed.state == "ready":
+        if observed.endpoint is not None and "no-cron-v1" in observed.endpoint.capabilities:
+            return "the gateway is in no-cron mode; agent jobs will run on the next eligible tick"
         return None
     if observed.state == "absent":
         return GATEWAY_DOWN_HINT

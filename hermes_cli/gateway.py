@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the no-cron launch guard remains alongside the existing gateway command
 """Gateway subcommand for hermes CLI.
 
 Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
@@ -4545,13 +4546,16 @@ def _respawn_storm_backoff() -> None:
 
 
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
-                idle_exit: bool = False):
+                idle_exit: bool = False, no_cron_launch_id: str | None = None):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
     (``gateway.unmanaged_idle_exit_seconds``)."""
     _guard_official_docker_root_gateway()
-    _attach_to_host_gateway_or_guard(force=force, replace=replace)
+    if no_cron_launch_id is None:
+        _attach_to_host_gateway_or_guard(force=force, replace=replace)
+    elif not idle_exit or replace or force or _running_under_gateway_supervisor():
+        raise SystemExit("No-cron launch requires an unmanaged idle-exit gateway")
     _guard_supervised_gateway_conflict(force=force)
     _guard_existing_gateway_process_conflict(replace=replace)
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -4575,7 +4579,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Refresh the systemd unit on every boot so restart settings stay current even after an
     # exit-code-75 respawn (stale-code or /restart), which bypasses `hermes gateway restart`.
-    if supports_systemd_services():
+    if no_cron_launch_id is None and supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:
@@ -4616,8 +4620,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
+        launch_options = {"no_cron_launch_id": no_cron_launch_id} if no_cron_launch_id is not None else {}
         success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit))
+                                            idle_exit=idle_exit, **launch_options))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -5037,14 +5042,17 @@ def _print_runtime_health() -> None:
 
 
 def _cmd_run(args):
-    if _maybe_redirect_run_to_s6_supervision(args):
+    launch_id = getattr(args, "no_cron_launch_id", None)
+    if launch_id is None and _maybe_redirect_run_to_s6_supervision(args):
         return  # unreachable; execvp doesn't return
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
+    launch_options = {"no_cron_launch_id": launch_id} if launch_id is not None else {}
     run_gateway(
         getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
         replace=getattr(args, "replace", False), force=getattr(args, "force", False),
         idle_exit=getattr(args, "idle_exit", False),
+        **launch_options,
     )
 
 

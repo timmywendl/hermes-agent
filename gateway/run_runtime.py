@@ -306,6 +306,8 @@ async def serve_profile_runtime(runner, name, home):
     """Hot-serve one reserved profile's runtime: build its authority, recover its durable state and
     publish it in the descriptor/ticket store — the steps boot performs per secondary. Raises when
     the profile's store is unusable; the caller parks it (and releases the reservation)."""
+    if getattr(runner, '_no_cron', False) is True:
+        raise RuntimeError('no-cron gateway cannot hot-serve profiles')
     from gateway.session_authorities import owner_scope
     from gateway.session_bot import recover_bot_deliveries
     from gateway.session_hosted_service import _ensure_hosted_service, start_ready_hosted_services
@@ -415,8 +417,18 @@ def publish_gateway_runtime_ready(runner):
     descriptor = runner.session_runtime_descriptor
     if runner.session_api.task.done() or not runner._running or runner._draining:
         raise RuntimeError('gateway stopped before session API readiness')
-    descriptor.update(state='ready', capabilities=[
-        'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
+    if getattr(runner, '_no_cron', False) is True:
+        from hermes_cli.version_info import get_code_identity
+        code_sha = get_code_identity().get('sha')
+        launch_id = getattr(runner, '_no_cron_launch_id', None)
+        if (not isinstance(code_sha, str) or not code_sha or not isinstance(launch_id, str)
+                or len(descriptor.get('served_profiles', [])) != 1):
+            raise RuntimeError('no-cron gateway identity unavailable')
+        descriptor.update(launch_id=launch_id, code_sha=code_sha)
+    capabilities = ['session-authority-v1', 'durable-admission-v1', 'event-replay-v1']
+    if getattr(runner, '_no_cron', False) is True:
+        capabilities.append('no-cron-v1')
+    descriptor.update(state='ready', capabilities=capabilities)
     from gateway.session_hosted_service import start_ready_hosted_services
     start_ready_hosted_services(runner)
 

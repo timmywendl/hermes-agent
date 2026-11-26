@@ -45,6 +45,42 @@ def _runner(tmp_path, monkeypatch, *, window=0.2):
     return runner, home, db, stops
 
 
+def test_no_cron_idle_skips_cron_but_preserves_pending_admissions(tmp_path, monkeypatch):
+    runner, _home, db, _stops = _runner(tmp_path, monkeypatch)
+    runner._no_cron = True
+    monkeypatch.setattr(run_idle_exit, "_cron_busy", lambda homes: pytest.fail("cron was consulted"))
+    monkeypatch.setattr("gateway.run._cron_tick_profile_homes", lambda config: pytest.fail("cron homes consulted"))
+    try:
+        assert run_idle_exit.busy_reason(runner, window=0.2) is None
+        db.create_session("s", source="cli")
+        epoch = begin_runtime_epoch(db, instance_id="owner")
+        admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
+                            payload={"text": "pending"})
+        assert "admissions pending" in run_idle_exit.busy_reason(runner, window=0.2)
+    finally:
+        db.close()
+
+
+def test_no_cron_rejects_disabled_idle_exit(monkeypatch):
+    from gateway import run_bootstrap, run_runtime
+
+    runner = SimpleNamespace(_no_cron=True)
+    monkeypatch.setattr(run_runtime, "publish_gateway_runtime_ready", lambda runner: pytest.fail("published READY"))
+    for window in (0, float("inf"), float("nan")):
+        monkeypatch.setattr(run_idle_exit, "idle_exit_seconds", lambda runner, value=window: value)
+        assert not run_idle_exit.arm_unmanaged_idle_exit(runner)
+        with pytest.raises(RuntimeError, match=r"gateway\.unmanaged_idle_exit_seconds.*positive and finite"):
+            run_bootstrap._start_gateway_publish_ready(runner, idle_exit=True, no_cron=True)
+
+
+def test_no_cron_freezes_positive_idle_exit_window(monkeypatch):
+    runner = SimpleNamespace(_no_cron=True, _spawn_supervised=lambda *args: None)
+    monkeypatch.setattr(run_idle_exit, "idle_exit_seconds", lambda runner: 12)
+    monkeypatch.setattr("gateway.control_socket._detect_supervisor", lambda: "manual")
+    assert run_idle_exit.arm_unmanaged_idle_exit(runner)
+    assert runner._no_cron_idle_exit_seconds == 12
+
+
 @pytest.mark.asyncio
 async def test_idle_auto_started_gateway_exits_and_publishes_why(tmp_path, monkeypatch):
     runner, _home, db, stops = _runner(tmp_path, monkeypatch)

@@ -11,6 +11,22 @@ from gateway.control_socket import _home_hash
 from hermes_cli.gateway_runtime_discovery import DiscoveryError, home_mode_unsafe, query_identify
 
 
+def test_no_cron_discovery_requires_manual_single_profile_and_launch_identity(tmp_path):
+    from hermes_cli.gateway_runtime import _endpoint
+
+    home = tmp_path.resolve()
+    payload = {"runtime_protocol": 1, "state": "ready", "instance_id": "instance",
+               "authority_epoch": 1, "served_profiles": [{"profile_id": str(home), "home": str(home)}],
+               "capabilities": ["session-authority-v1", "no-cron-v1"], "launch_id": "a" * 32,
+               "api_origin": "http://127.0.0.1:1234", "supervisor": "none", "launch_supervisor": "manual"}
+    assert _endpoint(payload, home).endpoint.launch_id == "a" * 32
+    for override in ({"launch_supervisor": "desktop"}, {"launch_id": "bad"},
+                     {"supervisor": "launchd"},
+                     {"served_profiles": [{"profile_id": "/other", "home": str(home)}]}):
+        assert _endpoint({**payload, **override}, home).reason_code == "invalid_no_cron_identity"
+    assert _endpoint(payload, home, control_home=tmp_path / "host").reason_code == "invalid_no_cron_identity"
+
+
 @pytest.mark.platforms("linux")
 def test_fallback_pointer_uses_owner_location_and_keeps_identity_checks(tmp_path):
     home = tmp_path / 'profile'

@@ -86,10 +86,11 @@ def _messaging_busy(runner) -> str | None:
 
 
 def _served_homes(runner) -> list[Path]:
-    from gateway.run import _cron_tick_profile_homes
     from gateway.session_authorities import all_authorities
     homes = {Path(a.profile_id) for a in all_authorities(runner)}
-    homes.update(Path(h) for _name, h in _cron_tick_profile_homes(runner.config))
+    if getattr(runner, "_no_cron", False) is not True:
+        from gateway.run import _cron_tick_profile_homes
+        homes.update(Path(h) for _name, h in _cron_tick_profile_homes(runner.config))
     return sorted(homes)
 
 
@@ -168,7 +169,8 @@ def busy_reason(runner, *, window: float) -> str | None:
         if runner._scale_to_zero_has_live_background_work():
             return "background work in flight"
         homes = _served_homes(runner)
-        return (_messaging_busy(runner) or _ledger_busy(runner) or _cron_busy(homes) or _kanban_busy()
+        return (_messaging_busy(runner) or _ledger_busy(runner)
+                or (None if getattr(runner, "_no_cron", False) is True else _cron_busy(homes)) or _kanban_busy()
                 or _store_gates_busy(homes))
     except Exception as exc:
         logger.debug("idle-exit probe failed; staying up", exc_info=True)
@@ -185,7 +187,8 @@ def _begin_idle_exit(runner, window: float) -> None:
 
 
 async def unmanaged_idle_exit_watcher(runner) -> None:
-    window = idle_exit_seconds(runner)
+    no_cron = getattr(runner, "_no_cron", False) is True
+    window = runner._no_cron_idle_exit_seconds if no_cron else idle_exit_seconds(runner)
     if window <= 0:
         logger.info("Auto-started gateway idle exit disabled (gateway.unmanaged_idle_exit_seconds=0)")
         return
@@ -195,7 +198,8 @@ async def unmanaged_idle_exit_watcher(runner) -> None:
     idle_since = None
     while runner._running and not runner._draining:
         await asyncio.sleep(interval)
-        window = idle_exit_seconds(runner)
+        if not no_cron:
+            window = idle_exit_seconds(runner)
         if window <= 0:
             idle_since = None
             continue
@@ -216,6 +220,12 @@ async def unmanaged_idle_exit_watcher(runner) -> None:
 def arm_unmanaged_idle_exit(runner) -> bool:
     """Start the watcher for an ``--idle-exit`` launch that no supervisor owns. Returns whether it armed."""
     from gateway.control_socket import _detect_supervisor
+    if getattr(runner, "_no_cron", False) is True:
+        import math
+        window = idle_exit_seconds(runner)
+        if not math.isfinite(window) or window <= 0:
+            return False
+        runner._no_cron_idle_exit_seconds = window
     supervisor = _detect_supervisor()
     if supervisor != "manual":
         logger.info("Auto-started gateway idle exit not armed: supervised by %s", supervisor)

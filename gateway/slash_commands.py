@@ -533,6 +533,8 @@ class GatewaySlashCommandsMixin(
 
     async def _handle_restart_command(self, event: MessageEvent) -> str | EphemeralReply:
         """Handle /restart command - drain active work, then restart the gateway."""
+        if getattr(self, "_no_cron", False) is True:
+            return EphemeralReply("Restart is unavailable for this one-shot Gateway; it exits automatically when idle.")
         from gateway.run import _hermes_home
         # Idempotency check: if the previous gateway process recorded this same /restart (platform +
         # update_id) and we see it *again*, it's a redelivery from PTB's graceful-shutdown get_updates

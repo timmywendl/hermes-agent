@@ -7,6 +7,79 @@ from websockets.asyncio.client import connect
 
 
 @pytest.mark.asyncio
+async def test_no_cron_pause_ack_is_truthful_and_normal_ack_unchanged(monkeypatch, tmp_path):
+    import atexit
+    from types import SimpleNamespace
+    from gateway import control_socket, run_bootstrap, run_profile_reconcile, run_plugin_rewire
+    from hermes_cli import gateway as gateway_cli, update_cmd_posix_pause
+
+    class FakeControl:
+        def __init__(self, *, verb_handlers):
+            self.handlers = verb_handlers
+        async def start(self):
+            return True
+        def cleanup_files(self):
+            pass
+    monkeypatch.setattr(control_socket, 'GatewayControlServer', FakeControl)
+    monkeypatch.setattr(atexit, 'register', lambda fn: None)
+    monkeypatch.setattr(gateway_cli, '_get_restart_drain_timeout', lambda: 30)
+    for name in ('migrate_profile_identity_verb', 'purge_profile_identity_verb', 'unserve_profile_verb', 'serve_profile_verb'):
+        monkeypatch.setattr(run_profile_reconcile, name, lambda runner: lambda *args: {})
+    monkeypatch.setattr(run_plugin_rewire, 'reload_plugins_verb', lambda runner, loop: lambda *args: {})
+    calls = []
+    runner = SimpleNamespace(_no_cron=True, _draining=False, _running=True,
+                             session_runtime_descriptor={}, session_ticket_store=object(),
+                             request_restart=lambda **kw: calls.append(kw) or True)
+    server = await run_bootstrap._start_gateway_start_control_socket(runner)
+    handler = server.handlers['pause-for-update']
+    reply = await asyncio.to_thread(handler)
+    assert reply['pausing'] is False and reply['already_stopping'] is False and calls == []
+    monkeypatch.setattr(control_socket, 'pause_gateway_for_update', lambda home: reply)
+    assert update_cmd_posix_pause._ask_to_drain({'home': str(tmp_path)}) is False
+    runner._draining = True
+    assert (await asyncio.to_thread(handler))['already_stopping'] is True and calls == []
+    runner._draining, runner._running = False, False
+    assert (await asyncio.to_thread(handler))['already_stopping'] is False and calls == []
+    runner._stop_task = object()
+    assert (await asyncio.to_thread(handler))['already_stopping'] is True and calls == []
+    runner._stop_task = None
+    runner._no_cron, runner._running = False, True
+    reply = await asyncio.to_thread(handler)
+    assert reply['pausing'] is True and reply['already_stopping'] is False and len(calls) == 1
+    runner.request_restart = lambda **kw: False
+    reply = await asyncio.to_thread(handler)
+    assert reply['pausing'] is False and reply['already_stopping'] is True
+
+
+@pytest.mark.asyncio
+async def test_no_cron_restart_refuses_before_markers_and_normal_path_is_unchanged(monkeypatch):
+    from types import SimpleNamespace
+    from gateway import restart, slash_commands
+    from gateway.platforms.base import EphemeralReply
+
+    calls = []
+    monkeypatch.setattr(slash_commands, 'atomic_json_write', lambda path, payload, **kw: calls.append(path.name))
+    monkeypatch.setattr(restart, 'is_gateway_supervisor_process', lambda: False)
+    monkeypatch.setattr(restart, 'is_container_restart_context', lambda: False)
+    runner = SimpleNamespace(_no_cron=True,
+        _is_stale_restart_redelivery=lambda event: pytest.fail('stale check before no-cron refusal'),
+        request_restart=lambda **kw: pytest.fail('restart requested'))
+    reply = await slash_commands.GatewaySlashCommandsMixin._handle_restart_command(runner, object())
+    assert isinstance(reply, EphemeralReply) and 'one-shot' in reply and 'idle' in reply and calls == []
+    runner._no_cron = False
+    runner._is_stale_restart_redelivery = lambda event: False
+    runner._restart_requested = runner._draining = False
+    runner._running_agent_count = lambda: 0
+    runner.request_restart = lambda **kw: calls.append('restart')
+    source = SimpleNamespace(platform=SimpleNamespace(value='test'), chat_id='id', chat_type='dm',
+                             delivered_via_upstream_relay=False, thread_id=None, message_id=None, profile=None)
+    event = SimpleNamespace(source=source, message_id=None, platform_update_id='u')
+    reply = await slash_commands.GatewaySlashCommandsMixin._handle_restart_command(runner, event)
+    assert isinstance(reply, EphemeralReply)
+    assert calls == ['.restart_notify.json', '.restart_last_processed.json', 'restart']
+
+
+@pytest.mark.asyncio
 async def test_no_cron_startup_skips_notice_import_but_keeps_recovery(monkeypatch):
     import builtins
     import sys
@@ -113,6 +186,30 @@ async def test_no_cron_empty_shutdown_notice_never_imports_cron(monkeypatch):
         return original(name, *args, **kwargs)
     monkeypatch.setattr(builtins, '__import__', guarded)
     assert await GatewayShutdownMixin._notify_interrupted_cron_jobs(object(), []) == 0
+
+
+def test_no_cron_diagnostics_keep_noncron_work_without_cron_import(monkeypatch):
+    import builtins
+    from gateway import run_shutdown
+
+    runner = object.__new__(run_shutdown.GatewayShutdownMixin)
+    runner._no_cron = True
+    runner._sessions_map = dict
+    runner._running_agent_count = lambda: 2
+    runner._active_api_run_count = lambda: 1
+    runner._active_deferred_agent_worker_count = lambda: 0
+    runner._wedged_chat_agent_count = lambda: 0
+    monkeypatch.setattr(run_shutdown, 'managed_turn_count', lambda runner: 0)
+    original = builtins.__import__
+    def guarded(name, *args, **kwargs):
+        if name == 'cron' or name.startswith('cron.'):
+            pytest.fail('cron imported during diagnostics')
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', guarded)
+    assert runner._active_work_count() == 3
+    assert runner._drain_work_counts() == (2, 0, 1, 0)
+    assert runner._awaitable_work_count() == 3
+    assert [item['kind'] for item in runner._describe_active_work()] == ['api']
 
 
 @pytest.mark.asyncio

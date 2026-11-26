@@ -300,6 +300,9 @@ async def _start_gateway_start_control_socket(runner):
                 _drain = float(_get_restart_drain_timeout())
             except Exception:
                 _drain = 30.0
+            if getattr(runner, '_no_cron', False) is True:
+                stopping = getattr(runner, '_draining', False) is True or getattr(runner, '_stop_task', None) is not None
+                return {"pausing": False, "already_stopping": stopping, "pid": os.getpid(), "drain_timeout": _drain}
             accepted_box: list[bool] = []
             _done = threading.Event()
 
